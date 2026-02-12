@@ -4,7 +4,7 @@ use nalgebra::{Point3, Vector3};
 
 use crate::{
     mobjects::{text::Text, Mobject, MobjectClone, SimpleLine},
-    video_backend::{FFMPEGEncoder, VideoBackendController},
+    video_backend::{FfmpegPipeEncoder, FfmpegPipeBackend},
     Context, GMFloat, Scene,
 };
 
@@ -143,7 +143,7 @@ fn test_simple_move() {
         last_progress: 0.0,
     };
     use crate::video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,VideoBackendController
     };
 
     let video_config = VideoConfig {
@@ -154,9 +154,9 @@ fn test_simple_move() {
         color_order: ColorOrder::Rgba,
     };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
+        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
             &video_config,
-            FFMPEGEncoder::hevc_vaapi,
+            FfmpegPipeEncoder::HevcVaapi,
             false,
         )),
     };
@@ -244,7 +244,7 @@ fn test_simple_rotate() {
         is_first_frame: true,
     };
     use crate::video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
     };
 
     let video_config = VideoConfig {
@@ -255,9 +255,9 @@ fn test_simple_rotate() {
         color_order: ColorOrder::Rgba,
     };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
+        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
             &video_config,
-            FFMPEGEncoder::libx264,
+            FfmpegPipeEncoder::Libx264,
             false,
         )),
     };

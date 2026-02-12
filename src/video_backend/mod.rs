@@ -3,10 +3,12 @@ use std::fmt::Display;
 use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
+use ffmpeg_next::format::pixel;
 
 const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
-    FFMPEG(FFMPEGBackend),
+    FfmpegPipe(FfmpegPipeBackend),
+    Ffmpeg(FfmpegBackend),
     BgraRAW(BgraRAWBackend),
     Gstreamer,
 }
@@ -34,6 +36,7 @@ impl Display for ColorOrder {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct VideoConfig {
     pub filename: String,
     pub framerate: u32,
@@ -42,31 +45,73 @@ pub struct VideoConfig {
     pub color_order: ColorOrder,
 }
 
-pub struct FFMPEGBackend {
+pub enum FfmpegPipeEncoder {
+    Libx264,
+    Libx265,
+    HevcNvenc,
+    HevcVaapi,
+}
+
+impl FfmpegPipeEncoder {
+    fn get_encoder_name(&self) -> &'static str {
+        match self {
+            Self::Libx264 => "libx264",
+            Self::Libx265 => "libx265",
+            Self::HevcNvenc => "hevc_nvenc",
+            Self::HevcVaapi => "hevc_vaapi",
+        }
+    }
+}
+
+pub struct FfmpegPipeConfig {
+    pub ffmpeg_encoder: FfmpegPipeEncoder,
+}
+
+pub struct FfmpegPipeBackend {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
 }
 
-#[allow(non_camel_case_types)]
-pub enum FFMPEGEncoder {
-    libx264,
-    libx265,
-    hevc_nvenc,
-    hevc_vaapi,
+pub struct FfmpegBackend {
 }
 
-impl FFMPEGEncoder {
-    fn get_encoder_name(&self) -> &'static str {
-        match self {
-            Self::libx264 => "libx264",
-            Self::libx265 => "libx265",
-            Self::hevc_nvenc => "hevc_nvenc",
-            Self::hevc_vaapi => "hevc_vaapi",
+impl FfmpegBackend {
+    fn new(video_config: &VideoConfig) -> Self {
+        ffmpeg_next::init().unwrap();
+
+        // init Muxer
+        let mut octx = ffmpeg_next::format::output(&video_config.filename).unwrap();
+        let global_header = octx
+            .format()
+            .flags()
+            .contains(ffmpeg_next::format::Flags::GLOBAL_HEADER);
+        // config video stream
+        let v_codec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::MPEG4).unwrap();
+        let mut v_stream = octx.add_stream(v_codec).unwrap();
+        let mut v_enc =
+            ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters())
+                .unwrap()
+                .encoder()
+                .video()
+                .unwrap();
+        v_enc.set_width(video_config.output_width);
+        v_enc.set_height(video_config.output_height);
+        v_enc.set_format(pixel::Pixel::RGBAF32LE);
+        v_enc.set_time_base((1 as i32, video_config.framerate as i32));
+        if global_header {
+            v_enc.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
+        }
+        let mut v_enc = v_enc.open().unwrap();
+        v_stream.set_parameters(&v_enc);
+        octx.write_header().unwrap();
+        
+        Self {
         }
     }
 }
-pub struct FFMPEGConfig {
-    pub ffmpeg_encoder: FFMPEGEncoder,
+
+pub struct FfmpegConfig {
+    pub ffmpeg_encoder: FfmpegPipeEncoder,
 }
 
 pub struct BgraRAWBackend {
@@ -92,7 +137,7 @@ pub enum VideoBackendState {
 impl VideoBackend {
     pub fn write_frame(&mut self, frame_data: &[u8]) {
         match &mut self.backend_type {
-            VideoBackendType::FFMPEG(f) => {
+            VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
                 f.stdin.write_all(frame_data);
             }
@@ -141,12 +186,12 @@ impl VideoBackend {
         }
     }
 }
-struct FFMPEGOutputOptionBuilder {
+struct FfmpegPipeOutputOptionBuilder {
     high_quality: bool,
-    encoder: FFMPEGEncoder,
+    encoder: FfmpegPipeEncoder,
 }
 
-impl FFMPEGOutputOptionBuilder {
+impl FfmpegPipeOutputOptionBuilder {
     fn build_option(&self, args: &mut Vec<String>) {
         args.push("-an".to_string());
         args.extend([
@@ -159,7 +204,7 @@ impl FFMPEGOutputOptionBuilder {
     }
     fn specify_hwaccel_device_option(&self, args: &mut Vec<String>) {
         match self.encoder {
-            FFMPEGEncoder::hevc_vaapi => {
+            FfmpegPipeEncoder::HevcVaapi => {
                 args.extend([
                     "-vaapi_device".to_string(),
                     "/dev/dri/renderD128".to_string(),
@@ -173,14 +218,14 @@ impl FFMPEGOutputOptionBuilder {
 
     fn specify_quality_option(&self, args: &mut Vec<String>) {
         let mut quality_options = match self.encoder {
-            FFMPEGEncoder::hevc_vaapi => {
+            FfmpegPipeEncoder::HevcVaapi => {
                 if self.high_quality {
                     vec!["-compression_level", "11"] // I can't use level value 1 and 29, and i don't know why.
                 } else {
                     vec!["-compression_level", "0"]
                 }
             }
-            FFMPEGEncoder::hevc_nvenc => {
+            FfmpegPipeEncoder::HevcNvenc => {
                 if self.high_quality {
                     vec!["-preset", "p7"]
                 } else {
@@ -196,7 +241,7 @@ impl FFMPEGOutputOptionBuilder {
             }
         };
         //vaapi only support "vaapi" pix_fmt
-        if !matches!(self.encoder, FFMPEGEncoder::hevc_vaapi) {
+        if !matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
             if self.high_quality {
                 quality_options.extend(["-pix_fmt", "yuv444p"]);
             } else {
@@ -207,10 +252,10 @@ impl FFMPEGOutputOptionBuilder {
     }
 }
 
-impl FFMPEGBackend {
+impl FfmpegPipeBackend {
     pub fn new(
         video_config: &VideoConfig,
-        encoder_config: FFMPEGEncoder,
+        encoder_config: FfmpegPipeEncoder,
         high_profile: bool,
     ) -> Self {
         let encoder_name = encoder_config.get_encoder_name();
@@ -231,11 +276,11 @@ impl FFMPEGBackend {
             "-i".to_string(),
             "-".to_string(),
         ];
-        let encoder_option_builder = FFMPEGOutputOptionBuilder {
+        let encoder_option_builder = FfmpegPipeOutputOptionBuilder {
             high_quality: high_profile,
             encoder: encoder_config,
         };
-        
+
         encoder_option_builder.build_option(&mut args);
 
         args.push(video_config.filename.to_string());
