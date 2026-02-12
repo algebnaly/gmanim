@@ -1,7 +1,7 @@
 use std::{fs, io::Read};
 
 use nalgebra::Vector2;
-use usvg::{tiny_skia_path::PathSegment, Group, Node, NodeExt, NodeKind, TreeParsing};
+use usvg::{tiny_skia_path::PathSegment, Group, Node};
 
 use crate::{
     math_utils::{point2d_to_point3d, point3d_to_point2d},
@@ -9,8 +9,8 @@ use crate::{
 };
 
 use super::{
-    coordinate_change_x, coordinate_change_y, group::MobjectGroup, Draw, DrawConfig, Mobject,
-    Transform, path::PathElement,
+    coordinate_change_x, coordinate_change_y, group::MobjectGroup, path::PathElement, Draw,
+    DrawConfig, Mobject, Transform,
 };
 
 
@@ -185,28 +185,28 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
     svg_file.read_to_string(&mut svg_str_buf);
     let tree = usvg::Tree::from_str(&svg_str_buf, &Default::default()).unwrap();
     let mut paths: Vec<SVGPath> = vec![];
-    for node in tree.root.descendants() {
-        let n = &*node.borrow();
+    for node in tree.root().children() {
+        let n = node;
         match n {
-            NodeKind::Group(g) => {
+            Node::Group(g) => {
                 //we don't care for now
             }
-            NodeKind::Image(img) => {
+            Node::Image(img) => {
                 //we don't care for now
             }
-            NodeKind::Path(path) => {
+            Node::Path(path) => {
                 //apply transform
                 let mut svg_path = SVGPath::new();
                 let transform = node.abs_transform();
-                let path_data = &path.data;
-                for e in path_data.segments() {
+                let path_data = path;
+                for e in path_data.data().segments() {
                     let pe = process_path_element(e, transform);
                     svg_path.elements.push(pe);
                 }
                 svg_path.flip_y_coordinate();
                 paths.push(svg_path);
             }
-            NodeKind::Text(text) => {
+            Node::Text(text) => {
                 //we don't care for now
             }
         }

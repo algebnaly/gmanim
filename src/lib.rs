@@ -240,7 +240,7 @@ fn write_frame() {
     use std::sync::mpsc::{Receiver, Sender};
 
     use video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
     };
 
     let video_config = VideoConfig {
@@ -251,9 +251,9 @@ fn write_frame() {
         color_order: ColorOrder::Rgba,
     };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
+        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
             &video_config,
-            video_backend::FFMPEGEncoder::hevc_nvenc,
+            video_backend::FfmpegPipeEncoder::HevcNvenc,
             false,
         )),
     };
@@ -297,7 +297,7 @@ fn thread_frame_pass() {
     use std::sync::mpsc::{Receiver, Sender};
 
     use video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegConfig,FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
     };
 
     let video_config = VideoConfig {
@@ -309,9 +309,9 @@ fn thread_frame_pass() {
     };
 
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
+        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
             &video_config,
-            video_backend::FFMPEGEncoder::hevc_nvenc,
+            video_backend::FfmpegPipeEncoder::HevcNvenc,
             false,
         )),
     };
@@ -322,9 +322,10 @@ fn thread_frame_pass() {
 
     let state = Arc::new(Mutex::new(video_backend::VideoBackendState::Running));
     let state_ref = state.clone();
-    let thread_handler = thread::spawn(move || {
-        video_backend_var.write_frame_background(rx, state_ref, queue_ref);
-    });
+    // let thread_handler = thread::spawn(move || {
+    //     video_backend_var.write_frame_background(rx, state_ref, queue_ref);
+    // });
+    
     for _ in 0..480 {
         let now = std::time::Instant::now();
         let translation =
@@ -352,5 +353,5 @@ fn thread_frame_pass() {
         } //release state lock
         tx.send(FrameMessage::End);
     }
-    thread_handler.join();
+    // thread_handler.join();
 }

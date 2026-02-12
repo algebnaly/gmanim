@@ -8,12 +8,14 @@ edition = "2021"
 [dependencies]
 nalgebra = "*"
 rusttype = "*"
-usvg = "0.36.0"
-tiny-skia = "*"
+usvg = "0.47"
+tiny-skia = "0.12"
 fern = "*"
 log = "*"
 humantime = "*"
 cfg-if = "1.0.0"
+ffmpeg-next = "8.0"
+yuv = { version = "0.8.11", features = ["fast_mode"] }
 
 [features]
 default = ["gmfloat_f32"]

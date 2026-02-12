@@ -1,11 +1,13 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Instant};
 
+use ffmpeg_next::ffi::WINT_MAX;
 use nalgebra::{Point3, Vector3};
+use tiny_skia::Pixmap;
 
 use crate::{
     mobjects::{text::Text, Mobject, MobjectClone, SimpleLine},
-    video_backend::{FFMPEGEncoder, VideoBackendController},
-    Context, GMFloat, Scene,
+    video_backend::{ffmpeg::FfmpegBackend, FfmpegPipeBackend, FfmpegPipeEncoder},
+    Context, GMFloat, Scene, SceneConfig,
 };
 
 trait Animation: Iterator<Item = Vec<u8>> {
@@ -69,7 +71,7 @@ impl Iterator for SimpleMovement {
 
 impl Animation for SimpleMovement {
     fn total_frame(&self) -> u32 {
-        return self.animation_config.total_frame
+        return self.animation_config.total_frame;
     }
 }
 
@@ -143,7 +145,8 @@ fn test_simple_move() {
         last_progress: 0.0,
     };
     use crate::video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendController,
+        VideoBackendType, VideoConfig,
     };
 
     let video_config = VideoConfig {
@@ -154,18 +157,18 @@ fn test_simple_move() {
         color_order: ColorOrder::Rgba,
     };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
+        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
             &video_config,
-            FFMPEGEncoder::hevc_vaapi,
+            FfmpegPipeEncoder::Libx264,
             false,
         )),
     };
-    let mut video_backend_controller = VideoBackendController::new(video_backend_var);
+    // let mut video_backend_controller = VideoBackendController::new(video_backend_var);
     for frame in simple_move {
-        video_backend_controller.write_frame(frame);
-        // video_backend_var.write_frame(&frame);
+        // video_backend_controller.write_frame(frame);
+        video_backend_var.write_frame(&frame);
     }
-    video_backend_controller.end();
+    // video_backend_controller.end();
 }
 
 impl Animation for SimpleRotate {
@@ -209,7 +212,18 @@ impl Animation for Wait {
 
 #[test]
 fn test_simple_rotate() {
-    let mut ctx = Context::default();
+    let width: usize = 1920;
+    let height: usize = 1080;
+    let mut ctx = Context {
+        ctx_type: crate::ContextType::TinySKIA(Pixmap::new(width as u32, height as u32).unwrap()),
+        scene_config: SceneConfig {
+            width: 16.0,
+            height: 9.0,
+            output_width: width as u32,
+            output_height: height as u32,
+            scale_factor: height as GMFloat / 16.0,
+        },
+    };
     let mut scene = Scene::default();
     let mut line: Box<dyn Mobject> = Box::new(SimpleLine {
         p0: Point3::new(0.0, 0.0, 0.0),
@@ -244,27 +258,31 @@ fn test_simple_rotate() {
         is_first_frame: true,
     };
     use crate::video_backend::{
-        ColorOrder, FFMPEGBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
     };
 
     let video_config = VideoConfig {
         filename: "output.mp4".to_owned(),
         framerate: 60,
-        output_height: 1080,
-        output_width: 1920,
+        output_width: width as u32,
+        output_height: height as u32,
         color_order: ColorOrder::Rgba,
     };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FFMPEG(FFMPEGBackend::new(
-            &video_config,
-            FFMPEGEncoder::libx264,
-            false,
-        )),
+        backend_type: VideoBackendType::Ffmpeg(FfmpegBackend::new(&video_config)),
+        // backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
+        //     &video_config,
+        //     FfmpegPipeEncoder::Libx264,
+        //     false,
+        // )),
     };
+
+    let mut frames: VecDeque<Vec<u8>> = VecDeque::new();
     for frame in simple_move {
-        video_backend_var.write_frame(&frame);
+        frames.push_back(frame);
     }
-    for frame in wait {
-        video_backend_var.write_frame(&frame);
+    for f in frames {
+        video_backend_var.write_frame(&f);
     }
+    video_backend_var.close();
 }

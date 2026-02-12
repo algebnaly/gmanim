@@ -4,9 +4,13 @@ use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
+use crate::video_backend::ffmpeg::FfmpegBackend;
+pub mod ffmpeg;
+
 const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
-    FFMPEG(FFMPEGBackend),
+    FfmpegPipe(FfmpegPipeBackend),
+    Ffmpeg(FfmpegBackend),
     BgraRAW(BgraRAWBackend),
     Gstreamer,
 }
@@ -34,6 +38,7 @@ impl Display for ColorOrder {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct VideoConfig {
     pub filename: String,
     pub framerate: u32,
@@ -42,31 +47,35 @@ pub struct VideoConfig {
     pub color_order: ColorOrder,
 }
 
-pub struct FFMPEGBackend {
+pub enum FfmpegPipeEncoder {
+    Libx264,
+    Libx265,
+    HevcNvenc,
+    HevcVaapi,
+}
+
+impl FfmpegPipeEncoder {
+    fn get_encoder_name(&self) -> &'static str {
+        match self {
+            Self::Libx264 => "libx264",
+            Self::Libx265 => "libx265",
+            Self::HevcNvenc => "hevc_nvenc",
+            Self::HevcVaapi => "hevc_vaapi",
+        }
+    }
+}
+
+pub struct FfmpegPipeConfig {
+    pub ffmpeg_encoder: FfmpegPipeEncoder,
+}
+
+pub struct FfmpegPipeBackend {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
 }
 
-#[allow(non_camel_case_types)]
-pub enum FFMPEGEncoder {
-    libx264,
-    libx265,
-    hevc_nvenc,
-    hevc_vaapi,
-}
-
-impl FFMPEGEncoder {
-    fn get_encoder_name(&self) -> &'static str {
-        match self {
-            Self::libx264 => "libx264",
-            Self::libx265 => "libx265",
-            Self::hevc_nvenc => "hevc_nvenc",
-            Self::hevc_vaapi => "hevc_vaapi",
-        }
-    }
-}
-pub struct FFMPEGConfig {
-    pub ffmpeg_encoder: FFMPEGEncoder,
+pub struct FfmpegConfig {
+    pub ffmpeg_encoder: FfmpegPipeEncoder,
 }
 
 pub struct BgraRAWBackend {
@@ -92,9 +101,12 @@ pub enum VideoBackendState {
 impl VideoBackend {
     pub fn write_frame(&mut self, frame_data: &[u8]) {
         match &mut self.backend_type {
-            VideoBackendType::FFMPEG(f) => {
+            VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
                 f.stdin.write_all(frame_data);
+            }
+            VideoBackendType::Ffmpeg(f) => {
+                f.write_frame(frame_data);
             }
             VideoBackendType::BgraRAW(f) => {
                 use std::io::Write;
@@ -103,6 +115,16 @@ impl VideoBackend {
             _ => {}
         }
     }
+    
+    pub fn close(&mut self) {
+        match &mut self.backend_type {
+            VideoBackendType::Ffmpeg(f) => {
+                f.finish();
+            }
+            _ => {}
+        }
+    }
+    
     pub fn write_frame_background(
         &mut self,
         rx: Receiver<FrameMessage>,
@@ -141,12 +163,12 @@ impl VideoBackend {
         }
     }
 }
-struct FFMPEGOutputOptionBuilder {
+struct FfmpegPipeOutputOptionBuilder {
     high_quality: bool,
-    encoder: FFMPEGEncoder,
+    encoder: FfmpegPipeEncoder,
 }
 
-impl FFMPEGOutputOptionBuilder {
+impl FfmpegPipeOutputOptionBuilder {
     fn build_option(&self, args: &mut Vec<String>) {
         args.push("-an".to_string());
         args.extend([
@@ -159,7 +181,7 @@ impl FFMPEGOutputOptionBuilder {
     }
     fn specify_hwaccel_device_option(&self, args: &mut Vec<String>) {
         match self.encoder {
-            FFMPEGEncoder::hevc_vaapi => {
+            FfmpegPipeEncoder::HevcVaapi => {
                 args.extend([
                     "-vaapi_device".to_string(),
                     "/dev/dri/renderD128".to_string(),
@@ -173,14 +195,14 @@ impl FFMPEGOutputOptionBuilder {
 
     fn specify_quality_option(&self, args: &mut Vec<String>) {
         let mut quality_options = match self.encoder {
-            FFMPEGEncoder::hevc_vaapi => {
+            FfmpegPipeEncoder::HevcVaapi => {
                 if self.high_quality {
                     vec!["-compression_level", "11"] // I can't use level value 1 and 29, and i don't know why.
                 } else {
                     vec!["-compression_level", "0"]
                 }
             }
-            FFMPEGEncoder::hevc_nvenc => {
+            FfmpegPipeEncoder::HevcNvenc => {
                 if self.high_quality {
                     vec!["-preset", "p7"]
                 } else {
@@ -196,7 +218,7 @@ impl FFMPEGOutputOptionBuilder {
             }
         };
         //vaapi only support "vaapi" pix_fmt
-        if !matches!(self.encoder, FFMPEGEncoder::hevc_vaapi) {
+        if !matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
             if self.high_quality {
                 quality_options.extend(["-pix_fmt", "yuv444p"]);
             } else {
@@ -207,10 +229,10 @@ impl FFMPEGOutputOptionBuilder {
     }
 }
 
-impl FFMPEGBackend {
+impl FfmpegPipeBackend {
     pub fn new(
         video_config: &VideoConfig,
-        encoder_config: FFMPEGEncoder,
+        encoder_config: FfmpegPipeEncoder,
         high_profile: bool,
     ) -> Self {
         let encoder_name = encoder_config.get_encoder_name();
@@ -231,11 +253,11 @@ impl FFMPEGBackend {
             "-i".to_string(),
             "-".to_string(),
         ];
-        let encoder_option_builder = FFMPEGOutputOptionBuilder {
+        let encoder_option_builder = FfmpegPipeOutputOptionBuilder {
             high_quality: high_profile,
             encoder: encoder_config,
         };
-        
+
         encoder_option_builder.build_option(&mut args);
 
         args.push(video_config.filename.to_string());
@@ -255,10 +277,13 @@ impl FFMPEGBackend {
     }
 }
 
+// the intent of backend controller is to seperate framge generation and video encoding 
+// we use a backgroud thread to push frame data to the ffmpeg pipe
+// TODO: make send frame zero copy
 pub struct VideoBackendController {
     // video_backend: Arc<Mutex<VideoBackend>>,
     video_backend: Arc<Mutex<VideoBackend>>,
-    background_thread_handler: JoinHandle<()>,
+    // background_thread_handler: JoinHandle<()>,
     block_queue: Arc<Mutex<VecDeque<Vec<Vec<u8>>>>>,
     sender: Sender<FrameMessage>,
     block: Option<Vec<Vec<u8>>>,
@@ -276,33 +301,33 @@ impl VideoBackendController {
 
         let block = Some(Vec::new());
 
-        let handler = thread::spawn(move || {
-            let video_backend_ref = video_backend_ref_clone.clone();
-            let block_queue = block_queue_ref.clone();
-            loop {
-                let msg = receiver.recv();
-                if msg.is_err() {
-                    break;
-                }
-                let frame_msg = msg.unwrap();
-                if matches!(frame_msg, FrameMessage::End) {
-                    break;
-                }
-                let frame_list = match block_queue.lock().unwrap().pop_front() {
-                    None => {
-                        break;
-                    }
-                    Some(f) => f,
-                };
-                let mut video_baackend = video_backend_ref.lock().unwrap();
-                for f in frame_list {
-                    video_baackend.write_frame(&f);
-                }
-            }
-        });
+        // let handler = thread::spawn(move || {
+        //     let video_backend_ref = video_backend_ref_clone.clone();
+        //     let block_queue = block_queue_ref.clone();
+        //     loop {
+        //         let msg = receiver.recv();
+        //         if msg.is_err() {
+        //             break;
+        //         }
+        //         let frame_msg = msg.unwrap();
+        //         if matches!(frame_msg, FrameMessage::End) {
+        //             break;
+        //         }
+        //         let frame_list = match block_queue.lock().unwrap().pop_front() {
+        //             None => {
+        //                 break;
+        //             }
+        //             Some(f) => f,
+        //         };
+        //         let mut video_baackend = video_backend_ref.lock().unwrap();
+        //         for f in frame_list {
+        //             video_baackend.write_frame(&f);
+        //         }
+        //     }
+        // });
         Self {
             video_backend: video_backend_ref,
-            background_thread_handler: handler,
+            // background_thread_handler: handler,
             block_queue,
             sender,
             block,
@@ -320,7 +345,7 @@ impl VideoBackendController {
     }
     pub fn end(self) {
         self.sender.send(FrameMessage::End);
-        self.background_thread_handler.join();
+        // self.background_thread_handler.join();
     }
 }
 
