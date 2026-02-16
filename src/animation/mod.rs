@@ -3,9 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use nalgebra::{Point3, Vector3};
 
 use crate::{
-    mobjects::{text::Text, Mobject, MobjectClone, SimpleLine},
-    video_backend::{FfmpegPipeEncoder, FfmpegPipeBackend},
-    Context, GMFloat, Scene,
+    Context, GMFloat, Scene, mobjects::{Mobject, MobjectClone, SimpleLine, text::Text}, video_backend::{FfmpegPipeBackend, FfmpegPipeEncoder, ffmpeg::FfmpegBackend}
 };
 
 trait Animation: Iterator<Item = Vec<u8>> {
@@ -254,13 +252,17 @@ fn test_simple_rotate() {
         output_width: 1920,
         color_order: ColorOrder::Rgba,
     };
+    // let mut video_backend_var = VideoBackend {
+    //     backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
+    //         &video_config,
+    //         FfmpegPipeEncoder::Libx264,
+    //         false,
+    //     )),
+    // };
     let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
-            &video_config,
-            FfmpegPipeEncoder::Libx264,
-            false,
-        )),
+        backend_type: VideoBackendType::Ffmpeg(FfmpegBackend::new(&video_config)),
     };
+    
     for frame in simple_move {
         video_backend_var.write_frame(&frame);
     }

@@ -322,9 +322,10 @@ fn thread_frame_pass() {
 
     let state = Arc::new(Mutex::new(video_backend::VideoBackendState::Running));
     let state_ref = state.clone();
-    let thread_handler = thread::spawn(move || {
-        video_backend_var.write_frame_background(rx, state_ref, queue_ref);
-    });
+    // let thread_handler = thread::spawn(move || {
+    //     video_backend_var.write_frame_background(rx, state_ref, queue_ref);
+    // });
+    
     for _ in 0..480 {
         let now = std::time::Instant::now();
         let translation =
@@ -352,5 +353,5 @@ fn thread_frame_pass() {
         } //release state lock
         tx.send(FrameMessage::End);
     }
-    thread_handler.join();
+    // thread_handler.join();
 }

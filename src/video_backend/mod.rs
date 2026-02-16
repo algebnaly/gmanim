@@ -5,7 +5,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::video_backend::ffmpeg::FfmpegBackend;
-mod ffmpeg;
+pub mod ffmpeg;
 
 const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
@@ -104,6 +104,9 @@ impl VideoBackend {
             VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
                 f.stdin.write_all(frame_data);
+            }
+            VideoBackendType::Ffmpeg(f) => {
+                todo!()
             }
             VideoBackendType::BgraRAW(f) => {
                 use std::io::Write;
@@ -270,7 +273,7 @@ impl FfmpegPipeBackend {
 pub struct VideoBackendController {
     // video_backend: Arc<Mutex<VideoBackend>>,
     video_backend: Arc<Mutex<VideoBackend>>,
-    background_thread_handler: JoinHandle<()>,
+    // background_thread_handler: JoinHandle<()>,
     block_queue: Arc<Mutex<VecDeque<Vec<Vec<u8>>>>>,
     sender: Sender<FrameMessage>,
     block: Option<Vec<Vec<u8>>>,
@@ -288,33 +291,33 @@ impl VideoBackendController {
 
         let block = Some(Vec::new());
 
-        let handler = thread::spawn(move || {
-            let video_backend_ref = video_backend_ref_clone.clone();
-            let block_queue = block_queue_ref.clone();
-            loop {
-                let msg = receiver.recv();
-                if msg.is_err() {
-                    break;
-                }
-                let frame_msg = msg.unwrap();
-                if matches!(frame_msg, FrameMessage::End) {
-                    break;
-                }
-                let frame_list = match block_queue.lock().unwrap().pop_front() {
-                    None => {
-                        break;
-                    }
-                    Some(f) => f,
-                };
-                let mut video_baackend = video_backend_ref.lock().unwrap();
-                for f in frame_list {
-                    video_baackend.write_frame(&f);
-                }
-            }
-        });
+        // let handler = thread::spawn(move || {
+        //     let video_backend_ref = video_backend_ref_clone.clone();
+        //     let block_queue = block_queue_ref.clone();
+        //     loop {
+        //         let msg = receiver.recv();
+        //         if msg.is_err() {
+        //             break;
+        //         }
+        //         let frame_msg = msg.unwrap();
+        //         if matches!(frame_msg, FrameMessage::End) {
+        //             break;
+        //         }
+        //         let frame_list = match block_queue.lock().unwrap().pop_front() {
+        //             None => {
+        //                 break;
+        //             }
+        //             Some(f) => f,
+        //         };
+        //         let mut video_baackend = video_backend_ref.lock().unwrap();
+        //         for f in frame_list {
+        //             video_baackend.write_frame(&f);
+        //         }
+        //     }
+        // });
         Self {
             video_backend: video_backend_ref,
-            background_thread_handler: handler,
+            // background_thread_handler: handler,
             block_queue,
             sender,
             block,
@@ -332,7 +335,7 @@ impl VideoBackendController {
     }
     pub fn end(self) {
         self.sender.send(FrameMessage::End);
-        self.background_thread_handler.join();
+        // self.background_thread_handler.join();
     }
 }
 
