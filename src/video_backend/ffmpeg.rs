@@ -1,4 +1,7 @@
+use std::io::Write;
+
 use ffmpeg_next::format::{pixel, Pixel};
+use ffmpeg_next::Dictionary;
 use ffmpeg_next::{ChannelLayout, StreamMut};
 
 use ffmpeg_next::codec::encoder::{Audio, Video};
@@ -20,68 +23,83 @@ impl FfmpegBackend {
     pub fn new(video_config: &VideoConfig) -> Self {
         ffmpeg_next::init().unwrap();
 
-        // init Muxer
+        // #[cfg(test)]
+        // ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+
+        // 1. Init Muxer
         let mut octx = ffmpeg_next::format::output(&video_config.filename).unwrap();
         let global_header = octx
             .format()
             .flags()
             .contains(ffmpeg_next::format::Flags::GLOBAL_HEADER);
-        // config video stream
-        let v_codec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+
+        // ==========================================
+        //  视频流配置 (Video Stream)
+        // ==========================================
+        let v_codec = ffmpeg_next::encoder::find_by_name("libx264")
+            .or_else(|| ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264))
+            .expect("H.264 encoder not found");
 
         let mut v_stream = octx.add_stream(v_codec).unwrap();
         let v_stream_idx = v_stream.index();
 
-        let mut v_enc_ctx_new = ffmpeg_next::codec::context::Context::new();
-        let mut v_enc_ctx = v_enc_ctx_new.encoder().video().unwrap();
+        let mut v_enc_ctx = ffmpeg_next::codec::context::Context::new();
+        let mut v_enc = v_enc_ctx.encoder().video().unwrap();
 
-        v_enc_ctx.set_width(video_config.output_width);
-        v_enc_ctx.set_height(video_config.output_height);
-        v_enc_ctx.set_format(pixel::Pixel::RGBAF32LE); // TODO: checks if we need scaling
+        v_enc.set_width(video_config.output_width);
+        v_enc.set_height(video_config.output_height);
+        v_enc.set_format(Pixel::YUV420P);
+        v_enc.set_time_base((1, video_config.framerate as i32));
+        v_enc.set_gop(10);
+        v_enc.set_max_b_frames(1);
 
-        v_enc_ctx.set_time_base((1 as i32, video_config.framerate as i32));
+        v_enc.set_qmin(10);
+        v_enc.set_qmax(51);
 
         if global_header {
-            v_enc_ctx.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
+            v_enc.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
         }
-        let v_enc = v_enc_ctx.open().unwrap();
+
+        let mut v_opts = Dictionary::new();
+
+        v_opts.set("preset", "medium");
+        v_opts.set("crf", "23");
+        v_opts.set("profile", "high");
+
+        let v_enc = v_enc
+            .open_as_with(v_codec, v_opts)
+            .expect("Failed to open libx264");
         v_stream.set_parameters(&v_enc);
 
+        // ==========================================
+        //  音频流配置
+        // ==========================================
         let a_codec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::AAC).unwrap();
         let mut a_stream = octx.add_stream(a_codec).unwrap();
         let a_stream_idx = a_stream.index();
-        let mut a_enc_ctx_new = ffmpeg_next::codec::context::Context::new();
-        let mut a_enc_ctx = a_enc_ctx_new.encoder().audio().unwrap();
-        // 必须设置的 AAC 参数：
-        // 1. 采样格式：AAC 通常使用 FLTP (Float Planar)，有些实现也支持 S16
-        a_enc_ctx.set_format(ffmpeg_next::format::Sample::F32(
+
+        let mut a_enc_ctx = ffmpeg_next::codec::context::Context::new();
+        let mut a_enc = a_enc_ctx.encoder().audio().unwrap();
+
+        a_enc.set_format(ffmpeg_next::format::Sample::F32(
             ffmpeg_next::format::sample::Type::Planar,
         ));
+        a_enc.set_rate(44100);
+        a_enc.set_channel_layout(ChannelLayout::STEREO);
+        a_enc.set_time_base((1, 44100));
 
-        // 2. 采样率
-        a_enc_ctx.set_rate(44100); // 或从 config 获取
-
-        // 3. 声道布局 (立体声)
-        a_enc_ctx.set_channel_layout(ChannelLayout::STEREO);
-        // set_channels 对于ffmpeg 7.0以后是不存在的
-
-        // 4. 时间基准
-        a_enc_ctx.set_time_base((1, 44100));
-
-        // 5. 全局头 (对于 MP4 容器非常重要)
         if global_header {
-            a_enc_ctx.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
+            a_enc.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
         }
 
-        let a_enc = a_enc_ctx.open_as(a_codec).unwrap();
+        let a_enc = a_enc.open_as(a_codec).unwrap();
         a_stream.set_parameters(&a_enc);
 
-        let v_target_format = Pixel::YUV420P;
         let scaler = scaling::context::Context::get(
-            Pixel::RGBA, // 输入格式
+            Pixel::RGBA,
             video_config.output_width,
             video_config.output_height,
-            v_target_format, // 输出格式 (YUV420P)
+            Pixel::YUV420P,
             video_config.output_width,
             video_config.output_height,
             scaling::flag::Flags::BILINEAR,
@@ -101,5 +119,59 @@ impl FfmpegBackend {
         }
     }
 
-    pub fn write_frame(frame_data: &[u8]) {}
+    pub fn write_frame(&mut self, frame_data: &[u8]) {
+        
+        let width = self.v_enc.width();
+        let height = self.v_enc.height();
+        let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe {
+            input_frame.alloc(pixel::Pixel::RGBA, width, height);
+        }
+
+        // 2. 填充数据
+        // frame_data 必须是 RGBA packed 格式 (长度 = width * height * 4)
+        let stride = (self.v_enc.width() * 4) as usize;
+
+        unsafe {
+            let mut data = input_frame.data_mut(0);
+            data.write(frame_data);
+        }
+
+        // 3. 创建输出 frame (YUV420P)
+        let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
+        unsafe {
+            output_frame.alloc(Pixel::YUV420P, width, height);
+        }
+
+        // 4. 转换格式 (RGBA -> YUV420P)
+        self.scaler.run(&input_frame, &mut output_frame).unwrap(); // TODO: need measure time here
+
+        // 5. 设置 PTS (Presentation Time Stamp)
+        output_frame.set_pts(Some(self.frame_count as i64));
+        self.frame_count += 1;
+
+        // 6. 发送给编码器
+        self.send_frame(&output_frame);
+    }
+
+    // 辅助函数：发送并接收包
+    fn send_frame(&mut self, frame: &ffmpeg_next::util::frame::video::Video) {
+        self.v_enc.send_frame(frame).unwrap();
+
+        loop {
+            let mut packet = ffmpeg_next::Packet::empty();
+            match self.v_enc.receive_packet(&mut packet) {
+                Ok(_) => {
+                    packet.set_stream(self.v_stream_idx);
+                    // 重要：转换时间基
+                    packet.rescale_ts(
+                        self.v_enc.time_base(),
+                        self.octx.stream(self.v_stream_idx).unwrap().time_base(),
+                    );
+                    packet.write_interleaved(&mut self.octx).unwrap();
+                }
+                Err(e) => break, // EAGAIN or EOF
+            }
+        }
+    }
 }

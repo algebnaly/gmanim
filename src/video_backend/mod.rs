@@ -106,7 +106,7 @@ impl VideoBackend {
                 f.stdin.write_all(frame_data);
             }
             VideoBackendType::Ffmpeg(f) => {
-                todo!()
+                f.write_frame(frame_data);
             }
             VideoBackendType::BgraRAW(f) => {
                 use std::io::Write;

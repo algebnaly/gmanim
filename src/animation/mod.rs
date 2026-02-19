@@ -1,4 +1,4 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, rc::Rc, time::Instant};
 
 use nalgebra::{Point3, Vector3};
 
@@ -266,7 +266,7 @@ fn test_simple_rotate() {
     for frame in simple_move {
         video_backend_var.write_frame(&frame);
     }
-    for frame in wait {
-        video_backend_var.write_frame(&frame);
-    }
+    // for frame in wait {
+    //     video_backend_var.write_frame(&frame);
+    // }
 }
