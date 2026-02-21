@@ -14,7 +14,8 @@ fern = "*"
 log = "*"
 humantime = "*"
 cfg-if = "1.0.0"
-ffmpeg-next = "8.0.0"
+ffmpeg-next = {path = "temp/rust-ffmpeg"}
+yuv = { version = "0.8.11", features = ["fast_mode"] }
 
 [features]
 default = ["gmfloat_f32"]

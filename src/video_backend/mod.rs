@@ -115,6 +115,16 @@ impl VideoBackend {
             _ => {}
         }
     }
+    
+    pub fn close(&mut self) {
+        match &mut self.backend_type {
+            VideoBackendType::Ffmpeg(f) => {
+                f.finish();
+            }
+            _ => {}
+        }
+    }
+    
     pub fn write_frame_background(
         &mut self,
         rx: Receiver<FrameMessage>,
