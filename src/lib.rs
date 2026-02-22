@@ -28,15 +28,15 @@ cfg_if::cfg_if! {
 
 pub type GMPoint = Point3<GMFloat>;
 #[derive(Clone, Copy, Debug)]
-struct Color {
-    r: u8,
-    g: u8,
-    b: u8,
-    a: u8,
+pub struct Color {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+    pub a: u8,
 }
 
 impl Color {
-    fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
+    pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
 }
@@ -78,7 +78,7 @@ pub struct Context {
     pub scene_config: SceneConfig,
 }
 
-impl SceneConfig{
+impl SceneConfig {
     pub fn convert_coord_x(&self, x: GMFloat) -> GMFloat {
         coordinate_change_x(x, self.width) * self.scale_factor
     }
@@ -127,8 +127,6 @@ impl Context {
             _ => &[],
         }
     }
-
-
 }
 
 #[derive(Default)]
@@ -297,7 +295,8 @@ fn thread_frame_pass() {
     use std::sync::mpsc::{Receiver, Sender};
 
     use video_backend::{
-        ColorOrder, FfmpegConfig,FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegConfig, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType,
+        VideoConfig,
     };
 
     let video_config = VideoConfig {
@@ -325,7 +324,7 @@ fn thread_frame_pass() {
     // let thread_handler = thread::spawn(move || {
     //     video_backend_var.write_frame_background(rx, state_ref, queue_ref);
     // });
-    
+
     for _ in 0..480 {
         let now = std::time::Instant::now();
         let translation =

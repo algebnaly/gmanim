@@ -1,6 +1,5 @@
 use std::{cell::RefCell, collections::VecDeque, rc::Rc, time::Instant};
 
-use ffmpeg_next::ffi::WINT_MAX;
 use nalgebra::{Point3, Vector3};
 use tiny_skia::Pixmap;
 

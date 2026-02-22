@@ -115,7 +115,7 @@ impl VideoBackend {
             _ => {}
         }
     }
-    
+
     pub fn close(&mut self) {
         match &mut self.backend_type {
             VideoBackendType::Ffmpeg(f) => {
@@ -124,7 +124,7 @@ impl VideoBackend {
             _ => {}
         }
     }
-    
+
     pub fn write_frame_background(
         &mut self,
         rx: Receiver<FrameMessage>,
@@ -277,7 +277,7 @@ impl FfmpegPipeBackend {
     }
 }
 
-// the intent of backend controller is to seperate framge generation and video encoding 
+// the intent of backend controller is to seperate framge generation and video encoding
 // we use a backgroud thread to push frame data to the ffmpeg pipe
 // TODO: make send frame zero copy
 pub struct VideoBackendController {

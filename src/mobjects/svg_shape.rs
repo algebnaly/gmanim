@@ -13,8 +13,6 @@ use super::{
     DrawConfig, Mobject, Transform,
 };
 
-
-
 #[derive(Debug)]
 struct SVGPath {
     elements: Vec<PathElement>,
