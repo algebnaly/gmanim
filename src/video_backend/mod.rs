@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::fmt::Display;
+use std::io;
 use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
@@ -71,7 +72,8 @@ pub struct FfmpegPipeConfig {
 
 pub struct FfmpegPipeBackend {
     child: std::process::Child,
-    stdin: std::process::ChildStdin,
+    stdin: Option<std::process::ChildStdin>,
+    closed: bool,
 }
 
 pub struct FfmpegConfig {
@@ -103,7 +105,12 @@ impl VideoBackend {
         match &mut self.backend_type {
             VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
-                f.stdin.write_all(frame_data);
+                if let Some(stdin) = f.stdin.as_mut() {
+                    stdin.write_all(frame_data).unwrap();
+                }
+            }
+            VideoBackendType::Ffmpeg(f) => {
+                f.write_frame(frame_data);
             }
             VideoBackendType::Ffmpeg(f) => {
                 f.write_frame(frame_data);
@@ -116,12 +123,11 @@ impl VideoBackend {
         }
     }
 
-    pub fn close(&mut self) {
+    pub fn close(&mut self) -> io::Result<()> {
         match &mut self.backend_type {
-            VideoBackendType::Ffmpeg(f) => {
-                f.finish();
-            }
-            _ => {}
+            VideoBackendType::FfmpegPipe(f) => f.close(),
+            VideoBackendType::Ffmpeg(f) => f.finish(),
+            _ => Ok(()),
         }
     }
 
@@ -180,16 +186,13 @@ impl FfmpegPipeOutputOptionBuilder {
         self.specify_quality_option(args);
     }
     fn specify_hwaccel_device_option(&self, args: &mut Vec<String>) {
-        match self.encoder {
-            FfmpegPipeEncoder::HevcVaapi => {
-                args.extend([
-                    "-vaapi_device".to_string(),
-                    "/dev/dri/renderD128".to_string(),
-                    "-vf".to_string(),
-                    "format=nv12,hwupload".to_string(),
-                ]);
-            }
-            _ => {}
+        if matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
+            args.extend([
+                "-vaapi_device".to_string(),
+                "/dev/dri/renderD128".to_string(),
+                "-vf".to_string(),
+                "format=nv12,hwupload".to_string(),
+            ]);
         }
     }
 
@@ -217,7 +220,7 @@ impl FfmpegPipeOutputOptionBuilder {
                 }
             }
         };
-        //vaapi only support "vaapi" pix_fmt
+        // vaapi only support "vaapi" pix_fmt
         if !matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
             if self.high_quality {
                 quality_options.extend(["-pix_fmt", "yuv444p"]);
@@ -269,10 +272,35 @@ impl FfmpegPipeBackend {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("failed to spawn child process");
-        let mut stdin = c.stdin.take().expect("failed to open stdin");
+        let stdin = c.stdin.take().expect("failed to open stdin");
         Self {
             child: c,
-            stdin: stdin,
+            stdin: Some(stdin),
+            closed: false,
+        }
+    }
+
+    pub fn close(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        self.stdin.take();
+        match self.child.wait() {
+            Ok(status) if status.success() => {}
+            Ok(status) => {
+                return Err(io::Error::other(format!("ffmpeg exited with {status}")));
+            }
+            Err(e) => return Err(e),
+        }
+        self.closed = true;
+        Ok(())
+    }
+}
+
+impl Drop for FfmpegPipeBackend {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.close();
         }
     }
 }
