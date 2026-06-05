@@ -5,7 +5,7 @@ use nalgebra::{Point3, Vector3};
 use tiny_skia::Pixmap;
 
 use crate::{
-    mobjects::{text::Text, Mobject, MobjectClone, SimpleLine},
+    mobjects::{text::Text, Mobject, MobjectClone, Rectangle, SimpleLine},
     video_backend::{ffmpeg::FfmpegBackend, FfmpegPipeBackend, FfmpegPipeEncoder},
     Context, GMFloat, Scene, SceneConfig,
 };
@@ -92,6 +92,7 @@ pub struct SimpleRotate {
 impl Iterator for SimpleRotate {
     type Item = Vec<u8>;
     fn next(&mut self) -> Option<Self::Item> {
+        self.ctx.borrow_mut().clear_transparent();
         self.animation_config.current_frame += 1;
 
         let current_frame = self.animation_config.current_frame;
@@ -112,7 +113,6 @@ impl Iterator for SimpleRotate {
             .borrow_mut()
             .transform(nalgebra::Transform::from_matrix_unchecked(rotation_matrix));
         for d in &self.scene.borrow().mobjects {
-            self.ctx.borrow_mut().clear_transparent();
             d.borrow().draw(&mut *self.ctx.borrow_mut());
         }
         Some(self.ctx.borrow().image_bytes().to_vec())
@@ -270,19 +270,17 @@ fn test_simple_rotate() {
     };
     let mut video_backend_var = VideoBackend {
         backend_type: VideoBackendType::Ffmpeg(FfmpegBackend::new(&video_config)),
-        // backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
-        //     &video_config,
-        //     FfmpegPipeEncoder::Libx264,
-        //     false,
-        // )),
     };
 
+    let now = std::time::Instant::now();
     let mut frames: VecDeque<Vec<u8>> = VecDeque::new();
     for frame in simple_move {
         frames.push_back(frame);
     }
+    let elapsed = now.elapsed();
+
     for f in frames {
         video_backend_var.write_frame(&f);
     }
-    video_backend_var.close();
+    video_backend_var.close().unwrap();
 }

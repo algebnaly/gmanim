@@ -1,8 +1,9 @@
 use std::hint::black_box;
-use std::io::Write;
+use std::io::{self, Write};
 use std::time::Instant;
 
 use ffmpeg_next::format::{pixel, Pixel};
+use ffmpeg_next::packet::Packet;
 use ffmpeg_next::Dictionary;
 use ffmpeg_next::{ChannelLayout, StreamMut};
 
@@ -12,6 +13,9 @@ use ffmpeg_next::software::scaling;
 use yuv::rgba_to_yuv420;
 
 use crate::video_backend::VideoConfig;
+
+const PACKETS_PER_FLUSH: usize = 256;
+
 pub struct FfmpegBackend {
     v_enc: Video,
     a_enc: Audio,
@@ -20,6 +24,7 @@ pub struct FfmpegBackend {
     a_stream_idx: usize,
     // scaler: scaling::context::Context,
     frame_count: u64,
+    packets_buffer: Vec<Packet>,
 }
 
 impl FfmpegBackend {
@@ -96,6 +101,7 @@ impl FfmpegBackend {
             a_stream_idx,
             // scaler,
             frame_count: 0,
+            packets_buffer: Vec::with_capacity(PACKETS_PER_FLUSH),
         }
     }
 
@@ -133,10 +139,34 @@ impl FfmpegBackend {
         self.write_video_packet();
     }
 
-    pub fn finish(&mut self) {
-        self.v_enc.send_eof().unwrap();
+    pub fn flush(&mut self) -> io::Result<()> {
+        println!(
+            "flush: packets_buffer.len() = {}",
+            self.packets_buffer.len()
+        );
+        for packet in self.packets_buffer.iter_mut() {
+            packet.set_stream(self.v_stream_idx);
+
+            // since codec time base is different from container's time base,
+            // we need rescale time scale before writing to container
+            packet.rescale_ts(
+                self.v_enc.time_base(),
+                self.octx.stream(self.v_stream_idx).unwrap().time_base(),
+            );
+            packet
+                .write_interleaved(&mut self.octx)
+                .map_err(io::Error::other)?;
+        }
+        self.packets_buffer.clear();
+        Ok(())
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        self.flush()?;
+        self.v_enc.send_eof().map_err(io::Error::other)?;
         self.write_video_packet();
-        self.octx.write_trailer().unwrap();
+        self.octx.write_trailer().map_err(io::Error::other)?;
+        Ok(())
     }
 
     // before call this function, send_frame to encoder first
@@ -145,20 +175,15 @@ impl FfmpegBackend {
             let mut packet = ffmpeg_next::Packet::empty();
             match self.v_enc.receive_packet(&mut packet) {
                 Ok(_) => {
-                    packet.set_stream(self.v_stream_idx);
-
-                    // since codec time base is different from container's time base,
-                    // we need rescale time scale before writing to container
-                    packet.rescale_ts(
-                        self.v_enc.time_base(),
-                        self.octx.stream(self.v_stream_idx).unwrap().time_base(),
-                    );
-                    packet.write_interleaved(&mut self.octx).unwrap();
+                    self.packets_buffer.push(packet);
                 }
                 Err(e) => {
                     break;
                 } // EAGAIN or EOF
             }
+        }
+        if self.packets_buffer.len() >= PACKETS_PER_FLUSH {
+            self.flush().unwrap();
         }
     }
 }

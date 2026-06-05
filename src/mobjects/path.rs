@@ -13,7 +13,4 @@ pub enum PathElement {
     Close,
 }
 
-
-pub struct Path{
-
-}
+pub struct Path {}

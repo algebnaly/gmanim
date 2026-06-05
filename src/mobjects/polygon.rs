@@ -26,9 +26,15 @@ impl Draw for Polygon {
                 let mut v_list = self.vertices.iter();
                 let start = v_list.next().unwrap();
 
-                pb.move_to(ctx.scene_config.convert_coord_x(start.x), ctx.scene_config.convert_coord_y(start.y));
+                pb.move_to(
+                    ctx.scene_config.convert_coord_x(start.x),
+                    ctx.scene_config.convert_coord_y(start.y),
+                );
                 for p in v_list {
-                    pb.line_to(ctx.scene_config.convert_coord_x(p.x), ctx.scene_config.convert_coord_y(p.y));
+                    pb.line_to(
+                        ctx.scene_config.convert_coord_x(p.x),
+                        ctx.scene_config.convert_coord_y(p.y),
+                    );
                 }
                 pb.close();
                 let path = pb.finish().unwrap();

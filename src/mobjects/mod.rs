@@ -14,10 +14,10 @@ use tiny_skia::{LineCap, LineJoin, Paint, Stroke, StrokeDash};
 pub mod formula;
 pub mod group;
 pub mod path;
+pub mod polygon;
 pub mod svg_shape;
 pub mod text;
 pub mod three_d_viewport;
-pub mod polygon;
 
 pub trait Transform {
     fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>);
