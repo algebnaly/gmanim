@@ -7,10 +7,10 @@ use crate::{
 };
 
 pub struct Dot {
-    position: Point3<GMFloat>,
-    radius: GMFloat,
-    color: Color,
-    draw_config: DrawConfig,
+    pub position: Point3<GMFloat>,
+    pub radius: GMFloat,
+    pub color: Color,
+    pub draw_config: DrawConfig,
 }
 
 impl Default for Dot {

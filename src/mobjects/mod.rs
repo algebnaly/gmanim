@@ -38,9 +38,9 @@ pub trait Draw {
 
 #[derive(Debug, Clone, Copy)]
 pub struct DrawConfig {
-    stoke_width: GMFloat,
-    fill: bool,
-    color: Color,
+    pub stoke_width: GMFloat,
+    pub fill: bool,
+    pub color: Color,
 }
 
 impl Default for DrawConfig {
@@ -210,13 +210,13 @@ impl Transform for PolyLine {
 }
 
 pub struct Arc {
-    center_point: Point3<GMFloat>,
-    start_angle: GMFloat,
-    end_angle: GMFloat,
-    radius: GMFloat,
-    _segs: usize,
-    _seg_list: Vec<GMFloat>,
-    draw_config: DrawConfig,
+    pub center_point: Point3<GMFloat>,
+    pub start_angle: GMFloat,
+    pub end_angle: GMFloat,
+    pub radius: GMFloat,
+    pub _segs: usize,
+    pub _seg_list: Vec<GMFloat>,
+    pub draw_config: DrawConfig,
 }
 
 impl Arc {

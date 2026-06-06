@@ -146,6 +146,9 @@ impl Draw for Text {
         }
         let scale_factor = ctx.scene_config.scale_factor;
         for g in &self.glyph_paths {
+            if g.path_elements.is_empty() {
+                continue;
+            }
             let mut pb = tiny_skia::PathBuilder::new();
             for path in &g.path_elements {
                 match path {
@@ -232,7 +235,7 @@ impl Draw for Text {
 }
 
 impl Text {
-    fn new(
+    pub fn new(
         text: String,
         position: Point3<GMFloat>,
         font_size: GMFloat,

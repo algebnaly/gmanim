@@ -140,8 +140,13 @@ impl Scene {
         ctx.pixmap.save_png(file_path);
     }
 
-    pub fn add(&mut self, mobject: Box<dyn mobjects::Mobject>) {
-        self.mobjects.push(Rc::new(RefCell::new(mobject)));
+    pub fn add(
+        &mut self,
+        mobject: Box<dyn mobjects::Mobject>,
+    ) -> Rc<RefCell<Box<dyn mobjects::Mobject>>> {
+        let rc = Rc::new(RefCell::new(mobject));
+        self.mobjects.push(rc.clone());
+        rc
     }
     pub fn add_ref(&mut self, mobject_ref: Rc<RefCell<Box<dyn mobjects::Mobject>>>) {
         self.mobjects.push(mobject_ref.clone());
@@ -165,7 +170,8 @@ fn test_simple_line_image() {
     };
     scene.add(Box::new(simple_line));
     scene.add(Box::new(simple_line2));
-    scene.save_png(&mut ctx, "simple_line.png");
+    let path = std::env::temp_dir().join("simple_line.png");
+    scene.save_png(&mut ctx, path.to_str().unwrap());
 }
 
 #[test]
@@ -184,7 +190,8 @@ fn test_polyline_image() {
         ..Default::default()
     };
     scene.add(Box::new(polyline));
-    scene.save_png(&mut ctx, "poly_line.png");
+    let path = std::env::temp_dir().join("poly_line.png");
+    scene.save_png(&mut ctx, path.to_str().unwrap());
 }
 
 #[test]
@@ -200,7 +207,8 @@ fn test_rectangle_image() {
         ..Default::default()
     };
     scene.add(Box::new(rectangle));
-    scene.save_png(&mut ctx, "rectangle.png");
+    let path = std::env::temp_dir().join("rectangle.png");
+    scene.save_png(&mut ctx, path.to_str().unwrap());
 }
 
 #[test]
@@ -228,8 +236,9 @@ fn write_frame() {
         ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
     };
 
+    let path = std::env::temp_dir().join("output.mp4");
     let video_config = VideoConfig {
-        filename: "output.mp4".to_owned(),
+        filename: path.to_str().unwrap().to_owned(),
         framerate: 60,
         output_height: 1080,
         output_width: 1920,
@@ -286,8 +295,9 @@ fn thread_frame_pass() {
         VideoConfig,
     };
 
+    let path = std::env::temp_dir().join("output.mp4");
     let video_config = VideoConfig {
-        filename: "output.mp4".to_owned(),
+        filename: path.to_str().unwrap().to_owned(),
         framerate: 60,
         output_height: 1080,
         output_width: 1920,

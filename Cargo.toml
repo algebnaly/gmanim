@@ -1,13 +1,14 @@
 [package]
-name = "gmanim"
+name = "gmanim-core"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "gmanim_core"
 
 [dependencies]
-nalgebra = "*"
-rusttype = "*"
+nalgebra = "0.35"
+rusttype = "0.9.3"
 usvg = "0.47"
 tiny-skia = "0.12"
 fern = "*"
