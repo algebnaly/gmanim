@@ -4,7 +4,6 @@ use std::time::Instant;
 
 use ffmpeg_next::format::{pixel, Pixel};
 
-use ffmpeg_next::packet::Packet;
 use ffmpeg_next::Dictionary;
 use ffmpeg_next::{ChannelLayout, StreamMut};
 
@@ -15,7 +14,7 @@ use yuv::rgba_to_yuv420;
 
 use crate::video_backend::VideoConfig;
 
-const PACKETS_PER_FLUSH: usize = 256;
+pub use crate::video_backend::vaapi::FfmpegVaapiH264Backend;
 
 pub struct FfmpegBackend {
     v_enc: Video,
@@ -25,7 +24,6 @@ pub struct FfmpegBackend {
     a_stream_idx: usize,
     // scaler: scaling::context::Context,
     frame_count: u64,
-    packets_buffer: Vec<Packet>,
 }
 
 impl FfmpegBackend {
@@ -102,7 +100,6 @@ impl FfmpegBackend {
             a_stream_idx,
             // scaler,
             frame_count: 0,
-            packets_buffer: Vec::with_capacity(PACKETS_PER_FLUSH),
         }
     }
 
@@ -141,20 +138,6 @@ impl FfmpegBackend {
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
-        for packet in self.packets_buffer.iter_mut() {
-            packet.set_stream(self.v_stream_idx);
-
-            // since codec time base is different from container's time base,
-            // we need rescale time scale before writing to container
-            packet.rescale_ts(
-                self.v_enc.time_base(),
-                self.octx.stream(self.v_stream_idx).unwrap().time_base(),
-            );
-            packet
-                .write_interleaved(&mut self.octx)
-                .map_err(io::Error::other)?;
-        }
-        self.packets_buffer.clear();
         Ok(())
     }
 
@@ -172,15 +155,17 @@ impl FfmpegBackend {
             let mut packet = ffmpeg_next::Packet::empty();
             match self.v_enc.receive_packet(&mut packet) {
                 Ok(_) => {
-                    self.packets_buffer.push(packet);
+                    packet.set_stream(self.v_stream_idx);
+                    packet.rescale_ts(
+                        self.v_enc.time_base(),
+                        self.octx.stream(self.v_stream_idx).unwrap().time_base(),
+                    );
+                    packet.write_interleaved(&mut self.octx).unwrap();
                 }
                 Err(e) => {
                     break;
                 } // EAGAIN or EOF
             }
-        }
-        if self.packets_buffer.len() >= PACKETS_PER_FLUSH {
-            self.flush().unwrap();
         }
     }
 }

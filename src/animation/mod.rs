@@ -6,7 +6,10 @@ use tiny_skia::Pixmap;
 
 use crate::{
     mobjects::{text::Text, Mobject, MobjectClone, Rectangle, SimpleLine},
-    video_backend::{ffmpeg::FfmpegBackend, FfmpegPipeBackend, FfmpegPipeEncoder},
+    video_backend::{
+        ffmpeg::{FfmpegBackend, FfmpegVaapiH264Backend},
+        FfmpegPipeBackend, FfmpegPipeEncoder,
+    },
     Context, GMFloat, Scene, SceneConfig,
 };
 
@@ -241,7 +244,7 @@ fn test_simple_rotate() {
         ctx: ctx.clone(),
         m: line_ref.clone(),
         animation_config: AnimationConfig {
-            total_frame: 240,
+            total_frame: 1200,
             current_frame: 0,
             rate_function: |x| x,
         },
@@ -270,14 +273,11 @@ fn test_simple_rotate() {
     };
     let mut video_backend_var = VideoBackend {
         backend_type: VideoBackendType::Ffmpeg(FfmpegBackend::new(&video_config)),
+        // backend_type: VideoBackendType::FfmpegVaapiH264(FfmpegVaapiH264Backend::new(&video_config)),
     };
 
-    let mut frames: VecDeque<Vec<u8>> = VecDeque::new();
     for frame in simple_move {
-        frames.push_back(frame);
-    }
-    for f in frames {
-        video_backend_var.write_frame(&f);
+        video_backend_var.write_frame(&frame);
     }
     video_backend_var.close().unwrap();
 }
