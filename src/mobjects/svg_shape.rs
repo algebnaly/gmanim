@@ -5,7 +5,7 @@ use usvg::{tiny_skia_path::PathSegment, Group, Node};
 
 use crate::{
     math_utils::{point2d_to_point3d, point3d_to_point2d},
-    Context, ContextType, GMFloat, Scene,
+    Context, GMFloat, Scene,
 };
 
 use super::{
@@ -98,77 +98,66 @@ impl Draw for SVGPath {
         let scale_factor = ctx.scene_config.scale_factor;
         let scene_width = ctx.scene_config.width;
         let scene_height = ctx.scene_config.height;
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                let mut pb = tiny_skia::PathBuilder::new();
-                for e in &self.elements {
-                    match e {
-                        PathElement::MoveTo(p) => {
-                            pb.move_to(
-                                coordinate_change_x(p.x as f32, ctx.scene_config.width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p.y as f32, ctx.scene_config.height as f32)
-                                    * scale_factor as f32,
-                            );
-                        }
-                        PathElement::LineTo(p) => {
-                            pb.line_to(
-                                coordinate_change_x(p.x as f32, ctx.scene_config.width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p.y as f32, ctx.scene_config.height as f32)
-                                    * scale_factor as f32,
-                            );
-                        }
-                        PathElement::QuadTo(p1, p2) => {
-                            pb.quad_to(
-                                coordinate_change_x(p1.x as f32, ctx.scene_config.width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p1.y as f32, ctx.scene_config.height as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_x(p2.x as f32, ctx.scene_config.width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p2.y as f32, ctx.scene_config.height as f32)
-                                    * scale_factor as f32,
-                            );
-                        }
-                        PathElement::CubicTo(p1, p2, p3) => {
-                            pb.cubic_to(
-                                coordinate_change_x(p1.x as f32, scene_width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p1.y as f32, scene_height as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_x(p2.x as f32, scene_width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p2.y as f32, scene_height as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_x(p3.x as f32, scene_width as f32)
-                                    * scale_factor as f32,
-                                coordinate_change_y(p3.y as f32, scene_height as f32)
-                                    * scale_factor as f32,
-                            );
-                        }
-                        PathElement::Close => {
-                            pb.close();
-                        }
-                    }
+        let mut pb = tiny_skia::PathBuilder::new();
+        for e in &self.elements {
+            match e {
+                PathElement::MoveTo(p) => {
+                    pb.move_to(
+                        coordinate_change_x(p.x as f32, ctx.scene_config.width as f32)
+                            * scale_factor as f32,
+                        coordinate_change_y(p.y as f32, ctx.scene_config.height as f32)
+                            * scale_factor as f32,
+                    );
                 }
-                let path = pb.finish().unwrap();
-
-                let mut stroke = tiny_skia::Stroke::default();
-                stroke.width = self.draw_config.stoke_width * scale_factor;
-                stroke.line_cap = tiny_skia::LineCap::Round;
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color(self.draw_config.color.into());
-                pixmap.fill_path(
-                    &path,
-                    &paint,
-                    Default::default(),
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
+                PathElement::LineTo(p) => {
+                    pb.line_to(
+                        coordinate_change_x(p.x as f32, ctx.scene_config.width as f32)
+                            * scale_factor as f32,
+                        coordinate_change_y(p.y as f32, ctx.scene_config.height as f32)
+                            * scale_factor as f32,
+                    );
+                }
+                PathElement::QuadTo(p1, p2) => {
+                    pb.quad_to(
+                        coordinate_change_x(p1.x as f32, ctx.scene_config.width as f32)
+                            * scale_factor as f32,
+                        coordinate_change_y(p1.y as f32, ctx.scene_config.height as f32)
+                            * scale_factor as f32,
+                        coordinate_change_x(p2.x as f32, ctx.scene_config.width as f32)
+                            * scale_factor as f32,
+                        coordinate_change_y(p2.y as f32, ctx.scene_config.height as f32)
+                            * scale_factor as f32,
+                    );
+                }
+                PathElement::CubicTo(p1, p2, p3) => {
+                    pb.cubic_to(
+                        coordinate_change_x(p1.x as f32, scene_width as f32) * scale_factor as f32,
+                        coordinate_change_y(p1.y as f32, scene_height as f32) * scale_factor as f32,
+                        coordinate_change_x(p2.x as f32, scene_width as f32) * scale_factor as f32,
+                        coordinate_change_y(p2.y as f32, scene_height as f32) * scale_factor as f32,
+                        coordinate_change_x(p3.x as f32, scene_width as f32) * scale_factor as f32,
+                        coordinate_change_y(p3.y as f32, scene_height as f32) * scale_factor as f32,
+                    );
+                }
+                PathElement::Close => {
+                    pb.close();
+                }
             }
-            _ => {}
         }
+        let path = pb.finish().unwrap();
+
+        let mut stroke = tiny_skia::Stroke::default();
+        stroke.width = self.draw_config.stoke_width * scale_factor;
+        stroke.line_cap = tiny_skia::LineCap::Round;
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color(self.draw_config.color.into());
+        ctx.pixmap.fill_path(
+            &path,
+            &paint,
+            Default::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 

@@ -5,7 +5,8 @@ use std::sync::mpsc::{self, channel, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
-use crate::video_backend::ffmpeg::{FfmpegBackend, FfmpegVaapiH264Backend};
+use crate::video_backend::ffmpeg::FfmpegBackend;
+use crate::video_backend::vaapi::FfmpegVaapiBackend;
 pub mod ffmpeg;
 pub mod vaapi;
 
@@ -13,7 +14,7 @@ const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
     FfmpegPipe(FfmpegPipeBackend),
     Ffmpeg(FfmpegBackend),
-    FfmpegVaapiH264(FfmpegVaapiH264Backend),
+    Vaapi(FfmpegVaapiBackend),
     BgraRAW(BgraRAWBackend),
     Gstreamer,
 }
@@ -114,7 +115,7 @@ impl VideoBackend {
             VideoBackendType::Ffmpeg(f) => {
                 f.write_frame(frame_data);
             }
-            VideoBackendType::FfmpegVaapiH264(f) => {
+            VideoBackendType::Vaapi(f) => {
                 f.write_frame(frame_data);
             }
             VideoBackendType::BgraRAW(f) => {
@@ -129,7 +130,7 @@ impl VideoBackend {
         match &mut self.backend_type {
             VideoBackendType::FfmpegPipe(f) => f.close(),
             VideoBackendType::Ffmpeg(f) => f.finish(),
-            VideoBackendType::FfmpegVaapiH264(f) => f.finish(),
+            VideoBackendType::Vaapi(f) => f.finish(),
             _ => Ok(()),
         }
     }
@@ -394,10 +395,10 @@ impl BgraRAWBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::video_backend::ffmpeg::FfmpegVaapiH264Backend;
+    use crate::video_backend::vaapi::FfmpegVaapiBackend;
 
     #[test]
-    fn vaapi_h264_backend_is_available_through_video_backend_type() {
+    fn vaapi_backend_is_available_through_video_backend_type() {
         let config = VideoConfig {
             filename: "/tmp/gmanim-vaapi-api-test.mp4".to_owned(),
             framerate: 30,
@@ -406,13 +407,17 @@ mod tests {
             color_order: ColorOrder::Rgba,
         };
 
-        let backend = FfmpegVaapiH264Backend::new(&config);
-        let mut video_backend = VideoBackend {
-            backend_type: VideoBackendType::FfmpegVaapiH264(backend),
-        };
+        let mut backend = FfmpegVaapiBackend::new(&config);
 
-        let frame = vec![0; (config.output_width * config.output_height * 4) as usize];
-        video_backend.write_frame(&frame);
-        video_backend.close().unwrap();
+        // Test zero-copy path: acquire → fill → submit
+        let mut buf = backend.acquire_buffer();
+        buf.as_mut_slice().fill(128);
+        backend.submit_frame(buf);
+
+        // Test compatibility path: write_frame(&[u8])
+        let frame = vec![64u8; (config.output_width * config.output_height * 4) as usize];
+        backend.write_frame(&frame);
+
+        backend.finish().unwrap();
     }
 }

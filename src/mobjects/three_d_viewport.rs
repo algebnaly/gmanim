@@ -1,6 +1,6 @@
 use std::f32::INFINITY;
 
-use crate::{math_utils::constants::PI, mobjects::Transform, Color, ContextType};
+use crate::{math_utils::constants::PI, mobjects::Transform, Color};
 use nalgebra::{Isometry2, Matrix2, Point2, Point3, Point4, RealField};
 use tiny_skia::{Pixmap, PixmapPaint};
 
@@ -72,96 +72,89 @@ impl Draw for ThreeDViewport {
         if pixmap_size.1 == 0 {
             return;
         }
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                let mut z_buffer: Vec<Vec<GMFloat>> = (0..pixmap_size.1)
-                    .map(|_| (0..pixmap_size.0).map(|_| -GMFloat::INFINITY).collect())
-                    .collect();
-                let mut new_pixmap = Pixmap::new(pixmap_size.0, pixmap_size.1).unwrap();
-                for t in &self.triangle_list {
-                    let camera_transform = self.camera.get_camera_transform_matrix();
-                    let projection_transform = self.camera.get_projection_transform_matrix();
-                    let m = projection_transform * camera_transform;
-                    let p0_p = m * t.p0.to_homogeneous();
-                    let p1_p = m * t.p1.to_homogeneous();
-                    let p2_p = m * t.p2.to_homogeneous();
-                    let p_x_list = [
-                        (p0_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
-                        (p1_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
-                        (p2_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
-                    ];
-                    let p_y_list = [
-                        (p0_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
-                        (p1_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
-                        (p2_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
-                    ];
+        let mut z_buffer: Vec<Vec<GMFloat>> = (0..pixmap_size.1)
+            .map(|_| (0..pixmap_size.0).map(|_| -GMFloat::INFINITY).collect())
+            .collect();
+        let mut new_pixmap = Pixmap::new(pixmap_size.0, pixmap_size.1).unwrap();
+        for t in &self.triangle_list {
+            let camera_transform = self.camera.get_camera_transform_matrix();
+            let projection_transform = self.camera.get_projection_transform_matrix();
+            let m = projection_transform * camera_transform;
+            let p0_p = m * t.p0.to_homogeneous();
+            let p1_p = m * t.p1.to_homogeneous();
+            let p2_p = m * t.p2.to_homogeneous();
+            let p_x_list = [
+                (p0_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
+                (p1_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
+                (p2_p[0] + 1.0) / 2.0 * pixmap_size.0 as GMFloat,
+            ];
+            let p_y_list = [
+                (p0_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
+                (p1_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
+                (p2_p[1] + 1.0) / 2.0 * pixmap_size.1 as GMFloat,
+            ];
 
-                    let x_min = p_x_list
-                        .into_iter()
-                        .map(|x| x as i32)
-                        .min()
-                        .unwrap()
-                        .clone()
-                        .clamp(0, pixmap_size.0 as i32);
-                    let x_max = p_x_list
-                        .into_iter()
-                        .map(|x| x as i32)
-                        .max()
-                        .unwrap()
-                        .clone()
-                        .clamp(0, pixmap_size.0 as i32);
-                    let y_min = p_y_list
-                        .into_iter()
-                        .map(|y| y as i32)
-                        .min()
-                        .unwrap()
-                        .clone()
-                        .clamp(0, pixmap_size.1 as i32);
-                    let y_max = p_y_list
-                        .into_iter()
-                        .map(|y| y as i32)
-                        .max()
-                        .unwrap()
-                        .clone()
-                        .clamp(0, pixmap_size.1 as i32);
-                    for x in x_min..x_max {
-                        for y in y_min..y_max {
-                            let half_width = pixmap_size.0 as GMFloat / 2.0;
-                            let half_height = pixmap_size.1 as GMFloat / 2.0;
-                            let x_r = x as GMFloat / half_width - 1.0;
-                            let y_r = y as GMFloat / half_height - 1.0;
+            let x_min = p_x_list
+                .into_iter()
+                .map(|x| x as i32)
+                .min()
+                .unwrap()
+                .clone()
+                .clamp(0, pixmap_size.0 as i32);
+            let x_max = p_x_list
+                .into_iter()
+                .map(|x| x as i32)
+                .max()
+                .unwrap()
+                .clone()
+                .clamp(0, pixmap_size.0 as i32);
+            let y_min = p_y_list
+                .into_iter()
+                .map(|y| y as i32)
+                .min()
+                .unwrap()
+                .clone()
+                .clamp(0, pixmap_size.1 as i32);
+            let y_max = p_y_list
+                .into_iter()
+                .map(|y| y as i32)
+                .max()
+                .unwrap()
+                .clone()
+                .clamp(0, pixmap_size.1 as i32);
+            for x in x_min..x_max {
+                for y in y_min..y_max {
+                    let half_width = pixmap_size.0 as GMFloat / 2.0;
+                    let half_height = pixmap_size.1 as GMFloat / 2.0;
+                    let x_r = x as GMFloat / half_width - 1.0;
+                    let y_r = y as GMFloat / half_height - 1.0;
 
-                            if let Some(new_z) = try_triangle_inner_z(
-                                Point3::from_homogeneous(p0_p).unwrap(),
-                                Point3::from_homogeneous(p1_p).unwrap(),
-                                Point3::from_homogeneous(p2_p).unwrap(),
-                                Point2::new(x_r, y_r),
-                            ) {
-                                if z_buffer[y as usize][x as usize] < new_z {
-                                    z_buffer[y as usize][x as usize] = new_z;
-                                    let pix_list = new_pixmap.pixels_mut();
-                                    pix_list[y as usize * pixmap_size.0 as usize + x as usize] =
-                                        tiny_skia::PremultipliedColorU8::from_rgba(
-                                            255, 255, 0, 255,
-                                        )
-                                        .unwrap();
-                                }
-                            }
+                    if let Some(new_z) = try_triangle_inner_z(
+                        Point3::from_homogeneous(p0_p).unwrap(),
+                        Point3::from_homogeneous(p1_p).unwrap(),
+                        Point3::from_homogeneous(p2_p).unwrap(),
+                        Point2::new(x_r, y_r),
+                    ) {
+                        if z_buffer[y as usize][x as usize] < new_z {
+                            z_buffer[y as usize][x as usize] = new_z;
+                            let pix_list = new_pixmap.pixels_mut();
+                            pix_list[y as usize * pixmap_size.0 as usize + x as usize] =
+                                tiny_skia::PremultipliedColorU8::from_rgba(255, 255, 0, 255)
+                                    .unwrap();
                         }
                     }
                 }
-                new_pixmap.save_png("out1.png");
-                pixmap.draw_pixmap(
-                    0,
-                    0,
-                    new_pixmap.as_ref(),
-                    &PixmapPaint::default(),
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
             }
-            _ => {}
         }
+        new_pixmap.save_png("out1.png");
+        ctx.pixmap.draw_pixmap(
+            0,
+            0,
+            new_pixmap.as_ref(),
+            &PixmapPaint::default(),
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -177,10 +170,7 @@ pub fn test_three_d() {
         p2: Point3::new(0.75, 0.66, 0.66),
     });
     three_d_vp.draw(&mut ctx);
-    match ctx.ctx_type {
-        ContextType::TinySKIA(t) => t.save_png("output.png").unwrap(),
-        _ => {}
-    }
+    ctx.pixmap.save_png("output.png").unwrap();
 }
 
 #[inline]

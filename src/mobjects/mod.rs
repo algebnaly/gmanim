@@ -5,9 +5,7 @@ pub trait MobjectClone: Mobject {
 
 use std::f32::consts::PI;
 
-use crate::{
-    math_utils::k_for_bezier_arc, Color, Context, ContextType, GMFloat, Scene, SceneConfig,
-};
+use crate::{math_utils::k_for_bezier_arc, Color, Context, GMFloat, Scene, SceneConfig};
 
 use nalgebra::{point, Point, Point2, Point3, Vector2, Vector3};
 use tiny_skia::{LineCap, LineJoin, Paint, Stroke, StrokeDash};
@@ -86,51 +84,46 @@ impl Transform for Rectangle {
 
 impl Draw for Rectangle {
     fn draw(self: &Self, ctx: &mut Context) {
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                let scale_factor = ctx.scene_config.scale_factor;
-                let mut pb = tiny_skia::PathBuilder::new();
-                let p0 = (
-                    coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                let p1 = (
-                    coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                let p2 = (
-                    coordinate_change_x(self.p2[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p2[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                let p3 = (
-                    coordinate_change_x(self.p3[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p3[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                pb.move_to(p0.0 as f32, p0.1 as f32);
-                pb.line_to(p1.0 as f32, p1.1 as f32);
-                pb.line_to(p2.0 as f32, p2.1 as f32);
-                pb.line_to(p3.0 as f32, p3.1 as f32);
-                pb.line_to(p0.0 as f32, p0.1 as f32);
-                let path = pb.finish().unwrap();
+        let scale_factor = ctx.scene_config.scale_factor;
+        let mut pb = tiny_skia::PathBuilder::new();
+        let p0 = (
+            coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        let p1 = (
+            coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        let p2 = (
+            coordinate_change_x(self.p2[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p2[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        let p3 = (
+            coordinate_change_x(self.p3[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p3[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        pb.move_to(p0.0 as f32, p0.1 as f32);
+        pb.line_to(p1.0 as f32, p1.1 as f32);
+        pb.line_to(p2.0 as f32, p2.1 as f32);
+        pb.line_to(p3.0 as f32, p3.1 as f32);
+        pb.line_to(p0.0 as f32, p0.1 as f32);
+        let path = pb.finish().unwrap();
 
-                let mut stroke = Stroke::default();
-                stroke.width = self.draw_config.stoke_width * scale_factor;
-                stroke.line_cap = LineCap::Round;
-                stroke.line_join = LineJoin::Round;
-                let mut paint = Paint::default();
-                paint.set_color(self.draw_config.color.into());
+        let mut stroke = Stroke::default();
+        stroke.width = self.draw_config.stoke_width * scale_factor;
+        stroke.line_cap = LineCap::Round;
+        stroke.line_join = LineJoin::Round;
+        let mut paint = Paint::default();
+        paint.set_color(self.draw_config.color.into());
 
-                paint.anti_alias = true;
-                pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
-            }
-            _ => {}
-        }
+        paint.anti_alias = true;
+        ctx.pixmap.stroke_path(
+            &path,
+            &paint,
+            &stroke,
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -162,38 +155,33 @@ impl Transform for SimpleLine {
 impl Draw for SimpleLine {
     fn draw(self: &Self, ctx: &mut Context) {
         let scale_factor = ctx.scene_config.scale_factor;
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                let mut pb = tiny_skia::PathBuilder::new();
-                let p0 = (
-                    coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                let p1 = (
-                    coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
-                );
-                pb.move_to(p0.0 as f32, p0.1 as f32);
-                pb.line_to(p1.0 as f32, p1.1 as f32);
-                let path = pb.finish().unwrap();
+        let mut pb = tiny_skia::PathBuilder::new();
+        let p0 = (
+            coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        let p1 = (
+            coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
+        );
+        pb.move_to(p0.0 as f32, p0.1 as f32);
+        pb.line_to(p1.0 as f32, p1.1 as f32);
+        let path = pb.finish().unwrap();
 
-                let mut stroke = Stroke::default();
-                stroke.width = self.draw_config.stoke_width * scale_factor;
-                stroke.line_cap = LineCap::Round;
-                stroke.line_join = LineJoin::Round;
-                let mut paint = Paint::default();
-                paint.set_color(self.draw_config.color.into());
+        let mut stroke = Stroke::default();
+        stroke.width = self.draw_config.stoke_width * scale_factor;
+        stroke.line_cap = LineCap::Round;
+        stroke.line_join = LineJoin::Round;
+        let mut paint = Paint::default();
+        paint.set_color(self.draw_config.color.into());
 
-                pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
-            }
-            _ => {}
-        }
+        ctx.pixmap.stroke_path(
+            &path,
+            &paint,
+            &stroke,
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 
@@ -263,55 +251,50 @@ impl Draw for Arc {
         let scale_factor = ctx.scene_config.scale_factor;
         let scene_width = ctx.scene_config.width;
         let scene_height = ctx.scene_config.height;
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                for i in 0..(self._segs - 1) {
-                    let mut pb = tiny_skia::PathBuilder::new();
-                    // approximate arc by cubic bezier curve here
-                    let start_angle = self._seg_list[i];
-                    let end_angle = self._seg_list[i + 1];
-                    let k = k_for_bezier_arc((end_angle - start_angle) / 2.0);
-                    let point_0 = self.center_point.xy()
-                        + Vector2::new(end_angle.cos(), end_angle.sin()) * self.radius;
+        for i in 0..(self._segs - 1) {
+            let mut pb = tiny_skia::PathBuilder::new();
+            // approximate arc by cubic bezier curve here
+            let start_angle = self._seg_list[i];
+            let end_angle = self._seg_list[i + 1];
+            let k = k_for_bezier_arc((end_angle - start_angle) / 2.0);
+            let point_0 = self.center_point.xy()
+                + Vector2::new(end_angle.cos(), end_angle.sin()) * self.radius;
 
-                    let point_3 = self.center_point.xy()
-                        + Vector2::new(start_angle.cos(), start_angle.sin()) * self.radius;
+            let point_3 = self.center_point.xy()
+                + Vector2::new(start_angle.cos(), start_angle.sin()) * self.radius;
 
-                    let point_1 =
-                        point_0 + Vector2::new(end_angle.sin(), -end_angle.cos()) * k * self.radius;
-                    let point_2 = point_3
-                        + Vector2::new(-start_angle.sin(), start_angle.cos()) * k * self.radius;
-                    pb.move_to(
-                        coordinate_change_x(point_0.x, scene_width) * scale_factor,
-                        coordinate_change_y(point_0.y, scene_height) * scale_factor,
-                    );
-                    pb.cubic_to(
-                        coordinate_change_x(point_1.x, scene_width) * scale_factor,
-                        coordinate_change_y(point_1.y, scene_height) * scale_factor,
-                        coordinate_change_x(point_2.x, scene_width) * scale_factor,
-                        coordinate_change_y(point_2.y, scene_height) * scale_factor,
-                        coordinate_change_x(point_3.x, scene_width) * scale_factor,
-                        coordinate_change_y(point_3.y, scene_height) * scale_factor,
-                    );
+            let point_1 =
+                point_0 + Vector2::new(end_angle.sin(), -end_angle.cos()) * k * self.radius;
+            let point_2 =
+                point_3 + Vector2::new(-start_angle.sin(), start_angle.cos()) * k * self.radius;
+            pb.move_to(
+                coordinate_change_x(point_0.x, scene_width) * scale_factor,
+                coordinate_change_y(point_0.y, scene_height) * scale_factor,
+            );
+            pb.cubic_to(
+                coordinate_change_x(point_1.x, scene_width) * scale_factor,
+                coordinate_change_y(point_1.y, scene_height) * scale_factor,
+                coordinate_change_x(point_2.x, scene_width) * scale_factor,
+                coordinate_change_y(point_2.y, scene_height) * scale_factor,
+                coordinate_change_x(point_3.x, scene_width) * scale_factor,
+                coordinate_change_y(point_3.y, scene_height) * scale_factor,
+            );
 
-                    let path = pb.finish().unwrap();
-                    let mut stroke = Stroke::default();
-                    stroke.width = self.draw_config.stoke_width * scale_factor;
-                    stroke.line_cap = LineCap::Round;
-                    stroke.line_join = LineJoin::Round;
-                    let mut paint = Paint::default();
-                    paint.set_color(self.draw_config.color.into());
+            let path = pb.finish().unwrap();
+            let mut stroke = Stroke::default();
+            stroke.width = self.draw_config.stoke_width * scale_factor;
+            stroke.line_cap = LineCap::Round;
+            stroke.line_join = LineJoin::Round;
+            let mut paint = Paint::default();
+            paint.set_color(self.draw_config.color.into());
 
-                    pixmap.stroke_path(
-                        &path,
-                        &paint,
-                        &stroke,
-                        tiny_skia::Transform::identity(),
-                        None,
-                    );
-                }
-            }
-            _ => {}
+            ctx.pixmap.stroke_path(
+                &path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
         }
     }
 }
@@ -330,42 +313,36 @@ impl Draw for PolyLine {
 
         let scale_factor = ctx.scene_config.scale_factor;
 
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                let mut pb = tiny_skia::PathBuilder::new();
-                let p0 = (
-                    coordinate_change_x(self.points[0][(0)], ctx.scene_config.width) * scale_factor,
-                    coordinate_change_y(self.points[0][(1)], ctx.scene_config.height)
-                        * scale_factor,
-                );
-                pb.move_to(p0.0 as f32, p0.1 as f32);
-                for p in self.points[1..].iter() {
-                    let point = (
-                        coordinate_change_x(p[(0)], ctx.scene_config.width) * scale_factor,
-                        coordinate_change_y(p[(1)], ctx.scene_config.height) * scale_factor,
-                    );
-                    pb.line_to(point.0 as f32, point.1 as f32);
-                }
-                let path = pb.finish().unwrap();
-
-                let mut stroke = Stroke::default();
-                stroke.width = self.draw_config.stoke_width * scale_factor;
-                stroke.line_cap = LineCap::Round;
-                stroke.line_join = LineJoin::Round;
-
-                let mut paint = Paint::default();
-                paint.set_color(self.draw_config.color.into());
-
-                pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
-            }
-            _ => {}
+        let mut pb = tiny_skia::PathBuilder::new();
+        let p0 = (
+            coordinate_change_x(self.points[0][(0)], ctx.scene_config.width) * scale_factor,
+            coordinate_change_y(self.points[0][(1)], ctx.scene_config.height) * scale_factor,
+        );
+        pb.move_to(p0.0 as f32, p0.1 as f32);
+        for p in self.points[1..].iter() {
+            let point = (
+                coordinate_change_x(p[(0)], ctx.scene_config.width) * scale_factor,
+                coordinate_change_y(p[(1)], ctx.scene_config.height) * scale_factor,
+            );
+            pb.line_to(point.0 as f32, point.1 as f32);
         }
+        let path = pb.finish().unwrap();
+
+        let mut stroke = Stroke::default();
+        stroke.width = self.draw_config.stoke_width * scale_factor;
+        stroke.line_cap = LineCap::Round;
+        stroke.line_join = LineJoin::Round;
+
+        let mut paint = Paint::default();
+        paint.set_color(self.draw_config.color.into());
+
+        ctx.pixmap.stroke_path(
+            &path,
+            &paint,
+            &stroke,
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 

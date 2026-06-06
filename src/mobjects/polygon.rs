@@ -20,36 +20,31 @@ impl Polygon {
 }
 impl Draw for Polygon {
     fn draw(&self, ctx: &mut crate::Context) {
-        match &mut ctx.ctx_type {
-            crate::ContextType::TinySKIA(pixmap) => {
-                let mut pb = tiny_skia::PathBuilder::new();
-                let mut v_list = self.vertices.iter();
-                let start = v_list.next().unwrap();
+        let mut pb = tiny_skia::PathBuilder::new();
+        let mut v_list = self.vertices.iter();
+        let start = v_list.next().unwrap();
 
-                pb.move_to(
-                    ctx.scene_config.convert_coord_x(start.x),
-                    ctx.scene_config.convert_coord_y(start.y),
-                );
-                for p in v_list {
-                    pb.line_to(
-                        ctx.scene_config.convert_coord_x(p.x),
-                        ctx.scene_config.convert_coord_y(p.y),
-                    );
-                }
-                pb.close();
-                let path = pb.finish().unwrap();
-                let mut paint = Paint::default();
-                paint.set_color(self.draw_config.color.into());
-                pixmap.fill_path(
-                    &path,
-                    &paint,
-                    FillRule::EvenOdd,
-                    tiny_skia::Transform::identity(),
-                    None,
-                );
-            }
-            _ => {}
+        pb.move_to(
+            ctx.scene_config.convert_coord_x(start.x),
+            ctx.scene_config.convert_coord_y(start.y),
+        );
+        for p in v_list {
+            pb.line_to(
+                ctx.scene_config.convert_coord_x(p.x),
+                ctx.scene_config.convert_coord_y(p.y),
+            );
         }
+        pb.close();
+        let path = pb.finish().unwrap();
+        let mut paint = Paint::default();
+        paint.set_color(self.draw_config.color.into());
+        ctx.pixmap.fill_path(
+            &path,
+            &paint,
+            FillRule::EvenOdd,
+            tiny_skia::Transform::identity(),
+            None,
+        );
     }
 }
 

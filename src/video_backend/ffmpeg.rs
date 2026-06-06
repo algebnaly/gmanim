@@ -14,8 +14,6 @@ use yuv::rgba_to_yuv420;
 
 use crate::video_backend::VideoConfig;
 
-pub use crate::video_backend::vaapi::FfmpegVaapiH264Backend;
-
 pub struct FfmpegBackend {
     v_enc: Video,
     a_enc: Audio,

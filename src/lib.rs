@@ -58,13 +58,6 @@ impl Default for Color {
     }
 }
 
-pub enum ContextType {
-    TinySKIA(tiny_skia::Pixmap), // we always have cairo as a fallback
-    VULKAN,
-    CUDA,
-    HIP,
-}
-
 pub struct SceneConfig {
     pub width: GMFloat,
     pub height: GMFloat,
@@ -74,7 +67,7 @@ pub struct SceneConfig {
 }
 
 pub struct Context {
-    pub ctx_type: ContextType,
+    pub pixmap: tiny_skia::Pixmap,
     pub scene_config: SceneConfig,
 }
 
@@ -105,7 +98,7 @@ impl Default for Context {
         let pixmap =
             tiny_skia::Pixmap::new(scene_config.output_width, scene_config.output_height).unwrap();
         Self {
-            ctx_type: ContextType::TinySKIA(pixmap),
+            pixmap,
             scene_config,
         }
     }
@@ -113,19 +106,18 @@ impl Default for Context {
 
 impl Context {
     fn clear_transparent(&mut self) {
-        match &mut self.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xff));
-            }
-            _ => {}
-        }
+        self.pixmap
+            .fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xff));
     }
 
     fn image_bytes(&self) -> &[u8] {
-        match &self.ctx_type {
-            ContextType::TinySKIA(pixmap) => pixmap.data(),
-            _ => &[],
-        }
+        self.pixmap.data()
+    }
+
+    /// Copy rendered pixels directly into the provided buffer (avoids to_vec() allocation).
+    pub fn copy_image_into(&self, dst: &mut [u8]) {
+        let src = self.image_bytes();
+        dst[..src.len()].copy_from_slice(src);
     }
 }
 
@@ -145,12 +137,7 @@ impl Scene {
             m.borrow().draw(ctx);
         }
 
-        match &mut ctx.ctx_type {
-            ContextType::TinySKIA(pixmap) => {
-                pixmap.save_png(file_path);
-            }
-            _ => {}
-        }
+        ctx.pixmap.save_png(file_path);
     }
 
     pub fn add(&mut self, mobject: Box<dyn mobjects::Mobject>) {
