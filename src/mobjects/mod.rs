@@ -1,4 +1,19 @@
-pub trait Mobject: Transform + Draw {}
+pub trait Mobject: Transform + Draw {
+    fn get_position(&self) -> nalgebra::Point3<GMFloat> {
+        let mat = self.get_model_matrix();
+        nalgebra::Point3::new(mat.m14, mat.m24, mat.m34)
+    }
+    fn set_position(&mut self, pos: nalgebra::Point3<GMFloat>) {
+        let mut mat = self.get_model_matrix();
+        mat.m14 = pos.x;
+        mat.m24 = pos.y;
+        mat.m34 = pos.z;
+        self.set_model_matrix(mat);
+    }
+    fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
+        None
+    }
+}
 pub trait MobjectClone: Mobject {
     fn mobject_clone(&self) -> Box<dyn MobjectClone>;
 }
@@ -12,6 +27,7 @@ use tiny_skia::{LineCap, LineJoin, Paint, Stroke, StrokeDash};
 pub mod dot;
 pub mod formula;
 pub mod group;
+pub mod object_3d;
 pub mod path;
 pub mod polygon;
 pub mod svg_shape;
@@ -20,20 +36,29 @@ pub mod three_d_viewport;
 pub use dot::Dot;
 
 pub trait Transform {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>);
-    fn scale(&mut self, scale_factor: GMFloat) {
-        let scaling_matrix = nalgebra::Matrix4::new_scaling(scale_factor);
-        self.transform(nalgebra::Transform::from_matrix_unchecked(scaling_matrix));
+    // Modify the model_matrix natively
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat>;
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>);
+
+    fn apply_transform(&mut self, transform: nalgebra::Matrix4<GMFloat>) {
+        let current = self.get_model_matrix();
+        self.set_model_matrix(transform * current);
     }
+    
     fn move_this(&mut self, movement: nalgebra::Vector3<GMFloat>) {
         let movement_matrix = nalgebra::Matrix4::new_translation(&movement);
-        self.transform(nalgebra::Transform::from_matrix_unchecked(movement_matrix));
+        self.apply_transform(movement_matrix);
+    }
+    
+    fn scale(&mut self, scale_factor: GMFloat) {
+        let scaling_matrix = nalgebra::Matrix4::new_scaling(scale_factor);
+        self.apply_transform(scaling_matrix);
     }
 }
 
 pub trait Draw {
-    //draw shape without fill()
-    fn draw(&self, ctx: &mut Context);
+    // draw shape, incorporating accumulated parent transformations
+    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -53,12 +78,27 @@ impl Default for DrawConfig {
     }
 }
 
+impl DrawConfig {
+    pub fn get_stroke(&self, scale_factor: f32) -> Option<tiny_skia::Stroke> {
+        if self.stoke_width <= 0.0 {
+            return None;
+        }
+        let mut stroke = tiny_skia::Stroke::default();
+        stroke.width = self.stoke_width as f32 * scale_factor;
+        stroke.line_cap = tiny_skia::LineCap::Round;
+        stroke.line_join = tiny_skia::LineJoin::Round;
+        Some(stroke)
+    }
+}
+
 pub struct Rectangle {
-    pub p0: Point3<GMFloat>,
-    pub p1: Point3<GMFloat>,
-    pub p2: Point3<GMFloat>,
-    pub p3: Point3<GMFloat>,
+    pub p0: Point3<GMFloat>, // Top left
+    pub p1: Point3<GMFloat>, // Bottom left
+    pub p2: Point3<GMFloat>, // Bottom right
+    pub p3: Point3<GMFloat>, // Top right
+    pub color: Color,
     pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Default for Rectangle {
@@ -68,62 +108,73 @@ impl Default for Rectangle {
             p1: Point3::new(1.0, 0.0, 0.0),
             p2: Point3::new(1.0, 1.0, 0.0),
             p3: Point3::new(0.0, 1.0, 0.0),
+            color: Color::default(),
             draw_config: DrawConfig::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
 impl Transform for Rectangle {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        self.p0 = transform * self.p0;
-        self.p1 = transform * self.p1;
-        self.p2 = transform * self.p2;
-        self.p3 = transform * self.p3;
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
 impl Draw for Rectangle {
-    fn draw(self: &Self, ctx: &mut Context) {
-        let scale_factor = ctx.scene_config.scale_factor;
+    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
+
         let mut pb = tiny_skia::PathBuilder::new();
-        let p0 = (
-            coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
+        pb.move_to(
+            ctx.scene_config.convert_coord_x(self.p0.x),
+            ctx.scene_config.convert_coord_y(self.p0.y),
         );
-        let p1 = (
-            coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
+        pb.line_to(
+            ctx.scene_config.convert_coord_x(self.p1.x),
+            ctx.scene_config.convert_coord_y(self.p1.y),
         );
-        let p2 = (
-            coordinate_change_x(self.p2[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p2[(1)], ctx.scene_config.height) * scale_factor,
+        pb.line_to(
+            ctx.scene_config.convert_coord_x(self.p2.x),
+            ctx.scene_config.convert_coord_y(self.p2.y),
         );
-        let p3 = (
-            coordinate_change_x(self.p3[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p3[(1)], ctx.scene_config.height) * scale_factor,
+        pb.line_to(
+            ctx.scene_config.convert_coord_x(self.p3.x),
+            ctx.scene_config.convert_coord_y(self.p3.y),
         );
-        pb.move_to(p0.0 as f32, p0.1 as f32);
-        pb.line_to(p1.0 as f32, p1.1 as f32);
-        pb.line_to(p2.0 as f32, p2.1 as f32);
-        pb.line_to(p3.0 as f32, p3.1 as f32);
-        pb.line_to(p0.0 as f32, p0.1 as f32);
+        pb.close();
         let path = pb.finish().unwrap();
 
-        let mut stroke = Stroke::default();
-        stroke.width = self.draw_config.stoke_width * scale_factor;
-        stroke.line_cap = LineCap::Round;
-        stroke.line_join = LineJoin::Round;
-        let mut paint = Paint::default();
-        paint.set_color(self.draw_config.color.into());
+        let mut paint = tiny_skia::Paint::default();
+        paint.set_color(self.color.into());
 
-        paint.anti_alias = true;
-        ctx.pixmap.stroke_path(
-            &path,
-            &paint,
-            &stroke,
-            tiny_skia::Transform::identity(),
-            None,
-        );
+        if let Some(mut st) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
+            ctx.pixmap.stroke_path(
+                &path,
+                &paint,
+                &st,
+                ts_transform,
+                None,
+            );
+        }
+
+        if self.draw_config.fill {
+            ctx.pixmap.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::EvenOdd,
+                ts_transform,
+                None,
+            );
+        }
     }
 }
 
@@ -133,55 +184,61 @@ pub struct SimpleLine {
     pub p0: Point3<GMFloat>,
     pub p1: Point3<GMFloat>,
     pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
-impl Default for SimpleLine {
-    fn default() -> Self {
-        SimpleLine {
-            p0: Point3::new(0.0, 0.0, 0.0),
-            p1: Point3::new(1.0, 0.0, 0.0),
+impl SimpleLine {
+    pub fn new(p0: Point3<GMFloat>, p1: Point3<GMFloat>) -> Self {
+        Self {
+            p0,
+            p1,
             draw_config: DrawConfig::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
 impl Transform for SimpleLine {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        self.p0 = transform * self.p0;
-        self.p1 = transform * self.p1;
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
 impl Draw for SimpleLine {
-    fn draw(self: &Self, ctx: &mut Context) {
-        let scale_factor = ctx.scene_config.scale_factor;
+    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
+
         let mut pb = tiny_skia::PathBuilder::new();
-        let p0 = (
-            coordinate_change_x(self.p0[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p0[(1)], ctx.scene_config.height) * scale_factor,
+        pb.move_to(
+            ctx.scene_config.convert_coord_x(self.p0.x),
+            ctx.scene_config.convert_coord_y(self.p0.y),
         );
-        let p1 = (
-            coordinate_change_x(self.p1[(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.p1[(1)], ctx.scene_config.height) * scale_factor,
+        pb.line_to(
+            ctx.scene_config.convert_coord_x(self.p1.x),
+            ctx.scene_config.convert_coord_y(self.p1.y),
         );
-        pb.move_to(p0.0 as f32, p0.1 as f32);
-        pb.line_to(p1.0 as f32, p1.1 as f32);
-        let path = pb.finish().unwrap();
+        if let Some(path) = pb.finish() {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color(self.draw_config.color.into());
 
-        let mut stroke = Stroke::default();
-        stroke.width = self.draw_config.stoke_width * scale_factor;
-        stroke.line_cap = LineCap::Round;
-        stroke.line_join = LineJoin::Round;
-        let mut paint = Paint::default();
-        paint.set_color(self.draw_config.color.into());
-
-        ctx.pixmap.stroke_path(
-            &path,
-            &paint,
-            &stroke,
-            tiny_skia::Transform::identity(),
-            None,
-        );
+            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
+                ctx.pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    ts_transform,
+                    None,
+                );
+            }
+        }
     }
 }
 
@@ -190,22 +247,25 @@ impl Mobject for SimpleLine {}
 pub struct PolyLine {
     pub points: Vec<Point3<GMFloat>>,
     pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
-impl Default for PolyLine {
-    fn default() -> Self {
-        PolyLine {
-            points: vec![Point3::new(0.0, 0.0, 0.0), Point3::new(0.0, 0.0, 0.0)],
+impl PolyLine {
+    pub fn new(points: Vec<Point3<GMFloat>>) -> Self {
+        Self {
+            points,
             draw_config: DrawConfig::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
 impl Transform for PolyLine {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        for p in &mut self.points {
-            *p = transform * (*p);
-        }
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
@@ -214,9 +274,8 @@ pub struct Arc {
     pub start_angle: GMFloat,
     pub end_angle: GMFloat,
     pub radius: GMFloat,
-    pub _segs: usize,
-    pub _seg_list: Vec<GMFloat>,
     pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Arc {
@@ -226,123 +285,128 @@ impl Arc {
         end_angle: GMFloat,
         radius: GMFloat,
     ) -> Self {
-        let _segs = ((end_angle - start_angle) / (PI as GMFloat / 2 as GMFloat)).ceil() as usize;
-        let delta_angle = (end_angle - start_angle) / _segs as GMFloat;
-        let mut _seg_list = vec![];
-        _seg_list.push(start_angle);
-        for i in 1..(_segs - 1) {
-            _seg_list.push(start_angle + i as GMFloat * delta_angle);
-        }
-        _seg_list.push(end_angle);
         Self {
             center_point,
             start_angle,
             end_angle,
             radius,
-            _segs,
-            _seg_list,
             draw_config: DrawConfig::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
 impl Draw for Arc {
-    fn draw(&self, ctx: &mut Context) {
-        let scale_factor = ctx.scene_config.scale_factor;
-        let scene_width = ctx.scene_config.width;
-        let scene_height = ctx.scene_config.height;
-        for i in 0..(self._segs - 1) {
-            let mut pb = tiny_skia::PathBuilder::new();
-            // approximate arc by cubic bezier curve here
-            let start_angle = self._seg_list[i];
-            let end_angle = self._seg_list[i + 1];
-            let k = k_for_bezier_arc((end_angle - start_angle) / 2.0);
-            let point_0 = self.center_point.xy()
-                + Vector2::new(end_angle.cos(), end_angle.sin()) * self.radius;
+    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
 
-            let point_3 = self.center_point.xy()
-                + Vector2::new(start_angle.cos(), start_angle.sin()) * self.radius;
+        let mut pb = tiny_skia::PathBuilder::new();
+        
+        let num_curves = ((self.end_angle - self.start_angle).abs() / (PI / 2.0)).ceil() as usize;
+        if num_curves == 0 { return; }
 
-            let point_1 =
-                point_0 + Vector2::new(end_angle.sin(), -end_angle.cos()) * k * self.radius;
-            let point_2 =
-                point_3 + Vector2::new(-start_angle.sin(), start_angle.cos()) * k * self.radius;
-            pb.move_to(
-                coordinate_change_x(point_0.x, scene_width) * scale_factor,
-                coordinate_change_y(point_0.y, scene_height) * scale_factor,
-            );
+        let angle_step = (self.end_angle - self.start_angle) / (num_curves as f32);
+        
+        let start_x = self.center_point.x + self.radius * self.start_angle.cos();
+        let start_y = self.center_point.y + self.radius * self.start_angle.sin();
+        pb.move_to(
+            ctx.scene_config.convert_coord_x(start_x),
+            ctx.scene_config.convert_coord_y(start_y)
+        );
+
+        let mut current_angle = self.start_angle;
+        for _ in 0..num_curves {
+            let next_angle = current_angle + angle_step;
+            let k = k_for_bezier_arc(angle_step);
+            
+            let cp1_x = self.center_point.x + self.radius * (current_angle.cos() - k * current_angle.sin());
+            let cp1_y = self.center_point.y + self.radius * (current_angle.sin() + k * current_angle.cos());
+            
+            let cp2_x = self.center_point.x + self.radius * (next_angle.cos() + k * next_angle.sin());
+            let cp2_y = self.center_point.y + self.radius * (next_angle.sin() - k * current_angle.cos());
+            
+            let end_x = self.center_point.x + self.radius * next_angle.cos();
+            let end_y = self.center_point.y + self.radius * next_angle.sin();
+
             pb.cubic_to(
-                coordinate_change_x(point_1.x, scene_width) * scale_factor,
-                coordinate_change_y(point_1.y, scene_height) * scale_factor,
-                coordinate_change_x(point_2.x, scene_width) * scale_factor,
-                coordinate_change_y(point_2.y, scene_height) * scale_factor,
-                coordinate_change_x(point_3.x, scene_width) * scale_factor,
-                coordinate_change_y(point_3.y, scene_height) * scale_factor,
+                ctx.scene_config.convert_coord_x(cp1_x), ctx.scene_config.convert_coord_y(cp1_y),
+                ctx.scene_config.convert_coord_x(cp2_x), ctx.scene_config.convert_coord_y(cp2_y),
+                ctx.scene_config.convert_coord_x(end_x), ctx.scene_config.convert_coord_y(end_y)
             );
+            current_angle = next_angle;
+        }
 
-            let path = pb.finish().unwrap();
-            let mut stroke = Stroke::default();
-            stroke.width = self.draw_config.stoke_width * scale_factor;
-            stroke.line_cap = LineCap::Round;
-            stroke.line_join = LineJoin::Round;
-            let mut paint = Paint::default();
+        if let Some(path) = pb.finish() {
+            let mut paint = tiny_skia::Paint::default();
             paint.set_color(self.draw_config.color.into());
 
-            ctx.pixmap.stroke_path(
-                &path,
-                &paint,
-                &stroke,
-                tiny_skia::Transform::identity(),
-                None,
-            );
+            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
+                ctx.pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    ts_transform,
+                    None,
+                );
+            }
         }
     }
 }
 
 impl Transform for Arc {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {}
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
+    }
 }
 
 impl Mobject for Arc {}
 
 impl Draw for PolyLine {
-    fn draw(self: &Self, ctx: &mut Context) {
-        if self.points.len() < 2 {
+    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        if self.points.is_empty() {
             return;
         }
-
-        let scale_factor = ctx.scene_config.scale_factor;
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
 
         let mut pb = tiny_skia::PathBuilder::new();
-        let p0 = (
-            coordinate_change_x(self.points[0][(0)], ctx.scene_config.width) * scale_factor,
-            coordinate_change_y(self.points[0][(1)], ctx.scene_config.height) * scale_factor,
-        );
-        pb.move_to(p0.0 as f32, p0.1 as f32);
-        for p in self.points[1..].iter() {
-            let point = (
-                coordinate_change_x(p[(0)], ctx.scene_config.width) * scale_factor,
-                coordinate_change_y(p[(1)], ctx.scene_config.height) * scale_factor,
-            );
-            pb.line_to(point.0 as f32, point.1 as f32);
+        let mut first = true;
+        for p in &self.points {
+            let px = ctx.scene_config.convert_coord_x(p.x);
+            let py = ctx.scene_config.convert_coord_y(p.y);
+            if first {
+                pb.move_to(px, py);
+                first = false;
+            } else {
+                pb.line_to(px, py);
+            }
         }
-        let path = pb.finish().unwrap();
+        if let Some(path) = pb.finish() {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color(self.draw_config.color.into());
 
-        let mut stroke = Stroke::default();
-        stroke.width = self.draw_config.stoke_width * scale_factor;
-        stroke.line_cap = LineCap::Round;
-        stroke.line_join = LineJoin::Round;
-
-        let mut paint = Paint::default();
-        paint.set_color(self.draw_config.color.into());
-
-        ctx.pixmap.stroke_path(
-            &path,
-            &paint,
-            &stroke,
-            tiny_skia::Transform::identity(),
-            None,
-        );
+            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
+                ctx.pixmap.stroke_path(
+                    &path,
+                    &paint,
+                    &stroke,
+                    ts_transform,
+                    None,
+                );
+            }
+        }
     }
 }
 

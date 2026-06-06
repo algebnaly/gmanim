@@ -14,6 +14,7 @@ struct ThreeDViewport {
     pub vp_height: GMFloat,
     pub camera: Camera,
     pub triangle_list: Vec<Triangle>,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 struct Triangle {
     p0: Point3<GMFloat>,
@@ -34,6 +35,7 @@ impl ThreeDViewport {
             vp_height,
             camera,
             triangle_list: Vec::new(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
@@ -46,18 +48,22 @@ impl Default for ThreeDViewport {
             vp_height: 9.0,
             camera: Camera::default(),
             triangle_list: Vec::new(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
 impl Transform for ThreeDViewport {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        self.position = transform * self.position;
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
 impl Draw for ThreeDViewport {
-    fn draw(&self, ctx: &mut crate::Context) {
+    fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
         let pixmap_size = (
             (self.vp_width * ctx.scene_config.scale_factor) as u32,
             (self.vp_height * ctx.scene_config.scale_factor) as u32,
@@ -169,7 +175,7 @@ pub fn test_three_d() {
         p1: Point3::new(0.5, 0.25, 0.0),
         p2: Point3::new(0.75, 0.66, 0.66),
     });
-    three_d_vp.draw(&mut ctx);
+    three_d_vp.draw(&mut ctx, nalgebra::Matrix4::identity());
     ctx.pixmap.save_png("output.png").unwrap();
 }
 

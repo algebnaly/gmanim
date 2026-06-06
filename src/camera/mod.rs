@@ -131,11 +131,47 @@ impl Camera {
             projection,
         }
     }
+
+    pub fn look_at_dir(&self) -> Vector3<GMFloat> {
+        self.look_at
+    }
+
+    pub fn up_dir(&self) -> Vector3<GMFloat> {
+        self.up_direction
+    }
+
+    pub fn fov(&self) -> GMFloat {
+        match &self.projection {
+            Projection::Perspective(p) => p.fovy,
+            _ => std::f32::consts::PI / 2.0 as GMFloat,
+        }
+    }
+
+    pub fn proj_type(&self) -> u32 {
+        match &self.projection {
+            Projection::Perspective(_) => 0,
+            Projection::Orthographic(_) => 1,
+        }
+    }
+
+    pub fn ortho_params(&self) -> (GMFloat, GMFloat, GMFloat, GMFloat) {
+        match &self.projection {
+            Projection::Orthographic(o) => (o.left, o.right, o.bottom, o.top),
+            _ => (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
     pub fn set_look_at(&mut self, look_at: Vector3<GMFloat>) {
         self.look_at = look_at.normalize();
     }
     pub fn set_up_direction(&mut self, up_direction: Vector3<GMFloat>) {
         self.up_direction = up_direction.normalize();
+    }
+    pub fn set_orthographic(&mut self, left: GMFloat, right: GMFloat, bottom: GMFloat, top: GMFloat, near: GMFloat, far: GMFloat) {
+        self.projection = Projection::Orthographic(OrthographicSetting::new(left, right, bottom, top, near, far));
+    }
+    pub fn set_perspective(&mut self, fovy: GMFloat, aspect: GMFloat, near: GMFloat, far: GMFloat) {
+        self.projection = Projection::Perspective(PerspectiveSetting { fovy, aspect, near, far });
     }
     pub fn get_camera_transform_matrix(&self) -> Matrix4<GMFloat> {
         Isometry3::look_at_rh(
@@ -149,6 +185,36 @@ impl Camera {
         match &self.projection {
             Projection::Perspective(p) => p.get_perspective_project_matrix(),
             Projection::Orthographic(o) => o.get_orthographic_project_matrix(),
+        }
+    }
+
+    pub fn get_ray(
+        &self,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> (Point3<GMFloat>, Vector3<GMFloat>) {
+        let nx = (2.0 * x / width - 1.0) as GMFloat;
+        let ny = (1.0 - 2.0 * y / height) as GMFloat;
+
+        let forward = self.look_at;
+        let right = forward.cross(&self.up_direction).normalize();
+        let up = right.cross(&forward).normalize();
+
+        match &self.projection {
+            Projection::Perspective(p) => {
+                let v = ny * (p.fovy / 2.0).tan();
+                let u = nx * (p.fovy / 2.0).tan() * p.aspect;
+                let ray_dir = (forward + right * u + up * v).normalize();
+                (self.position, ray_dir)
+            }
+            Projection::Orthographic(o) => {
+                let u = nx * (o.right - o.left) / 2.0 + (o.right + o.left) / 2.0;
+                let v = ny * (o.top - o.bottom) / 2.0 + (o.top + o.bottom) / 2.0;
+                let ray_origin = self.position + right * u + up * v;
+                (ray_origin, forward)
+            }
         }
     }
 }

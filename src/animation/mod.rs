@@ -141,7 +141,7 @@ impl Animation for Rotate {
         let mat = nalgebra::Matrix4::new_rotation_wrt_point(self.axis_angle * dt, self.center);
         self.target
             .borrow_mut()
-            .transform(nalgebra::Transform::from_matrix_unchecked(mat));
+            .apply_transform(mat);
     }
 }
 
@@ -185,6 +185,7 @@ pub struct Timeline {
     pub scene: Scene,
     pub ctx: Context,
     actions: VecDeque<TimelineAction>,
+    wgpu_renderer: Option<crate::wgpu::renderer::WgpuRenderer>,
 }
 
 impl Timeline {
@@ -193,6 +194,7 @@ impl Timeline {
             scene,
             ctx,
             actions: VecDeque::new(),
+            wgpu_renderer: None,
         }
     }
 
@@ -248,13 +250,147 @@ impl Timeline {
                         // 1. Animation updates mobject state
                         anim.update(t, &mut self.scene);
 
-                        // 2. Render scene
-                        self.ctx.clear_transparent();
+                        let output_w = self.ctx.scene_config.output_width as f32;
+                        let output_h = self.ctx.scene_config.output_height as f32;
+
+                        let (has_clip, clip_x, clip_y, clip_w, clip_h) = match self.scene.clip_rect {
+                            Some(crate::ClipRect::Pixel(x, y, w, h)) => {
+                                (true, x as f32, y as f32, w as f32, h as f32)
+                            },
+                            Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
+                                let (o_left, o_right, o_bottom, o_top) = self.scene.camera.ortho_params();
+                                let log_w = o_right - o_left;
+                                let log_h = o_top - o_bottom;
+                                
+                                let tl_x = cx - w / 2.0;
+                                let tl_y = cy + h / 2.0;
+                                
+                                let norm_x = (tl_x - o_left) / log_w;
+                                let norm_y = (o_top - tl_y) / log_h;
+                                let norm_w = w / log_w;
+                                let norm_h = h / log_h;
+                                
+                                (true, norm_x * output_w, norm_y * output_h, norm_w * output_w, norm_h * output_h)
+                            },
+                            None => (false, 0.0, 0.0, 0.0, 0.0),
+                        };
+
+                        // 2. Render 3D scene via WGPU
+                        let mut primitives_3d = Vec::new();
                         for m in &self.scene.mobjects {
-                            m.borrow().draw(&mut self.ctx);
+                            if let Some(obj_3d) = m.borrow().as_3d() {
+                                primitives_3d.push(obj_3d.as_primitive_data());
+                            }
                         }
 
-                        // 3. Deliver frame to consumer
+                        if !primitives_3d.is_empty() {
+                            if self.wgpu_renderer.is_none() {
+                                if let Some(wgpu_ctx) =
+                                    pollster::block_on(crate::wgpu::context::WgpuContext::new())
+                                {
+                                    self.wgpu_renderer =
+                                        Some(crate::wgpu::renderer::WgpuRenderer::new(
+                                            std::sync::Arc::new(wgpu_ctx),
+                                        ));
+                                }
+                            }
+
+                            if let Some(renderer) = &self.wgpu_renderer {
+                                let width = self.ctx.scene_config.output_width as f32;
+                                let height = self.ctx.scene_config.output_height as f32;
+                                let look = self.scene.camera.look_at_dir();
+                                let fov = self.scene.camera.fov();
+
+                                let camera_uniform = crate::wgpu::renderer::CameraUniform {
+                                    pos: [
+                                        self.scene.camera.position.x as f32,
+                                        self.scene.camera.position.y as f32,
+                                        self.scene.camera.position.z as f32,
+                                    ],
+                                    _padding0: 0,
+                                    look_at: [
+                                        self.scene.camera.position.x as f32 + look.x as f32,
+                                        self.scene.camera.position.y as f32 + look.y as f32,
+                                        self.scene.camera.position.z as f32 + look.z as f32,
+                                    ],
+                                    _padding1: 0,
+                                    up: [
+                                        self.scene.camera.up_dir().x as f32,
+                                        self.scene.camera.up_dir().y as f32,
+                                        self.scene.camera.up_dir().z as f32,
+                                    ],
+                                    fov: fov as f32,
+                                    width,
+                                    height,
+                                    proj_type: self.scene.camera.proj_type(),
+                                    ortho_left: self.scene.camera.ortho_params().0 as f32,
+                                    ortho_right: self.scene.camera.ortho_params().1 as f32,
+                                    ortho_bottom: self.scene.camera.ortho_params().2 as f32,
+                                    ortho_top: self.scene.camera.ortho_params().3 as f32,
+                                    has_clip: if has_clip { 1 } else { 0 },
+                                    clip_x,
+                                    clip_y,
+                                    clip_w,
+                                    clip_h,
+                                    _padding2: [0, 0, 0, 0],
+                                };
+                                renderer.render(
+                                    self.ctx.scene_config.output_width,
+                                    self.ctx.scene_config.output_height,
+                                    &camera_uniform,
+                                    &primitives_3d,
+                                    self.ctx.pixmap.data_mut(),
+                                );
+                            } else {
+                                self.ctx.clear_transparent();
+                            }
+                        } else {
+                            self.ctx.clear_transparent();
+                        }
+
+                        for m in &self.scene.mobjects {
+                            if m.borrow().as_3d().is_none() {
+                                m.borrow().draw(&mut self.ctx, nalgebra::Matrix4::identity());
+                            }
+                        }
+
+                        if has_clip {
+                            let mut paint = tiny_skia::Paint::default();
+                            paint.blend_mode = tiny_skia::BlendMode::Clear;
+                            let width = self.ctx.scene_config.output_width as f32;
+                            let height = self.ctx.scene_config.output_height as f32;
+                            let cx = clip_x;
+                            let cy = clip_y;
+                            let cw = clip_w;
+                            let ch = clip_h;
+                            
+                            // Top
+                            if cy > 0.0 {
+                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, width, cy) {
+                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                                }
+                            }
+                            // Bottom
+                            if cy + ch < height {
+                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy + ch, width, height - (cy + ch)) {
+                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                                }
+                            }
+                            // Left
+                            if cx > 0.0 {
+                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy, cx, ch) {
+                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                                }
+                            }
+                            // Right
+                            if cx + cw < width {
+                                if let Some(r) = tiny_skia::Rect::from_xywh(cx + cw, cy, width - (cx + cw), ch) {
+                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                                }
+                            }
+                        }
+
+                        // 4. Deliver frame to consumer
                         on_frame(&self.ctx);
                     }
 

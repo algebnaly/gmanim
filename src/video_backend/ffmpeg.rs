@@ -22,6 +22,7 @@ pub struct FfmpegBackend {
     a_stream_idx: usize,
     // scaler: scaling::context::Context,
     frame_count: u64,
+    pub frame_size: usize,
 }
 
 impl FfmpegBackend {
@@ -96,8 +97,8 @@ impl FfmpegBackend {
             a_enc,
             v_stream_idx,
             a_stream_idx,
-            // scaler,
             frame_count: 0,
+            frame_size: (video_config.output_width * video_config.output_height * 4) as usize,
         }
     }
 

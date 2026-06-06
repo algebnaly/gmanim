@@ -463,20 +463,7 @@ impl Drop for Encoder {
 // FfmpegVaapiBackend — public async backend with buffer pooling
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// A reusable RGBA frame buffer obtained from [`FfmpegVaapiBackend::acquire_buffer`].
-///
-/// Render directly into this buffer, then submit via
-/// [`FfmpegVaapiBackend::submit_frame`] — no copies involved.
-pub struct FrameBuffer {
-    pub data: Vec<u8>,
-}
-
-impl FrameBuffer {
-    /// Borrow the buffer as a mutable byte slice for direct rendering.
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data
-    }
-}
+use super::FrameBuffer;
 
 enum WorkerMessage {
     Frame(Vec<u8>),

@@ -18,9 +18,10 @@ pub struct Text {
     pub position: Point3<GMFloat>,
     pub font_size: GMFloat,
     pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
-impl Transform for PathElement {
+impl PathElement {
     fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
         match self {
             PathElement::MoveTo(p) => {
@@ -50,10 +51,11 @@ pub enum FontConfig {
 }
 
 impl Transform for Text {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        for g in &mut self.glyph_paths {
-            g.transform(transform);
-        }
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
@@ -62,7 +64,7 @@ struct GlyphPath {
     path_elements: Vec<PathElement>,
 }
 
-impl Transform for GlyphPath {
+impl GlyphPath {
     fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
         for p in &mut self.path_elements {
             p.transform(transform);
@@ -140,10 +142,17 @@ impl rusttype::OutlineBuilder for GlyphPath {
 }
 
 impl Draw for Text {
-    fn draw(&self, ctx: &mut crate::Context) {
+    fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
         if self.text.len() == 0 {
-            return; //this is no text to draw
+            return;
         }
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
+
         let scale_factor = ctx.scene_config.scale_factor;
         for g in &self.glyph_paths {
             if g.path_elements.is_empty() {
@@ -153,63 +162,57 @@ impl Draw for Text {
             for path in &g.path_elements {
                 match path {
                     PathElement::MoveTo(p) => {
-                        let x = coordinate_change_x(p.x + self.position.x, ctx.scene_config.width)
+                        let x = coordinate_change_x(p.x, ctx.scene_config.width)
                             as f32
                             * scale_factor as f32;
-                        let y = coordinate_change_y(p.y + self.position.y, ctx.scene_config.height)
+                        let y = coordinate_change_y(p.y, ctx.scene_config.height)
                             as f32
                             * scale_factor as f32;
                         pb.move_to(x, y);
                     }
                     PathElement::LineTo(p) => {
-                        let x = coordinate_change_x(p.x + self.position.x, ctx.scene_config.width)
+                        let x = coordinate_change_x(p.x, ctx.scene_config.width)
                             as f32
                             * scale_factor as f32;
-                        let y = coordinate_change_y(p.y + self.position.y, ctx.scene_config.height)
+                        let y = coordinate_change_y(p.y, ctx.scene_config.height)
                             as f32
                             * scale_factor as f32;
                         pb.line_to(x, y);
                     }
                     PathElement::QuadTo(p1, p2) => {
-                        let x1 = coordinate_change_x(p1.x + self.position.x, ctx.scene_config.width)
+                        let x1 = coordinate_change_x(p1.x, ctx.scene_config.width)
                             as f32
                             * scale_factor as f32;
-                        let y1 =
-                            coordinate_change_y(p1.y + self.position.y, ctx.scene_config.height)
-                                as f32
-                                * scale_factor as f32;
-                        let x2 = coordinate_change_x(p2.x + self.position.x, ctx.scene_config.width)
+                        let y1 = coordinate_change_y(p1.y, ctx.scene_config.height)
                             as f32
                             * scale_factor as f32;
-                        let y2 =
-                            coordinate_change_y(p2.y + self.position.y, ctx.scene_config.height)
-                                as f32
-                                * scale_factor as f32;
+                        let x2 = coordinate_change_x(p2.x, ctx.scene_config.width)
+                            as f32
+                            * scale_factor as f32;
+                        let y2 = coordinate_change_y(p2.y, ctx.scene_config.height)
+                            as f32
+                            * scale_factor as f32;
                         pb.quad_to(x1, y1, x2, y2);
                     }
                     PathElement::CubicTo(p1, p2, p3) => {
-                        let x1 = coordinate_change_x(p1.x + self.position.x, ctx.scene_config.width)
+                        let x1 = coordinate_change_x(p1.x, ctx.scene_config.width)
                             as f32
                             * scale_factor as f32;
-                        let y1 =
-                            coordinate_change_y(p1.y + self.position.y, ctx.scene_config.height)
-                                as f32
-                                * scale_factor as f32;
-                        let x2 = coordinate_change_x(p2.x + self.position.x, ctx.scene_config.width)
+                        let y1 = coordinate_change_y(p1.y, ctx.scene_config.height)
                             as f32
                             * scale_factor as f32;
-                        let y2 =
-                            coordinate_change_y(p2.y + self.position.y, ctx.scene_config.height)
-                                as f32
-                                * scale_factor as f32;
-                        let x3 = coordinate_change_x(p3.x + self.position.x, ctx.scene_config.width)
+                        let x2 = coordinate_change_x(p2.x, ctx.scene_config.width)
                             as f32
                             * scale_factor as f32;
-                        let y3 =
-                            coordinate_change_y(p3.y + self.position.y, ctx.scene_config.height)
-                                as f32
-                                * scale_factor as f32;
-
+                        let y2 = coordinate_change_y(p2.y, ctx.scene_config.height)
+                            as f32
+                            * scale_factor as f32;
+                        let x3 = coordinate_change_x(p3.x, ctx.scene_config.width)
+                            as f32
+                            * scale_factor as f32;
+                        let y3 = coordinate_change_y(p3.y, ctx.scene_config.height)
+                            as f32
+                            * scale_factor as f32;
                         pb.cubic_to(x1, y1, x2, y2, x3, y3);
                     }
                     PathElement::Close => {
@@ -217,22 +220,22 @@ impl Draw for Text {
                     }
                 }
             }
-            let path = pb.finish().unwrap();
-            let mut stroke = tiny_skia::Stroke::default();
-            stroke.width = self.draw_config.stoke_width * scale_factor;
-            stroke.line_cap = tiny_skia::LineCap::Round;
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(self.draw_config.color.into());
-            ctx.pixmap.fill_path(
-                &path,
-                &paint,
-                Default::default(),
-                tiny_skia::Transform::identity(),
-                None,
-            );
+            if let Some(path) = pb.finish() {
+                let mut paint = tiny_skia::Paint::default();
+                paint.set_color(self.draw_config.color.into());
+                ctx.pixmap.fill_path(
+                    &path,
+                    &paint,
+                    tiny_skia::FillRule::EvenOdd,
+                    ts_transform,
+                    None,
+                );
+            }
         }
     }
 }
+
+impl Mobject for Text {}
 
 impl Text {
     pub fn new(
@@ -250,6 +253,7 @@ impl Text {
                 position,
                 font_size,
                 draw_config,
+                model_matrix: nalgebra::Matrix4::identity(),
             };
         }
         let mut f = fs::File::open("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc")
@@ -290,11 +294,10 @@ impl Text {
             position,
             font_size,
             draw_config,
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
-
-impl Mobject for Text {}
 
 #[test]
 fn test_draw_text() {
@@ -311,7 +314,7 @@ fn test_draw_text() {
         nalgebra::Vector3::new(0.0, 0.0, 1.0),
         nalgebra::Point3::new(0.0, 0.0, 0.0),
     );
-    text.transform(nalgebra::Transform::from_matrix_unchecked(rotation));
-    text.draw(&mut ctx);
+    text.apply_transform(rotation);
+    text.draw(&mut ctx, nalgebra::Matrix4::identity());
     ctx.pixmap.save_png("text_render.png");
 }

@@ -1,23 +1,37 @@
-use crate::GMFloat;
+use std::{cell::RefCell, rc::Rc};
 
-use super::{Draw, Mobject};
+use crate::{Context, GMFloat};
+
+use super::{Draw, Mobject, Transform};
 
 pub struct MobjectGroup {
     pub mobjects: Vec<Box<dyn Mobject>>,
+    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
-impl super::Transform for MobjectGroup {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        for m in &mut self.mobjects {
-            m.transform(transform);
+impl MobjectGroup {
+    pub fn new() -> Self {
+        Self {
+            mobjects: Vec::new(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }
 
+impl Transform for MobjectGroup {
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
+        self.model_matrix = mat;
+    }
+}
+
 impl Draw for MobjectGroup {
-    fn draw(&self, ctx: &mut crate::Context) {
+    fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        let global_mat = parent_matrix * self.model_matrix;
         for m in &self.mobjects {
-            m.draw(ctx);
+            m.draw(ctx, global_mat);
         }
     }
 }

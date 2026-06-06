@@ -14,10 +14,11 @@ use super::{
 };
 
 #[derive(Debug)]
-struct SVGPath {
-    elements: Vec<PathElement>,
-    is_closed: bool,
-    draw_config: DrawConfig,
+pub struct SVGPath {
+    pub elements: Vec<PathElement>,
+    pub is_closed: bool,
+    pub draw_config: DrawConfig,
+    pub model_matrix: nalgebra::Matrix4<crate::GMFloat>,
 }
 
 impl SVGPath {
@@ -26,6 +27,7 @@ impl SVGPath {
             elements: vec![],
             is_closed: false,
             draw_config: Default::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
     fn move_to_origin(&mut self) {
@@ -86,15 +88,23 @@ impl SVGPath {
 }
 
 impl super::Transform for SVGPath {
-    fn transform(&mut self, transform: nalgebra::Transform3<GMFloat>) {
-        for e in &mut self.elements {
-            e.transform(transform);
-        }
+    fn get_model_matrix(&self) -> nalgebra::Matrix4<crate::GMFloat> {
+        self.model_matrix
+    }
+    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<crate::GMFloat>) {
+        self.model_matrix = mat;
     }
 }
 
 impl Draw for SVGPath {
-    fn draw(&self, ctx: &mut crate::Context) {
+    fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {
+        let global_mat = parent_matrix * self.model_matrix;
+        let ts_transform = tiny_skia::Transform::from_row(
+            global_mat.m11 as f32, global_mat.m21 as f32,
+            global_mat.m12 as f32, global_mat.m22 as f32,
+            global_mat.m14 as f32, global_mat.m24 as f32,
+        );
+
         let scale_factor = ctx.scene_config.scale_factor;
         let scene_width = ctx.scene_config.width;
         let scene_height = ctx.scene_config.height;
@@ -149,15 +159,27 @@ impl Draw for SVGPath {
         let mut stroke = tiny_skia::Stroke::default();
         stroke.width = self.draw_config.stoke_width * scale_factor;
         stroke.line_cap = tiny_skia::LineCap::Round;
+        stroke.line_join = tiny_skia::LineJoin::Round;
+        
         let mut paint = tiny_skia::Paint::default();
         paint.set_color(self.draw_config.color.into());
-        ctx.pixmap.fill_path(
+        ctx.pixmap.stroke_path(
             &path,
             &paint,
-            Default::default(),
-            tiny_skia::Transform::identity(),
+            &stroke,
+            ts_transform,
             None,
         );
+
+        if self.draw_config.fill {
+            ctx.pixmap.fill_path(
+                &path,
+                &paint,
+                tiny_skia::FillRule::EvenOdd,
+                ts_transform,
+                None,
+            );
+        }
     }
 }
 
@@ -193,22 +215,21 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
                 svg_path.flip_y_coordinate();
                 paths.push(svg_path);
             }
-            Node::Text(text) => {
-                //we don't care for now
+            Node::Text(_text) => {
+                // we don't care for now
             }
+            _ => {}
         }
     }
 
     let mut grp_mobj = MobjectGroup {
-        mobjects: paths
-            .into_iter()
-            .map(|p| Box::new(p) as Box<dyn Mobject>)
-            .collect(),
+        mobjects: paths.into_iter().map(|p| Box::new(p) as Box<dyn Mobject>).collect(),
+        model_matrix: nalgebra::Matrix4::identity(),
     };
-
-    let scaling_matrix = nalgebra::Matrix4::new_scaling(0.1);
-    grp_mobj.transform(nalgebra::Transform::from_matrix_unchecked(scaling_matrix));
-
+    let scaling_matrix = nalgebra::Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::new(
+        0.01, -0.01, 1.0,
+    ));
+    grp_mobj.apply_transform(scaling_matrix);
     grp_mobj
 }
 

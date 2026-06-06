@@ -23,6 +23,16 @@ pub struct VideoBackend {
     pub backend_type: VideoBackendType,
 }
 
+pub struct FrameBuffer {
+    pub data: Vec<u8>,
+}
+
+impl FrameBuffer {
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum ColorOrder {
     Bgra,
@@ -77,6 +87,7 @@ pub struct FfmpegPipeBackend {
     child: std::process::Child,
     stdin: Option<std::process::ChildStdin>,
     closed: bool,
+    pub frame_size: usize,
 }
 
 pub struct FfmpegConfig {
@@ -85,42 +96,39 @@ pub struct FfmpegConfig {
 
 pub struct BgraRAWBackend {
     file: std::fs::File,
-}
-
-pub enum FrameMessage {
-    Frame,
-    End,
-}
-
-pub enum FrameDoneMessage {
-    Ok,
-    Err,
-}
-
-#[derive(Clone, Copy)]
-pub enum VideoBackendState {
-    Running,
-    Sleeping,
+    pub frame_size: usize,
 }
 
 impl VideoBackend {
-    pub fn write_frame(&mut self, frame_data: &[u8]) {
+    pub fn acquire_buffer(&mut self) -> FrameBuffer {
         match &mut self.backend_type {
+            VideoBackendType::Vaapi(f) => f.acquire_buffer(),
+            VideoBackendType::FfmpegPipe(f) => FrameBuffer {
+                data: vec![0u8; f.frame_size],
+            },
+            VideoBackendType::Ffmpeg(f) => FrameBuffer {
+                data: vec![0u8; f.frame_size],
+            },
+            VideoBackendType::BgraRAW(f) => FrameBuffer {
+                data: vec![0u8; f.frame_size],
+            },
+            VideoBackendType::Gstreamer => unimplemented!(),
+        }
+    }
+
+    pub fn submit_frame(&mut self, buf: FrameBuffer) {
+        match &mut self.backend_type {
+            VideoBackendType::Vaapi(f) => f.submit_frame(buf),
             VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
                 if let Some(stdin) = f.stdin.as_mut() {
-                    stdin.write_all(frame_data).unwrap();
+                    stdin.write_all(&buf.data).unwrap();
                 }
             }
-            VideoBackendType::Ffmpeg(f) => {
-                f.write_frame(frame_data);
-            }
-            VideoBackendType::Vaapi(f) => {
-                f.write_frame(frame_data);
-            }
+            VideoBackendType::Ffmpeg(f) => f.write_frame(&buf.data),
             VideoBackendType::BgraRAW(f) => {
                 use std::io::Write;
-                f.file.write_all(frame_data);
+                f.file.write_all(&buf.data).unwrap();
             }
             _ => {}
         }
@@ -132,44 +140,6 @@ impl VideoBackend {
             VideoBackendType::Ffmpeg(f) => f.finish(),
             VideoBackendType::Vaapi(f) => f.finish(),
             _ => Ok(()),
-        }
-    }
-
-    pub fn write_frame_background(
-        &mut self,
-        rx: Receiver<FrameMessage>,
-        state: Arc<Mutex<VideoBackendState>>,
-        queue: Arc<Mutex<VecDeque<Vec<u8>>>>,
-    ) {
-        loop {
-            let now = std::time::Instant::now();
-            let data;
-            {
-                let mut queue_guard = queue.lock().unwrap();
-                data = queue_guard.pop_front();
-            }
-            if data.is_none() {
-                {
-                    let mut state_guard = state.lock().unwrap();
-                    *state_guard = VideoBackendState::Sleeping;
-                }
-                println!("sleeping!");
-                match rx.recv() {
-                    Ok(f) => match f {
-                        FrameMessage::Frame => {}
-                        FrameMessage::End => {
-                            break;
-                        }
-                    },
-                    Err(e) => {
-                        //no more frame
-                        break;
-                    }
-                }
-            } else {
-                self.write_frame(&data.unwrap());
-            }
-            println!("write takes: {:?}", now.elapsed());
         }
     }
 }
@@ -281,6 +251,7 @@ impl FfmpegPipeBackend {
             child: c,
             stdin: Some(stdin),
             closed: false,
+            frame_size: (video_config.output_width * video_config.output_height * 4) as usize,
         }
     }
 
@@ -309,78 +280,6 @@ impl Drop for FfmpegPipeBackend {
     }
 }
 
-// the intent of backend controller is to seperate framge generation and video encoding
-// we use a backgroud thread to push frame data to the ffmpeg pipe
-// TODO: make send frame zero copy
-pub struct VideoBackendController {
-    // video_backend: Arc<Mutex<VideoBackend>>,
-    video_backend: Arc<Mutex<VideoBackend>>,
-    // background_thread_handler: JoinHandle<()>,
-    block_queue: Arc<Mutex<VecDeque<Vec<Vec<u8>>>>>,
-    sender: Sender<FrameMessage>,
-    block: Option<Vec<Vec<u8>>>,
-}
-
-impl VideoBackendController {
-    pub fn new(video_backend: VideoBackend) -> Self {
-        let video_backend_ref = Arc::new(Mutex::new(video_backend));
-
-        let block_queue = Arc::new(Mutex::new(VecDeque::<Vec<Vec<u8>>>::new()));
-        let block_queue_ref = block_queue.clone();
-
-        let video_backend_ref_clone = video_backend_ref.clone();
-        let (sender, receiver) = channel::<FrameMessage>();
-
-        let block = Some(Vec::new());
-
-        // let handler = thread::spawn(move || {
-        //     let video_backend_ref = video_backend_ref_clone.clone();
-        //     let block_queue = block_queue_ref.clone();
-        //     loop {
-        //         let msg = receiver.recv();
-        //         if msg.is_err() {
-        //             break;
-        //         }
-        //         let frame_msg = msg.unwrap();
-        //         if matches!(frame_msg, FrameMessage::End) {
-        //             break;
-        //         }
-        //         let frame_list = match block_queue.lock().unwrap().pop_front() {
-        //             None => {
-        //                 break;
-        //             }
-        //             Some(f) => f,
-        //         };
-        //         let mut video_baackend = video_backend_ref.lock().unwrap();
-        //         for f in frame_list {
-        //             video_baackend.write_frame(&f);
-        //         }
-        //     }
-        // });
-        Self {
-            video_backend: video_backend_ref,
-            // background_thread_handler: handler,
-            block_queue,
-            sender,
-            block,
-        }
-    }
-    pub fn write_frame(&mut self, frame: Vec<u8>) {
-        self.block.as_mut().unwrap().push(frame.to_owned());
-        if self.block.as_ref().unwrap().len() == BLOCK_SIZE {
-            self.block_queue
-                .lock()
-                .unwrap()
-                .push_back(self.block.replace(Vec::new()).unwrap());
-            self.sender.send(FrameMessage::Frame);
-        }
-    }
-    pub fn end(self) {
-        self.sender.send(FrameMessage::End);
-        // self.background_thread_handler.join();
-    }
-}
-
 impl BgraRAWBackend {
     pub fn new(video_config: &VideoConfig) -> Self {
         let file = std::fs::OpenOptions::new()
@@ -388,7 +287,10 @@ impl BgraRAWBackend {
             .write(true)
             .open(&format!("{}", video_config.filename))
             .unwrap();
-        Self { file }
+        Self {
+            file,
+            frame_size: (video_config.output_width * video_config.output_height * 4) as usize,
+        }
     }
 }
 

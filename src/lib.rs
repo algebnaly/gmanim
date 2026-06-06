@@ -13,6 +13,7 @@ pub mod log_utils;
 pub mod math_utils;
 pub mod mobjects;
 pub mod video_backend;
+pub mod wgpu;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "gmfloat_f16")]{
@@ -121,20 +122,44 @@ impl Context {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Debug)]
+pub enum ClipRect {
+    Logical(f32, f32, f32, f32), // center_x, center_y, width, height
+    Pixel(u32, u32, u32, u32),   // top_left_x, top_left_y, width, height
+}
+
 pub struct Scene {
     pub mobjects: Vec<Rc<RefCell<Box<dyn mobjects::Mobject>>>>,
+    pub camera: camera::Camera,
+    pub light_pos: Point3<GMFloat>,
+    pub light_color: Color,
+    pub clip_rect: Option<ClipRect>,
 }
 
 impl Scene {
     pub fn new() -> Self {
-        Scene { mobjects: vec![] }
+        Scene {
+            mobjects: Vec::new(),
+            camera: camera::Camera::default(),
+            light_pos: Point3::new(5.0, 5.0, 5.0),
+            light_color: Color::new(255, 255, 255, 255),
+            clip_rect: None,
+        }
     }
+}
+
+impl Default for Scene {
+    fn default() -> Self {
+        Scene::new()
+    }
+}
+
+impl Scene {
     pub fn save_png(&self, ctx: &mut Context, file_path: &str) {
         ctx.clear_transparent();
 
         for m in self.mobjects.iter() {
-            m.borrow().draw(ctx);
+            m.borrow().draw(ctx, nalgebra::Matrix4::identity());
         }
 
         ctx.pixmap.save_png(file_path);
@@ -233,7 +258,7 @@ fn write_frame() {
     use std::sync::mpsc::{Receiver, Sender};
 
     use video_backend::{
-        ColorOrder, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType, VideoConfig,
+        ColorOrder, FfmpegPipeBackend, VideoBackend, VideoBackendType, VideoConfig,
     };
 
     let path = std::env::temp_dir().join("output.mp4");
@@ -260,94 +285,11 @@ fn write_frame() {
         scene.mobjects[0].borrow_mut().transform(translation);
         ctx.clear_transparent();
         for m in scene.mobjects.iter() {
-            m.borrow().draw(&mut ctx);
+            m.borrow().draw(&mut ctx, nalgebra::Matrix4::identity());
         }
-        video_backend_var.write_frame(ctx.image_bytes());
+        let mut buf = video_backend_var.acquire_buffer();
+        ctx.copy_image_into(buf.as_mut_slice());
+        video_backend_var.submit_frame(buf);
         println!("takes {:?}", now.elapsed());
     }
-}
-
-#[test]
-fn thread_frame_pass() {
-    use mobjects::Rectangle;
-    use std::sync::mpsc::channel;
-    use std::sync::{Arc, Mutex};
-    use std::thread;
-    let mut ctx = Context::default();
-    let mut scene = Scene::new();
-    let rectangle = Rectangle {
-        p0: nalgebra::Point3::new(0.0, 0.0, 0.0),
-        p1: nalgebra::Point3::new(3.0, 0.0, 0.0),
-        p2: nalgebra::Point3::new(3.0, 3.0, 0.0),
-        p3: nalgebra::Point3::new(0.0, 3.0, 0.0),
-        ..Default::default()
-    };
-    scene.add(Box::new(rectangle));
-
-    use std::collections::VecDeque;
-    use std::io::Write;
-    use std::process::Command;
-    use std::sync::mpsc;
-    use std::sync::mpsc::{Receiver, Sender};
-
-    use video_backend::{
-        ColorOrder, FfmpegConfig, FfmpegPipeBackend, FrameMessage, VideoBackend, VideoBackendType,
-        VideoConfig,
-    };
-
-    let path = std::env::temp_dir().join("output.mp4");
-    let video_config = VideoConfig {
-        filename: path.to_str().unwrap().to_owned(),
-        framerate: 60,
-        output_height: 1080,
-        output_width: 1920,
-        color_order: ColorOrder::Rgba,
-    };
-
-    let mut video_backend_var = VideoBackend {
-        backend_type: VideoBackendType::FfmpegPipe(FfmpegPipeBackend::new(
-            &video_config,
-            video_backend::FfmpegPipeEncoder::HevcNvenc,
-            false,
-        )),
-    };
-
-    let (tx, rx) = channel::<video_backend::FrameMessage>();
-    let queue = Arc::new(Mutex::new(VecDeque::<Vec<u8>>::new()));
-    let queue_ref = queue.clone();
-
-    let state = Arc::new(Mutex::new(video_backend::VideoBackendState::Running));
-    let state_ref = state.clone();
-    // let thread_handler = thread::spawn(move || {
-    //     video_backend_var.write_frame_background(rx, state_ref, queue_ref);
-    // });
-
-    for _ in 0..480 {
-        let now = std::time::Instant::now();
-        let translation =
-            nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(0.01, 0.0, 0.0));
-        let translation = nalgebra::Transform3::<GMFloat>::from_matrix_unchecked(translation);
-        scene.mobjects[0].borrow_mut().transform(translation);
-        ctx.clear_transparent();
-        for m in scene.mobjects.iter() {
-            m.borrow().draw(&mut ctx);
-        }
-        let data_bytes = ctx.image_bytes().to_vec();
-        {
-            let mut queue_guard = queue.lock().unwrap();
-            queue_guard.push_back(data_bytes);
-        } //release queue lock
-        {
-            let mut state_guard = state.lock().unwrap();
-            match *state_guard {
-                video_backend::VideoBackendState::Sleeping => {
-                    *state_guard = video_backend::VideoBackendState::Running;
-                    tx.send(FrameMessage::Frame);
-                }
-                _ => {}
-            }
-        } //release state lock
-        tx.send(FrameMessage::End);
-    }
-    // thread_handler.join();
 }
