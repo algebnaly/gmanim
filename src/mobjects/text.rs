@@ -1,3 +1,4 @@
+use crate::mobjects::get_2d_transform;
 use std::fs;
 use std::io::Read;
 
@@ -147,11 +148,7 @@ impl Draw for Text {
             return;
         }
         let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = tiny_skia::Transform::from_row(
-            global_mat.m11 as f32, global_mat.m21 as f32,
-            global_mat.m12 as f32, global_mat.m22 as f32,
-            global_mat.m14 as f32, global_mat.m24 as f32,
-        );
+        let ts_transform = get_2d_transform(ctx, global_mat);
 
         let scale_factor = ctx.scene_config.scale_factor;
         for g in &self.glyph_paths {

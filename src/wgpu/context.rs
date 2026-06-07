@@ -1,14 +1,19 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+#[derive(Clone)]
 pub struct WgpuContext {
-    pub instance: wgpu::Instance,
-    pub adapter: wgpu::Adapter,
     pub device: Arc<wgpu::Device>,
     pub queue: Arc<wgpu::Queue>,
 }
 
+static GLOBAL_WGPU_CONTEXT: OnceLock<WgpuContext> = OnceLock::new();
+
 impl WgpuContext {
     pub async fn new() -> Option<Self> {
+        if let Some(ctx) = GLOBAL_WGPU_CONTEXT.get() {
+            return Some(ctx.clone());
+        }
+
         let instance = wgpu::Instance::default();
 
         let adapter = instance
@@ -25,11 +30,16 @@ impl WgpuContext {
             .await
             .ok()?;
 
-        Some(Self {
-            instance,
-            adapter,
+        let ctx = Self {
             device: Arc::new(device),
             queue: Arc::new(queue),
-        })
+        };
+
+        let _ = GLOBAL_WGPU_CONTEXT.set(ctx.clone());
+        Some(ctx)
+    }
+
+    pub fn from_existing(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>) -> Self {
+        Self { device, queue }
     }
 }

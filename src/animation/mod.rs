@@ -16,21 +16,23 @@ use crate::{
 /// Implementors only need to define how objects change — rendering is handled
 /// by [`Timeline`].
 pub trait Animation {
+    /// Called once when the animation starts playing.
+    fn begin(&mut self, _scene: &mut Scene) {}
+
+    /// Called every frame to update the scene.
+    /// `alpha` is the absolute progress from 0.0 to 1.0.
+    fn update(&mut self, alpha: GMFloat, scene: &mut Scene);
+
+    /// Called once when the animation completes.
+    fn finish(&mut self, _scene: &mut Scene) {}
+
     /// Total number of frames this animation spans.
     fn total_frames(&self) -> u32;
 
-    /// Advance the animation to progress `t` ∈ [0, 1].
-    ///
-    /// Called once per frame with monotonically increasing `t` (after rate_function).
-    /// For stateful animations that depend on the previous frame, track `last_t`
-    /// internally and compute `dt = t - last_t`.
-    fn update(&mut self, t: GMFloat, scene: &mut Scene);
-
-    /// Called once before the first frame (optional).
-    fn begin(&mut self, _scene: &mut Scene) {}
-
-    /// Called once after the last frame (optional).
-    fn finish(&mut self, _scene: &mut Scene) {}
+    /// Whether this animation is a pure function of alpha.
+    /// Pure animations can be fast-forwarded (O(1)).
+    /// Incremental animations must be stepped frame-by-frame.
+    fn is_pure(&self) -> bool { true }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -68,7 +70,7 @@ pub struct Move {
     pub target: Rc<RefCell<Box<dyn Mobject>>>,
     pub displacement: Vector3<GMFloat>,
     pub config: AnimationConfig,
-    last_t: GMFloat,
+    pub start_matrix: Option<nalgebra::Matrix4<GMFloat>>,
 }
 
 impl Move {
@@ -84,20 +86,25 @@ impl Move {
                 total_frames,
                 ..Default::default()
             },
-            last_t: 0.0,
+            start_matrix: None,
         }
     }
 }
 
 impl Animation for Move {
+    fn begin(&mut self, _scene: &mut Scene) {
+        self.start_matrix = Some(self.target.borrow().get_model_matrix());
+    }
+
     fn total_frames(&self) -> u32 {
         self.config.total_frames
     }
 
-    fn update(&mut self, t: GMFloat, _scene: &mut Scene) {
-        let dt = t - self.last_t;
-        self.last_t = t;
-        self.target.borrow_mut().move_this(self.displacement * dt);
+    fn update(&mut self, alpha: GMFloat, _scene: &mut Scene) {
+        if let Some(start) = self.start_matrix {
+            let mat = nalgebra::Matrix4::new_translation(&(self.displacement * alpha));
+            self.target.borrow_mut().set_model_matrix(mat * start);
+        }
     }
 }
 
@@ -107,7 +114,7 @@ pub struct Rotate {
     pub axis_angle: Vector3<GMFloat>,
     pub center: Point3<GMFloat>,
     pub config: AnimationConfig,
-    last_t: GMFloat,
+    pub start_matrix: Option<nalgebra::Matrix4<GMFloat>>,
 }
 
 impl Rotate {
@@ -125,23 +132,25 @@ impl Rotate {
                 total_frames,
                 ..Default::default()
             },
-            last_t: 0.0,
+            start_matrix: None,
         }
     }
 }
 
 impl Animation for Rotate {
+    fn begin(&mut self, _scene: &mut Scene) {
+        self.start_matrix = Some(self.target.borrow().get_model_matrix());
+    }
+
     fn total_frames(&self) -> u32 {
         self.config.total_frames
     }
 
-    fn update(&mut self, t: GMFloat, _scene: &mut Scene) {
-        let dt = t - self.last_t;
-        self.last_t = t;
-        let mat = nalgebra::Matrix4::new_rotation_wrt_point(self.axis_angle * dt, self.center);
-        self.target
-            .borrow_mut()
-            .apply_transform(mat);
+    fn update(&mut self, alpha: GMFloat, _scene: &mut Scene) {
+        if let Some(start) = self.start_matrix {
+            let mat = nalgebra::Matrix4::new_rotation_wrt_point(self.axis_angle * alpha, self.center);
+            self.target.borrow_mut().set_model_matrix(mat * start);
+        }
     }
 }
 
@@ -186,6 +195,10 @@ pub struct Timeline {
     pub ctx: Context,
     actions: VecDeque<TimelineAction>,
     wgpu_renderer: Option<crate::wgpu::renderer::WgpuRenderer>,
+    current_anim: Option<Box<dyn Animation>>,
+    current_anim_frame: u32,
+    pub total_cached_frames: u32,
+    pub current_frame_global: u32,
 }
 
 impl Timeline {
@@ -195,11 +208,16 @@ impl Timeline {
             ctx,
             actions: VecDeque::new(),
             wgpu_renderer: None,
+            current_anim: None,
+            current_anim_frame: 0,
+            total_cached_frames: 0,
+            current_frame_global: 0,
         }
     }
 
     /// Queue an animation to play.
     pub fn play(&mut self, anim: impl Animation + 'static) {
+        self.total_cached_frames += anim.total_frames();
         self.actions.push_back(TimelineAction::Anim(Box::new(anim)));
     }
 
@@ -220,181 +238,165 @@ impl Timeline {
 
     /// Total number of frames across all queued animations.
     pub fn total_frames(&self) -> u32 {
-        self.actions
-            .iter()
-            .map(|a| match a {
-                TimelineAction::Anim(a) => a.total_frames(),
-                TimelineAction::Script(_) => 0,
-            })
-            .sum()
+        self.total_cached_frames
     }
 
     /// Render all queued actions sequentially.
-    ///
-    /// `on_frame` is called once per rendered frame with a reference to the
-    /// [`Context`] containing the finished pixel data. The caller decides
-    /// what to do with it (encode, cache, display, etc.).
     pub fn render(&mut self, mut on_frame: impl FnMut(&Context)) {
-        while let Some(action) = self.actions.pop_front() {
-            match action {
-                TimelineAction::Script(script) => {
-                    script(&mut self.scene);
-                }
-                TimelineAction::Anim(mut anim) => {
-                    let total = anim.total_frames();
-                    anim.begin(&mut self.scene);
+        while self.step_frame() {
+            on_frame(&self.ctx);
+        }
+    }
 
-                    for frame in 1..=total {
-                        let t = frame as GMFloat / total as GMFloat;
+    /// Advance the timeline by one frame. Returns false if no more frames.
+    pub fn step_frame(&mut self) -> bool {
+        let has_more = self.advance_frame();
+        if has_more {
+            self.render_current_state();
+        }
+        has_more
+    }
 
-                        // 1. Animation updates mobject state
-                        anim.update(t, &mut self.scene);
+    /// Advance the timeline state by one frame without rendering.
+    pub fn advance_frame(&mut self) -> bool {
+        let initial_frame = self.current_frame_global;
+        self.seek_to_frame(initial_frame + 1);
+        self.current_frame_global > initial_frame
+    }
 
-                        let output_w = self.ctx.scene_config.output_width as f32;
-                        let output_h = self.ctx.scene_config.output_height as f32;
-
-                        let (has_clip, clip_x, clip_y, clip_w, clip_h) = match self.scene.clip_rect {
-                            Some(crate::ClipRect::Pixel(x, y, w, h)) => {
-                                (true, x as f32, y as f32, w as f32, h as f32)
-                            },
-                            Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
-                                let (o_left, o_right, o_bottom, o_top) = self.scene.camera.ortho_params();
-                                let log_w = o_right - o_left;
-                                let log_h = o_top - o_bottom;
-                                
-                                let tl_x = cx - w / 2.0;
-                                let tl_y = cy + h / 2.0;
-                                
-                                let norm_x = (tl_x - o_left) / log_w;
-                                let norm_y = (o_top - tl_y) / log_h;
-                                let norm_w = w / log_w;
-                                let norm_h = h / log_h;
-                                
-                                (true, norm_x * output_w, norm_y * output_h, norm_w * output_w, norm_h * output_h)
-                            },
-                            None => (false, 0.0, 0.0, 0.0, 0.0),
-                        };
-
-                        // 2. Render 3D scene via WGPU
-                        let mut primitives_3d = Vec::new();
-                        for m in &self.scene.mobjects {
-                            if let Some(obj_3d) = m.borrow().as_3d() {
-                                primitives_3d.push(obj_3d.as_primitive_data());
-                            }
+    /// Fast-forward or seek to a specific frame relative to the current state.
+    pub fn seek_to_frame(&mut self, target_frame: u32) {
+        while self.current_frame_global < target_frame {
+            if self.current_anim.is_none() {
+                if let Some(action) = self.actions.pop_front() {
+                    match action {
+                        TimelineAction::Script(script) => {
+                            script(&mut self.scene);
+                            continue;
                         }
-
-                        if !primitives_3d.is_empty() {
-                            if self.wgpu_renderer.is_none() {
-                                if let Some(wgpu_ctx) =
-                                    pollster::block_on(crate::wgpu::context::WgpuContext::new())
-                                {
-                                    self.wgpu_renderer =
-                                        Some(crate::wgpu::renderer::WgpuRenderer::new(
-                                            std::sync::Arc::new(wgpu_ctx),
-                                        ));
-                                }
-                            }
-
-                            if let Some(renderer) = &self.wgpu_renderer {
-                                let width = self.ctx.scene_config.output_width as f32;
-                                let height = self.ctx.scene_config.output_height as f32;
-                                let look = self.scene.camera.look_at_dir();
-                                let fov = self.scene.camera.fov();
-
-                                let camera_uniform = crate::wgpu::renderer::CameraUniform {
-                                    pos: [
-                                        self.scene.camera.position.x as f32,
-                                        self.scene.camera.position.y as f32,
-                                        self.scene.camera.position.z as f32,
-                                    ],
-                                    _padding0: 0,
-                                    look_at: [
-                                        self.scene.camera.position.x as f32 + look.x as f32,
-                                        self.scene.camera.position.y as f32 + look.y as f32,
-                                        self.scene.camera.position.z as f32 + look.z as f32,
-                                    ],
-                                    _padding1: 0,
-                                    up: [
-                                        self.scene.camera.up_dir().x as f32,
-                                        self.scene.camera.up_dir().y as f32,
-                                        self.scene.camera.up_dir().z as f32,
-                                    ],
-                                    fov: fov as f32,
-                                    width,
-                                    height,
-                                    proj_type: self.scene.camera.proj_type(),
-                                    ortho_left: self.scene.camera.ortho_params().0 as f32,
-                                    ortho_right: self.scene.camera.ortho_params().1 as f32,
-                                    ortho_bottom: self.scene.camera.ortho_params().2 as f32,
-                                    ortho_top: self.scene.camera.ortho_params().3 as f32,
-                                    has_clip: if has_clip { 1 } else { 0 },
-                                    clip_x,
-                                    clip_y,
-                                    clip_w,
-                                    clip_h,
-                                    _padding2: [0, 0, 0, 0],
-                                };
-                                renderer.render(
-                                    self.ctx.scene_config.output_width,
-                                    self.ctx.scene_config.output_height,
-                                    &camera_uniform,
-                                    &primitives_3d,
-                                    self.ctx.pixmap.data_mut(),
-                                );
-                            } else {
-                                self.ctx.clear_transparent();
-                            }
-                        } else {
-                            self.ctx.clear_transparent();
+                        TimelineAction::Anim(mut anim) => {
+                            anim.begin(&mut self.scene);
+                            self.current_anim = Some(anim);
+                            self.current_anim_frame = 0;
                         }
-
-                        for m in &self.scene.mobjects {
-                            if m.borrow().as_3d().is_none() {
-                                m.borrow().draw(&mut self.ctx, nalgebra::Matrix4::identity());
-                            }
-                        }
-
-                        if has_clip {
-                            let mut paint = tiny_skia::Paint::default();
-                            paint.blend_mode = tiny_skia::BlendMode::Clear;
-                            let width = self.ctx.scene_config.output_width as f32;
-                            let height = self.ctx.scene_config.output_height as f32;
-                            let cx = clip_x;
-                            let cy = clip_y;
-                            let cw = clip_w;
-                            let ch = clip_h;
-                            
-                            // Top
-                            if cy > 0.0 {
-                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, width, cy) {
-                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                                }
-                            }
-                            // Bottom
-                            if cy + ch < height {
-                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy + ch, width, height - (cy + ch)) {
-                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                                }
-                            }
-                            // Left
-                            if cx > 0.0 {
-                                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy, cx, ch) {
-                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                                }
-                            }
-                            // Right
-                            if cx + cw < width {
-                                if let Some(r) = tiny_skia::Rect::from_xywh(cx + cw, cy, width - (cx + cw), ch) {
-                                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                                }
-                            }
-                        }
-
-                        // 4. Deliver frame to consumer
-                        on_frame(&self.ctx);
                     }
+                } else {
+                    break;
+                }
+            }
 
-                    anim.finish(&mut self.scene);
+            if let Some(anim) = &mut self.current_anim {
+                let total = anim.total_frames();
+                let remaining_in_anim = total - self.current_anim_frame;
+                let frames_to_advance = target_frame - self.current_frame_global;
+
+                if anim.is_pure() && frames_to_advance >= remaining_in_anim {
+                    self.current_frame_global += remaining_in_anim;
+                    self.current_anim_frame = total;
+                    anim.update(1.0, &mut self.scene);
+                    
+                    if let Some(mut anim) = self.current_anim.take() {
+                        anim.finish(&mut self.scene);
+                    }
+                } else if anim.is_pure() && frames_to_advance > 1 {
+                    self.current_frame_global += frames_to_advance;
+                    self.current_anim_frame += frames_to_advance;
+                    let raw_t = self.current_anim_frame as GMFloat / total as GMFloat;
+                    anim.update(raw_t, &mut self.scene);
+                } else {
+                    self.current_frame_global += 1;
+                    self.current_anim_frame += 1;
+                    let raw_t = self.current_anim_frame as GMFloat / total as GMFloat;
+                    anim.update(raw_t, &mut self.scene);
+
+                    if self.current_anim_frame >= total {
+                        if let Some(mut anim) = self.current_anim.take() {
+                            anim.finish(&mut self.scene);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn render_current_state(&mut self) {
+        let output_w = self.ctx.scene_config.output_width as f32;
+        let output_h = self.ctx.scene_config.output_height as f32;
+
+        if self.wgpu_renderer.is_none() {
+            if let Some(wgpu_ctx) = pollster::block_on(crate::wgpu::context::WgpuContext::new()) {
+                self.wgpu_renderer = Some(crate::wgpu::renderer::WgpuRenderer::new(
+                    std::sync::Arc::new(wgpu_ctx),
+                ));
+            }
+        }
+
+        if let Some(renderer) = &mut self.wgpu_renderer {
+            renderer.render_scene(&self.scene, &self.ctx.scene_config, Some(self.ctx.pixmap.data_mut()));
+        } else {
+            self.ctx.clear_transparent();
+        }
+
+        for m in &self.scene.mobjects {
+            if m.borrow().as_3d().is_none() {
+                m.borrow().draw(&mut self.ctx, nalgebra::Matrix4::identity());
+            }
+        }
+
+        let (has_clip, clip_x, clip_y, clip_w, clip_h) = match self.scene.clip_rect {
+            Some(crate::ClipRect::Pixel(x, y, w, h)) => {
+                (true, x as f32, y as f32, w as f32, h as f32)
+            },
+            Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
+                let (o_left, o_right, o_bottom, o_top) = self.scene.camera.ortho_params();
+                let log_w = o_right - o_left;
+                let log_h = o_top - o_bottom;
+                
+                let tl_x = cx - w / 2.0;
+                let tl_y = cy + h / 2.0;
+                
+                let norm_x = (tl_x - o_left) / log_w;
+                let norm_y = (o_top - tl_y) / log_h;
+                let norm_w = w / log_w;
+                let norm_h = h / log_h;
+                
+                (true, norm_x * output_w, norm_y * output_h, norm_w * output_w, norm_h * output_h)
+            },
+            None => (false, 0.0, 0.0, 0.0, 0.0),
+        };
+
+        if has_clip {
+            let mut paint = tiny_skia::Paint::default();
+            paint.blend_mode = tiny_skia::BlendMode::Clear;
+            let width = self.ctx.scene_config.output_width as f32;
+            let height = self.ctx.scene_config.output_height as f32;
+            let cx = clip_x;
+            let cy = clip_y;
+            let cw = clip_w;
+            let ch = clip_h;
+            
+            // Top
+            if cy > 0.0 {
+                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, width, cy) {
+                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                }
+            }
+            // Bottom
+            if cy + ch < height {
+                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy + ch, width, height - (cy + ch)) {
+                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                }
+            }
+            // Left
+            if cx > 0.0 {
+                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy, cx, ch) {
+                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
+                }
+            }
+            // Right
+            if cx + cw < width {
+                if let Some(r) = tiny_skia::Rect::from_xywh(cx + cw, cy, width - (cx + cw), ch) {
+                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
                 }
             }
         }

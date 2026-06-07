@@ -19,7 +19,10 @@ struct CameraUniform {
     clip_y: f32,
     clip_w: f32,
     clip_h: f32,
-    _padding2: vec4<u32>,
+    aa_level: u32,
+    _pad1: u32,
+    _pad2: u32,
+    _pad3: u32,
 }
 @group(0) @binding(1) var<uniform> camera: CameraUniform;
 
@@ -223,29 +226,39 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let cy = cross(cx, cz);
     let ro = camera.pos;
 
-    let ndc_x = ((f32(x) + 0.5) / camera.width) * 2.0 - 1.0;
-    let ndc_y = 1.0 - ((f32(y) + 0.5) / camera.height) * 2.0;
-    
-    var ro_sample = ro;
-    var rd_sample = cz;
-    
-    if (camera.proj_type == 0u) {
-        // Perspective
-        rd_sample = normalize(cx * ndc_x * aspect * fov_scale + cy * ndc_y * fov_scale + cz);
-    } else {
-        // Orthographic
-        let u = ndc_x * (camera.ortho_right - camera.ortho_left) * 0.5 + (camera.ortho_right + camera.ortho_left) * 0.5;
-        let v = ndc_y * (camera.ortho_top - camera.ortho_bottom) * 0.5 + (camera.ortho_top + camera.ortho_bottom) * 0.5;
-        ro_sample = ro + cx * u + cy * v;
-        rd_sample = cz;
+    let aa = max(camera.aa_level, 1u);
+    var accumulated_color = vec4<f32>(0.0);
+
+    for (var i = 0u; i < aa; i = i + 1u) {
+        for (var j = 0u; j < aa; j = j + 1u) {
+            // subpixel offset from -0.5 to 0.5
+            let sub_x = (f32(i) + 0.5) / f32(aa) - 0.5;
+            let sub_y = (f32(j) + 0.5) / f32(aa) - 0.5;
+
+            let ndc_x = ((f32(x) + 0.5 + sub_x) / camera.width) * 2.0 - 1.0;
+            let ndc_y = 1.0 - ((f32(y) + 0.5 + sub_y) / camera.height) * 2.0;
+            
+            var ro_sample = ro;
+            var rd_sample = cz;
+            
+            if (camera.proj_type == 0u) {
+                // Perspective
+                rd_sample = normalize(cx * ndc_x * aspect * fov_scale + cy * ndc_y * fov_scale + cz);
+            } else {
+                // Orthographic
+                let u = ndc_x * (camera.ortho_right - camera.ortho_left) * 0.5 + (camera.ortho_right + camera.ortho_left) * 0.5;
+                let v = ndc_y * (camera.ortho_top - camera.ortho_bottom) * 0.5 + (camera.ortho_top + camera.ortho_bottom) * 0.5;
+                ro_sample = ro + cx * u + cy * v;
+                rd_sample = cz;
+            }
+            
+            let sample_color = render_ray(ro_sample, rd_sample);
+            let final_sample_color = vec4<f32>(sample_color.rgb * sample_color.a, sample_color.a);
+            accumulated_color = accumulated_color + final_sample_color;
+        }
     }
-    
-    let sample_color = render_ray(ro_sample, rd_sample);
-    let final_color = vec4<f32>(sample_color.rgb * sample_color.a, sample_color.a);
-    
-    // Un-premultiply alpha before storing (because output format is Rgba8Unorm and blending typically expects straight alpha, or if we want straight alpha out)
-    // Wait, TinySkia uses premultiplied alpha (PremultipliedColorU8)!
-    // If tiny_skia uses premultiplied alpha, then outputting premultiplied colors is correct!
-    
+
+    let final_color = accumulated_color / f32(aa * aa);
     textureStore(output_tex, vec2<i32>(i32(x), i32(y)), final_color);
 }
+

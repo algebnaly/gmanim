@@ -41,15 +41,11 @@ impl Dot {
 impl Draw for Dot {
     fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
         let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = tiny_skia::Transform::from_row(
-            global_mat.m11 as f32, global_mat.m21 as f32,
-            global_mat.m12 as f32, global_mat.m22 as f32,
-            global_mat.m14 as f32, global_mat.m24 as f32,
-        );
+        let ts_transform = crate::mobjects::get_2d_transform(ctx, global_mat);
 
         let path = tiny_skia::PathBuilder::from_circle(
-            ctx.scene_config.convert_coord_x(self.position.x) as f32 * ctx.scene_config.scale_factor,
-            ctx.scene_config.convert_coord_y(self.position.y) as f32 * ctx.scene_config.scale_factor,
+            (self.position.x) as f32 as f32 * ctx.scene_config.scale_factor,
+            (self.position.y) as f32 as f32 * ctx.scene_config.scale_factor,
             self.radius as f32 * ctx.scene_config.scale_factor, // scale radius
         )
         .unwrap();

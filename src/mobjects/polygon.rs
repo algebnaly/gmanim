@@ -1,3 +1,4 @@
+use crate::mobjects::get_2d_transform;
 use nalgebra::Point3;
 use tiny_skia::{FillRule, Paint, Shader};
 
@@ -51,11 +52,7 @@ impl Transform for Polygon {
 impl Draw for Polygon {
     fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {
         let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = tiny_skia::Transform::from_row(
-            global_mat.m11 as f32, global_mat.m21 as f32,
-            global_mat.m12 as f32, global_mat.m22 as f32,
-            global_mat.m14 as f32, global_mat.m24 as f32,
-        );
+        let ts_transform = get_2d_transform(ctx, global_mat);
         
         let mut paint = tiny_skia::Paint::default();
         paint.set_color(self.draw_config.color.into());

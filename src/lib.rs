@@ -111,7 +111,7 @@ impl Context {
             .fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xff));
     }
 
-    fn image_bytes(&self) -> &[u8] {
+    pub fn image_bytes(&self) -> &[u8] {
         self.pixmap.data()
     }
 
@@ -134,6 +134,7 @@ pub struct Scene {
     pub light_pos: Point3<GMFloat>,
     pub light_color: Color,
     pub clip_rect: Option<ClipRect>,
+    pub aa_level: u32,
 }
 
 impl Scene {
@@ -144,6 +145,7 @@ impl Scene {
             light_pos: Point3::new(5.0, 5.0, 5.0),
             light_color: Color::new(255, 255, 255, 255),
             clip_rect: None,
+            aa_level: 1,
         }
     }
 }
