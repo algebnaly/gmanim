@@ -1,10 +1,11 @@
-use nalgebra::Point3;
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers};
-use lyon::path::Path;
 use lyon::math::point;
+use lyon::path::Path;
+use lyon::tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
+};
+use nalgebra::Point3;
 use std::f32::consts::PI;
-
 
 use crate::{
     mobjects::{Draw, DrawConfig, Mobject, Transform},
@@ -34,7 +35,12 @@ impl Default for Dot {
 }
 
 impl Dot {
-    pub fn new(position: Point3<GMFloat>, radius: GMFloat, color: Color, draw_config: DrawConfig) -> Self {
+    pub fn new(
+        position: Point3<GMFloat>,
+        radius: GMFloat,
+        color: Color,
+        draw_config: DrawConfig,
+    ) -> Self {
         Self {
             position,
             radius,
@@ -47,8 +53,7 @@ impl Dot {
 }
 
 impl Draw for Dot {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
-    }
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Transform for Dot {
     fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {

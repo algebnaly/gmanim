@@ -46,12 +46,8 @@ impl Display for ColorOrder {
             ColorOrder::Bgra => {
                 write!(f, "bgra")
             }
-            ColorOrder::Rgba => {
-                f.write_str("rgba")
-            }
-            ColorOrder::Nv12 => {
-                f.write_str("nv12")
-            }
+            ColorOrder::Rgba => f.write_str("rgba"),
+            ColorOrder::Nv12 => f.write_str("nv12"),
         }
     }
 }
@@ -256,7 +252,9 @@ impl FfmpegPipeBackend {
             stdin: Some(stdin),
             closed: false,
             frame_size: match video_config.color_order {
-                ColorOrder::Nv12 => (video_config.output_width * video_config.output_height * 3 / 2) as usize,
+                ColorOrder::Nv12 => {
+                    (video_config.output_width * video_config.output_height * 3 / 2) as usize
+                }
                 _ => (video_config.output_width * video_config.output_height * 4) as usize,
             },
         }

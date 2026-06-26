@@ -2,13 +2,12 @@ pub mod basic;
 pub mod dot;
 pub mod formula;
 pub mod group;
-pub mod object_3d;
-pub mod scene_node;
 pub mod mesh_2d;
 pub mod mesh_3d;
-pub mod mesh_2d;
+pub mod object_3d;
 pub mod path;
 pub mod polygon;
+pub mod scene_node;
 pub mod svg_shape;
 pub mod text;
 pub mod three_d_viewport;
@@ -38,23 +37,28 @@ pub trait Mobject: Transform + Draw {
     fn as_mesh_3d(&self) -> Option<&crate::mobjects::mesh_3d::TriangleMesh3D> {
         None
     }
-    fn as_mesh_2d(&self) -> Option<&crate::mobjects::mesh_2d::TriangleMesh2D> {
-        None
-    }
     fn as_scene_node(&self) -> Option<&crate::mobjects::scene_node::SceneNode> {
         None
     }
-    fn get_name(&self) -> Option<String> { None }
+    fn get_name(&self) -> Option<String> {
+        None
+    }
     fn set_name(&mut self, _name: String) {}
-    fn add_child(&mut self, _child: std::rc::Rc<std::cell::RefCell<Box<dyn crate::mobjects::Mobject>>>) {}
-    fn remove_child(&mut self, _child: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::mobjects::Mobject>>>) {}
+    fn add_child(
+        &mut self,
+        _child: std::rc::Rc<std::cell::RefCell<Box<dyn crate::mobjects::Mobject>>>,
+    ) {
+    }
+    fn remove_child(
+        &mut self,
+        _child: &std::rc::Rc<std::cell::RefCell<Box<dyn crate::mobjects::Mobject>>>,
+    ) {
+    }
 }
 
 pub trait MobjectClone: Mobject {
     fn mobject_clone(&self) -> Box<dyn MobjectClone>;
 }
-
-
 
 use nalgebra::Vector3;
 
@@ -67,12 +71,12 @@ pub trait Transform {
         let current = self.get_model_matrix();
         self.set_model_matrix(transform * current);
     }
-    
+
     fn move_this(&mut self, movement: nalgebra::Vector3<GMFloat>) {
         let movement_matrix = nalgebra::Matrix4::new_translation(&movement);
         self.apply_transform(movement_matrix);
     }
-    
+
     fn scale(&mut self, scale_factor: GMFloat) {
         let scaling_matrix = nalgebra::Matrix4::new_scaling(scale_factor);
         self.apply_transform(scaling_matrix);

@@ -3,12 +3,13 @@ use std::f32::consts::PI;
 
 use crate::{math_utils::k_for_bezier_arc, Color, Context, GMFloat, Scene};
 
-use super::{get_2d_transform, Draw, DrawConfig, Mobject, Transform};
+use super::{Draw, DrawConfig, Mobject, Transform};
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers};
-use lyon::path::Path;
 use lyon::math::point;
-
+use lyon::path::Path;
+use lyon::tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
+};
 
 pub struct Rectangle {
     pub p0: Point3<GMFloat>, // Top left
@@ -42,6 +43,7 @@ impl Transform for Rectangle {
     }
     fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
         self.model_matrix = mat;
+        self.mesh.model_matrix = mat;
     }
 }
 
@@ -56,24 +58,33 @@ impl Rectangle {
         let path = builder.build();
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
-        let color = [self.color.r as f32 / 255.0, self.color.g as f32 / 255.0, self.color.b as f32 / 255.0, self.color.a as f32 / 255.0];
-        
+        let color = [
+            self.color.r as f32 / 255.0,
+            self.color.g as f32 / 255.0,
+            self.color.b as f32 / 255.0,
+            self.color.a as f32 / 255.0,
+        ];
+
         if self.draw_config.fill {
             let mut fill_tess = FillTessellator::new();
-            fill_tess.tessellate_path(
-                &path,
-                &FillOptions::default(),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
-            ).unwrap();
+            fill_tess
+                .tessellate_path(
+                    &path,
+                    &FillOptions::default(),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
         }
 
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
-            stroke_tess.tessellate_path(
-                &path,
-                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
-            ).unwrap();
+            stroke_tess
+                .tessellate_path(
+                    &path,
+                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
         }
 
         self.mesh.vertices = geometry.vertices;
@@ -136,15 +147,22 @@ impl SimpleLine {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
-        
+        let color = [
+            c.r as f32 / 255.0,
+            c.g as f32 / 255.0,
+            c.b as f32 / 255.0,
+            c.a as f32 / 255.0,
+        ];
+
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
-            stroke_tess.tessellate_path(
-                &path,
-                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
-            ).unwrap();
+            stroke_tess
+                .tessellate_path(
+                    &path,
+                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
         }
 
         self.mesh.vertices = geometry.vertices;
@@ -154,8 +172,7 @@ impl SimpleLine {
 }
 
 impl Draw for SimpleLine {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
-    }
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for SimpleLine {
@@ -228,11 +245,14 @@ impl Arc {
 impl Arc {
     pub fn update_mesh(&mut self) {
         let mut builder = Path::builder();
-        let num_curves = ((self.end_angle - self.start_angle).abs() / (PI as f32 / 2.0)).ceil() as usize;
-        if num_curves == 0 { return; }
+        let num_curves =
+            ((self.end_angle - self.start_angle).abs() / (PI as f32 / 2.0)).ceil() as usize;
+        if num_curves == 0 {
+            return;
+        }
 
         let angle_step = (self.end_angle - self.start_angle) / (num_curves as f32);
-        
+
         let start_x = self.center_point.x + self.radius * self.start_angle.cos();
         let start_y = self.center_point.y + self.radius * self.start_angle.sin();
         builder.begin(point(start_x as f32, start_y as f32));
@@ -241,20 +261,24 @@ impl Arc {
         for _ in 0..num_curves {
             let next_angle = current_angle + angle_step;
             let k = k_for_bezier_arc(angle_step);
-            
-            let cp1_x = self.center_point.x + self.radius * (current_angle.cos() - k * current_angle.sin());
-            let cp1_y = self.center_point.y + self.radius * (current_angle.sin() + k * current_angle.cos());
-            
-            let cp2_x = self.center_point.x + self.radius * (next_angle.cos() + k * next_angle.sin());
-            let cp2_y = self.center_point.y + self.radius * (next_angle.sin() - k * current_angle.cos());
-            
+
+            let cp1_x =
+                self.center_point.x + self.radius * (current_angle.cos() - k * current_angle.sin());
+            let cp1_y =
+                self.center_point.y + self.radius * (current_angle.sin() + k * current_angle.cos());
+
+            let cp2_x =
+                self.center_point.x + self.radius * (next_angle.cos() + k * next_angle.sin());
+            let cp2_y =
+                self.center_point.y + self.radius * (next_angle.sin() - k * current_angle.cos());
+
             let end_x = self.center_point.x + self.radius * next_angle.cos();
             let end_y = self.center_point.y + self.radius * next_angle.sin();
 
             builder.cubic_bezier_to(
                 point(cp1_x as f32, cp1_y as f32),
                 point(cp2_x as f32, cp2_y as f32),
-                point(end_x as f32, end_y as f32)
+                point(end_x as f32, end_y as f32),
             );
             current_angle = next_angle;
         }
@@ -263,15 +287,22 @@ impl Arc {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
-        
+        let color = [
+            c.r as f32 / 255.0,
+            c.g as f32 / 255.0,
+            c.b as f32 / 255.0,
+            c.a as f32 / 255.0,
+        ];
+
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
-            stroke_tess.tessellate_path(
-                &path,
-                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
-            ).unwrap();
+            stroke_tess
+                .tessellate_path(
+                    &path,
+                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
         }
 
         self.mesh.vertices = geometry.vertices;
@@ -281,8 +312,7 @@ impl Arc {
 }
 
 impl Draw for Arc {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
-    }
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Transform for Arc {
@@ -302,7 +332,9 @@ impl Mobject for Arc {
 
 impl PolyLine {
     pub fn update_mesh(&mut self) {
-        if self.points.is_empty() { return; }
+        if self.points.is_empty() {
+            return;
+        }
         let mut builder = Path::builder();
         let mut first = true;
         for p in &self.points {
@@ -318,15 +350,22 @@ impl PolyLine {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
-        
+        let color = [
+            c.r as f32 / 255.0,
+            c.g as f32 / 255.0,
+            c.b as f32 / 255.0,
+            c.a as f32 / 255.0,
+        ];
+
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
-            stroke_tess.tessellate_path(
-                &path,
-                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
-            ).unwrap();
+            stroke_tess
+                .tessellate_path(
+                    &path,
+                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
         }
 
         self.mesh.vertices = geometry.vertices;
@@ -336,8 +375,7 @@ impl PolyLine {
 }
 
 impl Draw for PolyLine {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
-    }
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for PolyLine {

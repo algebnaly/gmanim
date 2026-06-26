@@ -118,9 +118,7 @@ impl Default for SceneConfig {
 impl Default for Context {
     fn default() -> Self {
         let scene_config = SceneConfig::default();
-        Self {
-            scene_config,
-        }
+        Self { scene_config }
     }
 }
 

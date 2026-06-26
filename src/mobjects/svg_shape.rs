@@ -8,13 +8,15 @@ use crate::{
     Context, GMFloat, Scene,
 };
 
-use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
-use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers};
-use lyon::path::Path;
-use lyon::math::point;
 use super::{
     coordinate_change_x, coordinate_change_y, group::MobjectGroup, path::PathElement, Draw,
     DrawConfig, Mobject, Transform,
+};
+use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
+use lyon::math::point;
+use lyon::path::Path;
+use lyon::tessellation::{
+    BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
 };
 
 #[derive(Debug)]
@@ -69,7 +71,7 @@ impl SVGPath {
             }
         }
     }
-        pub fn update_mesh(&mut self) {
+    pub fn update_mesh(&mut self) {
         let mut builder = Path::builder();
         let mut in_subpath = false;
         for e in &self.elements {
@@ -112,14 +114,19 @@ impl SVGPath {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
-        
+        let color = [
+            c.r as f32 / 255.0,
+            c.g as f32 / 255.0,
+            c.b as f32 / 255.0,
+            c.a as f32 / 255.0,
+        ];
+
         if self.draw_config.fill {
             let mut fill_tess = FillTessellator::new();
             let _ = fill_tess.tessellate_path(
                 &path,
                 &FillOptions::default(),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
             );
         }
 
@@ -128,7 +135,7 @@ impl SVGPath {
             let _ = stroke_tess.tessellate_path(
                 &path,
                 &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
             );
         }
 
@@ -219,59 +226,41 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
     }
 
     let mut grp_mobj = MobjectGroup {
-        mobjects: paths.into_iter().map(|p| Box::new(p) as Box<dyn Mobject>).collect(),
+        mobjects: paths
+            .into_iter()
+            .map(|p| Box::new(p) as Box<dyn Mobject>)
+            .collect(),
         model_matrix: nalgebra::Matrix4::identity(),
     };
-    let scaling_matrix = nalgebra::Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::new(
-        0.01, -0.01, 1.0,
-    ));
+    let scaling_matrix =
+        nalgebra::Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::new(0.01, -0.01, 1.0));
     grp_mobj.apply_transform(scaling_matrix);
     grp_mobj
 }
 
-pub fn process_path_element(e: PathSegment, transform: tiny_skia::Transform) -> PathElement {
+fn map_point(
+    transform: usvg::Transform,
+    mut x: f32,
+    mut y: f32,
+) -> nalgebra::Point3<crate::GMFloat> {
+    let tx = transform.sx * x + transform.kx * y + transform.tx;
+    let ty = transform.ky * x + transform.sy * y + transform.ty;
+    nalgebra::Point3::new(tx as crate::GMFloat, ty as crate::GMFloat, 0.0)
+}
+
+pub fn process_path_element(e: PathSegment, transform: usvg::Transform) -> PathElement {
     match e {
-        PathSegment::MoveTo(p) => {
-            let mut new_p = p.clone();
-            transform.map_point(&mut new_p);
-            PathElement::MoveTo(nalgebra::Point3::new(
-                new_p.x as GMFloat,
-                new_p.y as GMFloat,
-                0.0,
-            ))
-        }
-        PathSegment::LineTo(p) => {
-            let mut new_p = p.clone();
-            transform.map_point(&mut new_p);
-            PathElement::LineTo(nalgebra::Point3::new(
-                new_p.x as GMFloat,
-                new_p.y as GMFloat,
-                0.0,
-            ))
-        }
-        PathSegment::QuadTo(p1, p2) => {
-            let mut new_p1 = p1.clone();
-            let mut new_p2 = p2.clone();
-            transform.map_point(&mut new_p1);
-            transform.map_point(&mut new_p2);
-            PathElement::QuadTo(
-                nalgebra::Point3::new(new_p1.x as GMFloat, new_p1.y as GMFloat, 0.0),
-                nalgebra::Point3::new(new_p2.x as GMFloat, new_p2.y as GMFloat, 0.0),
-            )
-        }
-        PathSegment::CubicTo(p1, p2, p3) => {
-            let mut new_p1 = p1.clone();
-            let mut new_p2 = p2.clone();
-            let mut new_p3 = p3.clone();
-            transform.map_point(&mut new_p1);
-            transform.map_point(&mut new_p2);
-            transform.map_point(&mut new_p3);
-            PathElement::CubicTo(
-                nalgebra::Point3::new(new_p1.x as GMFloat, new_p1.y as GMFloat, 0.0),
-                nalgebra::Point3::new(new_p2.x as GMFloat, new_p2.y as GMFloat, 0.0),
-                nalgebra::Point3::new(new_p3.x as GMFloat, new_p3.y as GMFloat, 0.0),
-            )
-        }
+        PathSegment::MoveTo(p) => PathElement::MoveTo(map_point(transform, p.x as f32, p.y as f32)),
+        PathSegment::LineTo(p) => PathElement::LineTo(map_point(transform, p.x as f32, p.y as f32)),
+        PathSegment::QuadTo(p1, p2) => PathElement::QuadTo(
+            map_point(transform, p1.x as f32, p1.y as f32),
+            map_point(transform, p2.x as f32, p2.y as f32),
+        ),
+        PathSegment::CubicTo(p1, p2, p3) => PathElement::CubicTo(
+            map_point(transform, p1.x as f32, p1.y as f32),
+            map_point(transform, p2.x as f32, p2.y as f32),
+            map_point(transform, p3.x as f32, p3.y as f32),
+        ),
         PathSegment::Close => PathElement::Close,
     }
 }

@@ -86,7 +86,7 @@ fn map(p: vec3<f32>) -> MapResult {
     var best_color: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     let num_primitives = camera.num_primitives;
     
-    for (var i: u32 = 0u; i < num_primitives; i = i + 1u) {
+    for (var i = 0u; i < 2u; i = i + 1u) {
         let prim = primitives[i];
         var d: f32 = 99999.0;
         

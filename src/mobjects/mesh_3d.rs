@@ -1,7 +1,7 @@
-use crate::Color;
 use crate::mobjects::{Draw, Mobject, Transform};
-use nalgebra::{Matrix4, Point3};
+use crate::Color;
 use crate::GMFloat;
+use nalgebra::{Matrix4, Point3};
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -25,11 +25,15 @@ impl TriangleMesh3D {
             model_matrix: Matrix4::identity(),
         }
     }
-    
-    pub fn box_mesh(center: Point3<GMFloat>, size: nalgebra::Vector3<GMFloat>, color: Color) -> Self {
+
+    pub fn box_mesh(
+        center: Point3<GMFloat>,
+        size: nalgebra::Vector3<GMFloat>,
+        color: Color,
+    ) -> Self {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        
+
         let c = [
             color.r as f32 / 255.0,
             color.g as f32 / 255.0,
@@ -45,35 +49,65 @@ impl TriangleMesh3D {
 
         let faces = [
             // front
-            ([0.0, 0.0, 1.0], [
-                [cx - hw, cy - hh, cz + hd], [cx + hw, cy - hh, cz + hd],
-                [cx + hw, cy + hh, cz + hd], [cx - hw, cy + hh, cz + hd],
-            ]),
+            (
+                [0.0, 0.0, 1.0],
+                [
+                    [cx - hw, cy - hh, cz + hd],
+                    [cx + hw, cy - hh, cz + hd],
+                    [cx + hw, cy + hh, cz + hd],
+                    [cx - hw, cy + hh, cz + hd],
+                ],
+            ),
             // back
-            ([0.0, 0.0, -1.0], [
-                [cx + hw, cy - hh, cz - hd], [cx - hw, cy - hh, cz - hd],
-                [cx - hw, cy + hh, cz - hd], [cx + hw, cy + hh, cz - hd],
-            ]),
+            (
+                [0.0, 0.0, -1.0],
+                [
+                    [cx + hw, cy - hh, cz - hd],
+                    [cx - hw, cy - hh, cz - hd],
+                    [cx - hw, cy + hh, cz - hd],
+                    [cx + hw, cy + hh, cz - hd],
+                ],
+            ),
             // top
-            ([0.0, 1.0, 0.0], [
-                [cx - hw, cy + hh, cz + hd], [cx + hw, cy + hh, cz + hd],
-                [cx + hw, cy + hh, cz - hd], [cx - hw, cy + hh, cz - hd],
-            ]),
+            (
+                [0.0, 1.0, 0.0],
+                [
+                    [cx - hw, cy + hh, cz + hd],
+                    [cx + hw, cy + hh, cz + hd],
+                    [cx + hw, cy + hh, cz - hd],
+                    [cx - hw, cy + hh, cz - hd],
+                ],
+            ),
             // bottom
-            ([0.0, -1.0, 0.0], [
-                [cx - hw, cy - hh, cz - hd], [cx + hw, cy - hh, cz - hd],
-                [cx + hw, cy - hh, cz + hd], [cx - hw, cy - hh, cz + hd],
-            ]),
+            (
+                [0.0, -1.0, 0.0],
+                [
+                    [cx - hw, cy - hh, cz - hd],
+                    [cx + hw, cy - hh, cz - hd],
+                    [cx + hw, cy - hh, cz + hd],
+                    [cx - hw, cy - hh, cz + hd],
+                ],
+            ),
             // right
-            ([1.0, 0.0, 0.0], [
-                [cx + hw, cy - hh, cz + hd], [cx + hw, cy - hh, cz - hd],
-                [cx + hw, cy + hh, cz - hd], [cx + hw, cy + hh, cz + hd],
-            ]),
+            (
+                [1.0, 0.0, 0.0],
+                [
+                    [cx + hw, cy - hh, cz + hd],
+                    [cx + hw, cy - hh, cz - hd],
+                    [cx + hw, cy + hh, cz - hd],
+                    [cx + hw, cy + hh, cz + hd],
+                ],
+            ),
             // left
-            ([-1.0, 0.0, 0.0], [
-                [cx - hw, cy - hh, cz - hd], [cx - hw, cy - hh, cz + hd],
-                [cx - hw, cy + hh, cz + hd], [cx - hw, cy + hh, cz - hd],
-            ]),
+            (
+                [-1.0, 0.0, 0.0],
+                [
+                    [cx - hw, cy - hh, cz - hd],
+                    [cx - hw, cy - hh, cz + hd],
+                    [cx - hw, cy + hh, cz + hd],
+                    [cx - hw, cy + hh, cz - hd],
+                ],
+            ),
         ];
 
         for (normal, pos) in faces.iter() {
@@ -86,18 +120,28 @@ impl TriangleMesh3D {
                 });
             }
             indices.extend_from_slice(&[
-                start_idx, start_idx + 1, start_idx + 2,
-                start_idx, start_idx + 2, start_idx + 3,
+                start_idx,
+                start_idx + 1,
+                start_idx + 2,
+                start_idx,
+                start_idx + 2,
+                start_idx + 3,
             ]);
         }
 
         Self::new(vertices, indices)
     }
 
-    pub fn uv_sphere(center: Point3<GMFloat>, radius: GMFloat, segments: u32, rings: u32, color: Color) -> Self {
+    pub fn uv_sphere(
+        center: Point3<GMFloat>,
+        radius: GMFloat,
+        segments: u32,
+        rings: u32,
+        color: Color,
+    ) -> Self {
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
-        
+
         let c = [
             color.r as f32 / 255.0,
             color.g as f32 / 255.0,

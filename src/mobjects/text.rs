@@ -1,4 +1,3 @@
-use crate::mobjects::get_2d_transform;
 use std::fs;
 use std::io::Read;
 
@@ -143,92 +142,8 @@ impl rusttype::OutlineBuilder for GlyphPath {
 }
 
 impl Draw for Text {
-    fn draw(&self, ctx: &mut crate::Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        if self.text.len() == 0 {
-            return;
-        }
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = get_2d_transform(ctx, global_mat);
-
-        let scale_factor = ctx.scene_config.scale_factor;
-        for g in &self.glyph_paths {
-            if g.path_elements.is_empty() {
-                continue;
-            }
-            let mut pb = tiny_skia::PathBuilder::new();
-            for path in &g.path_elements {
-                match path {
-                    PathElement::MoveTo(p) => {
-                        let x = coordinate_change_x(p.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y = coordinate_change_y(p.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        pb.move_to(x, y);
-                    }
-                    PathElement::LineTo(p) => {
-                        let x = coordinate_change_x(p.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y = coordinate_change_y(p.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        pb.line_to(x, y);
-                    }
-                    PathElement::QuadTo(p1, p2) => {
-                        let x1 = coordinate_change_x(p1.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y1 = coordinate_change_y(p1.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        let x2 = coordinate_change_x(p2.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y2 = coordinate_change_y(p2.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        pb.quad_to(x1, y1, x2, y2);
-                    }
-                    PathElement::CubicTo(p1, p2, p3) => {
-                        let x1 = coordinate_change_x(p1.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y1 = coordinate_change_y(p1.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        let x2 = coordinate_change_x(p2.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y2 = coordinate_change_y(p2.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        let x3 = coordinate_change_x(p3.x, ctx.scene_config.width)
-                            as f32
-                            * scale_factor as f32;
-                        let y3 = coordinate_change_y(p3.y, ctx.scene_config.height)
-                            as f32
-                            * scale_factor as f32;
-                        pb.cubic_to(x1, y1, x2, y2, x3, y3);
-                    }
-                    PathElement::Close => {
-                        pb.close();
-                    }
-                }
-            }
-            if let Some(path) = pb.finish() {
-                let mut paint = tiny_skia::Paint::default();
-                paint.set_color(self.draw_config.color.into());
-                ctx.pixmap.fill_path(
-                    &path,
-                    &paint,
-                    tiny_skia::FillRule::EvenOdd,
-                    ts_transform,
-                    None,
-                );
-            }
-        }
+    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {
+        // GPU tessellation logic will be added here
     }
 }
 

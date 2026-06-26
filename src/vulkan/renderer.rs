@@ -1,12 +1,15 @@
-use crate::vulkan::context::VulkanContext;
-use std::sync::Arc;
-use crate::mobjects::mesh_3d::{TriangleMesh3D, Vertex};
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D};
+use crate::mobjects::mesh_3d::{TriangleMesh3D, Vertex};
+use crate::vulkan::context::VulkanContext;
 use ash::vk;
+use std::sync::Arc;
 
 fn compile_wgsl_full(ctx: &VulkanContext, source: &str) -> vk::ShaderModule {
     let module = naga::front::wgsl::parse_str(source).unwrap();
-    let mut validator = naga::valid::Validator::new(naga::valid::ValidationFlags::all(), naga::valid::Capabilities::all());
+    let mut validator = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    );
     let info = validator.validate(&module).unwrap();
     let options = naga::back::spv::Options::default();
     let spv = naga::back::spv::write_vec(&module, &info, &options, None).unwrap();
@@ -26,7 +29,12 @@ pub struct Buffer {
 }
 
 impl Buffer {
-    pub fn new(ctx: &VulkanContext, size: u64, usage: vk::BufferUsageFlags, memory_location: gpu_allocator::MemoryLocation) -> Self {
+    pub fn new(
+        ctx: &VulkanContext,
+        size: u64,
+        usage: vk::BufferUsageFlags,
+        memory_location: gpu_allocator::MemoryLocation,
+    ) -> Self {
         let buffer_info = vk::BufferCreateInfo {
             s_type: vk::StructureType::BUFFER_CREATE_INFO,
             size,
@@ -38,19 +46,30 @@ impl Buffer {
         let vk_buffer = unsafe { ctx.device.create_buffer(&buffer_info, None).unwrap() };
         let requirements = unsafe { ctx.device.get_buffer_memory_requirements(vk_buffer) };
 
-        let allocation = ctx.allocator.lock().unwrap().allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-            name: "buffer",
-            requirements,
-            location: memory_location,
-            linear: true,
-            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-        }).unwrap();
+        let allocation = ctx
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "buffer",
+                requirements,
+                location: memory_location,
+                linear: true,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })
+            .unwrap();
 
         unsafe {
-            ctx.device.bind_buffer_memory(vk_buffer, allocation.memory(), allocation.offset()).unwrap();
+            ctx.device
+                .bind_buffer_memory(vk_buffer, allocation.memory(), allocation.offset())
+                .unwrap();
         }
 
-        Self { vk_buffer, allocation: Some(allocation), size }
+        Self {
+            vk_buffer,
+            allocation: Some(allocation),
+            size,
+        }
     }
 
     pub fn write_bytes(&self, offset: u64, data: &[u8]) {
@@ -84,15 +103,27 @@ pub struct Image {
 }
 
 impl Image {
-    pub fn new(ctx: &VulkanContext, width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags, aspect_mask: vk::ImageAspectFlags) -> Self {
+    pub fn new(
+        ctx: &VulkanContext,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect_mask: vk::ImageAspectFlags,
+        samples: vk::SampleCountFlags,
+    ) -> Self {
         let image_info = vk::ImageCreateInfo {
             s_type: vk::StructureType::IMAGE_CREATE_INFO,
             image_type: vk::ImageType::TYPE_2D,
             format,
-            extent: vk::Extent3D { width, height, depth: 1 },
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
             mip_levels: 1,
             array_layers: 1,
-            samples: vk::SampleCountFlags::TYPE_1,
+            samples,
             tiling: vk::ImageTiling::OPTIMAL,
             usage,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
@@ -103,16 +134,23 @@ impl Image {
         let vk_image = unsafe { ctx.device.create_image(&image_info, None).unwrap() };
         let requirements = unsafe { ctx.device.get_image_memory_requirements(vk_image) };
 
-        let allocation = ctx.allocator.lock().unwrap().allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-            name: "image",
-            requirements,
-            location: gpu_allocator::MemoryLocation::GpuOnly,
-            linear: false,
-            allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-        }).unwrap();
+        let allocation = ctx
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "image",
+                requirements,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })
+            .unwrap();
 
         unsafe {
-            ctx.device.bind_image_memory(vk_image, allocation.memory(), allocation.offset()).unwrap();
+            ctx.device
+                .bind_image_memory(vk_image, allocation.memory(), allocation.offset())
+                .unwrap();
         }
 
         let view_info = vk::ImageViewCreateInfo {
@@ -132,7 +170,14 @@ impl Image {
 
         let view = unsafe { ctx.device.create_image_view(&view_info, None).unwrap() };
 
-        Self { vk_image, allocation: Some(allocation), view, format, width, height }
+        Self {
+            vk_image,
+            allocation: Some(allocation),
+            view,
+            format,
+            width,
+            height,
+        }
     }
 
     pub fn destroy(&mut self, ctx: &VulkanContext) {
@@ -205,6 +250,9 @@ pub struct RenderCache {
     pub height: u32,
     pub texture: Image,
     pub depth_texture: Image,
+    pub msaa_texture: Image,
+    pub msaa_depth_texture: Image,
+    pub resolved_texture: Image,
     pub output_buffers: [Buffer; 3],
     pub nv12_output_buffers: [Buffer; 3],
     pub nv12_descriptor_sets: [vk::DescriptorSet; 3],
@@ -212,15 +260,22 @@ pub struct RenderCache {
     pub compute_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set_2d: vk::DescriptorSet,
+    pub composite_descriptor_set: vk::DescriptorSet,
     pub padded_bytes_per_row: u32,
     pub framebuffer: vk::Framebuffer,
+    pub rgba_preview_buffer: Vec<u8>,
 }
 
 impl RenderCache {
     pub fn destroy(&mut self, ctx: &VulkanContext) {
-        unsafe { ctx.device.destroy_framebuffer(self.framebuffer, None); }
+        unsafe {
+            ctx.device.destroy_framebuffer(self.framebuffer, None);
+        }
         self.texture.destroy(ctx);
         self.depth_texture.destroy(ctx);
+        self.msaa_texture.destroy(ctx);
+        self.msaa_depth_texture.destroy(ctx);
+        self.resolved_texture.destroy(ctx);
         for buf in &mut self.output_buffers {
             buf.destroy(ctx);
         }
@@ -238,15 +293,18 @@ pub struct FrameData {
 
 pub struct VulkanRenderer {
     ctx: Arc<VulkanContext>,
-    
+
     descriptor_pool: vk::DescriptorPool,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
     raster_descriptor_set_layout: vk::DescriptorSetLayout,
     raster_descriptor_set_layout_2d: vk::DescriptorSetLayout,
+    composite_descriptor_set_layout: vk::DescriptorSetLayout,
     nv12_descriptor_set_layout: vk::DescriptorSetLayout,
 
     compute_pipeline_layout: vk::PipelineLayout,
     compute_pipeline: vk::Pipeline,
+    composite_pipeline_layout: vk::PipelineLayout,
+    composite_pipeline: vk::Pipeline,
     nv12_pipeline_layout: vk::PipelineLayout,
     nv12_pipeline: vk::Pipeline,
 
@@ -277,6 +335,35 @@ impl VulkanRenderer {
         let raster_shader = compile_wgsl_full(&ctx, include_str!("raster_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
         let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
+        let composite_shader = compile_wgsl_full(&ctx, include_str!("composite_shader.wgsl"));
+
+        let composite_bindings = [
+            vk::DescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+        ];
+        let composite_layout_info = vk::DescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            binding_count: composite_bindings.len() as u32,
+            p_bindings: composite_bindings.as_ptr(),
+            ..Default::default()
+        };
+        let composite_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&composite_layout_info, None)
+                .unwrap()
+        };
 
         let nv12_bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -307,7 +394,11 @@ impl VulkanRenderer {
             p_bindings: nv12_bindings.as_ptr(),
             ..Default::default()
         };
-        let nv12_descriptor_set_layout = unsafe { ctx.device.create_descriptor_set_layout(&nv12_layout_info, None).unwrap() };
+        let nv12_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&nv12_layout_info, None)
+                .unwrap()
+        };
 
         let nv12_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
@@ -315,7 +406,11 @@ impl VulkanRenderer {
             p_set_layouts: &nv12_descriptor_set_layout,
             ..Default::default()
         };
-        let nv12_pipeline_layout = unsafe { ctx.device.create_pipeline_layout(&nv12_pipeline_layout_info, None).unwrap() };
+        let nv12_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&nv12_pipeline_layout_info, None)
+                .unwrap()
+        };
 
         let main_name = std::ffi::CString::new("main").unwrap();
         let nv12_stage = vk::PipelineShaderStageCreateInfo {
@@ -331,7 +426,51 @@ impl VulkanRenderer {
             layout: nv12_pipeline_layout,
             ..Default::default()
         };
-        let nv12_pipeline = unsafe { ctx.device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&nv12_pipeline_info), None).unwrap()[0] };
+        let nv12_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&nv12_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+
+        let composite_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+            set_layout_count: 1,
+            p_set_layouts: &composite_descriptor_set_layout,
+            ..Default::default()
+        };
+        let composite_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&composite_pipeline_layout_info, None)
+                .unwrap()
+        };
+
+        let composite_stage = vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: vk::ShaderStageFlags::COMPUTE,
+            module: composite_shader,
+            p_name: main_name.as_ptr(),
+            ..Default::default()
+        };
+
+        let composite_pipeline_info = vk::ComputePipelineCreateInfo {
+            s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+            stage: composite_stage,
+            layout: composite_pipeline_layout,
+            ..Default::default()
+        };
+        let composite_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&composite_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let compute_bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -345,7 +484,9 @@ impl VulkanRenderer {
                 binding: 1,
                 descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                 descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE | vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                stage_flags: vk::ShaderStageFlags::COMPUTE
+                    | vk::ShaderStageFlags::VERTEX
+                    | vk::ShaderStageFlags::FRAGMENT,
                 ..Default::default()
             },
             vk::DescriptorSetLayoutBinding {
@@ -356,31 +497,37 @@ impl VulkanRenderer {
                 ..Default::default()
             },
         ];
-        
+
         let compute_layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: compute_bindings.len() as u32,
             p_bindings: compute_bindings.as_ptr(),
             ..Default::default()
         };
-        let compute_descriptor_set_layout = unsafe { ctx.device.create_descriptor_set_layout(&compute_layout_info, None).unwrap() };
+        let compute_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&compute_layout_info, None)
+                .unwrap()
+        };
 
-        let raster_bindings = [
-            vk::DescriptorSetLayoutBinding {
-                binding: 1,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                ..Default::default()
-            },
-        ];
+        let raster_bindings = [vk::DescriptorSetLayoutBinding {
+            binding: 1,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            ..Default::default()
+        }];
         let raster_layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: raster_bindings.len() as u32,
             p_bindings: raster_bindings.as_ptr(),
             ..Default::default()
         };
-        let raster_descriptor_set_layout = unsafe { ctx.device.create_descriptor_set_layout(&raster_layout_info, None).unwrap() };
+        let raster_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&raster_layout_info, None)
+                .unwrap()
+        };
 
         let compute_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
@@ -388,7 +535,11 @@ impl VulkanRenderer {
             p_set_layouts: &compute_descriptor_set_layout,
             ..Default::default()
         };
-        let compute_pipeline_layout = unsafe { ctx.device.create_pipeline_layout(&compute_pipeline_layout_info, None).unwrap() };
+        let compute_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&compute_pipeline_layout_info, None)
+                .unwrap()
+        };
 
         let main_name = std::ffi::CString::new("main").unwrap();
         let compute_stage = vk::PipelineShaderStageCreateInfo {
@@ -405,23 +556,31 @@ impl VulkanRenderer {
             layout: compute_pipeline_layout,
             ..Default::default()
         };
-        let compute_pipeline = unsafe { ctx.device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&compute_pipeline_info), None).unwrap()[0] };
+        let compute_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&compute_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let color_attachment = vk::AttachmentDescription {
             format: vk::Format::R8G8B8A8_UNORM,
-            samples: vk::SampleCountFlags::TYPE_1,
-            load_op: vk::AttachmentLoadOp::LOAD,
-            store_op: vk::AttachmentStoreOp::STORE,
+            samples: vk::SampleCountFlags::TYPE_8,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::DONT_CARE,
             stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
             stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: vk::ImageLayout::GENERAL,
-            final_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             ..Default::default()
         };
 
         let depth_attachment = vk::AttachmentDescription {
             format: vk::Format::D32_SFLOAT,
-            samples: vk::SampleCountFlags::TYPE_1,
+            samples: vk::SampleCountFlags::TYPE_8,
             load_op: vk::AttachmentLoadOp::CLEAR,
             store_op: vk::AttachmentStoreOp::DONT_CARE,
             stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
@@ -431,14 +590,31 @@ impl VulkanRenderer {
             ..Default::default()
         };
 
+        let resolve_attachment = vk::AttachmentDescription {
+            format: vk::Format::R8G8B8A8_UNORM,
+            samples: vk::SampleCountFlags::TYPE_1,
+            load_op: vk::AttachmentLoadOp::CLEAR,
+            store_op: vk::AttachmentStoreOp::STORE,
+            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            final_layout: vk::ImageLayout::GENERAL,
+            ..Default::default()
+        };
+
         let color_attachment_ref = vk::AttachmentReference {
             attachment: 0,
             layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         };
-        
+
         let depth_attachment_ref = vk::AttachmentReference {
             attachment: 1,
             layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        };
+
+        let resolve_attachment_ref = vk::AttachmentReference {
+            attachment: 2,
+            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
         };
 
         let subpass = vk::SubpassDescription {
@@ -446,10 +622,11 @@ impl VulkanRenderer {
             color_attachment_count: 1,
             p_color_attachments: &color_attachment_ref,
             p_depth_stencil_attachment: &depth_attachment_ref,
+            p_resolve_attachments: &resolve_attachment_ref,
             ..Default::default()
         };
 
-        let attachments = [color_attachment, depth_attachment];
+        let attachments = [color_attachment, depth_attachment, resolve_attachment];
         let render_pass_info = vk::RenderPassCreateInfo {
             s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
             attachment_count: attachments.len() as u32,
@@ -459,7 +636,11 @@ impl VulkanRenderer {
             ..Default::default()
         };
 
-        let render_pass = unsafe { ctx.device.create_render_pass(&render_pass_info, None).unwrap() };
+        let render_pass = unsafe {
+            ctx.device
+                .create_render_pass(&render_pass_info, None)
+                .unwrap()
+        };
 
         let raster_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
@@ -467,25 +648,31 @@ impl VulkanRenderer {
             p_set_layouts: &raster_descriptor_set_layout,
             ..Default::default()
         };
-        let raster_pipeline_layout = unsafe { ctx.device.create_pipeline_layout(&raster_pipeline_layout_info, None).unwrap() };
+        let raster_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&raster_pipeline_layout_info, None)
+                .unwrap()
+        };
 
-        let raster_descriptor_set_layout_bindings_2d = [
-            vk::DescriptorSetLayoutBinding {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-                p_immutable_samplers: std::ptr::null(),
-                ..Default::default()
-            },
-        ];
+        let raster_descriptor_set_layout_bindings_2d = [vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+            p_immutable_samplers: std::ptr::null(),
+            ..Default::default()
+        }];
         let raster_descriptor_set_layout_info_2d = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: raster_descriptor_set_layout_bindings_2d.len() as u32,
             p_bindings: raster_descriptor_set_layout_bindings_2d.as_ptr(),
             ..Default::default()
         };
-        let raster_descriptor_set_layout_2d = unsafe { ctx.device.create_descriptor_set_layout(&raster_descriptor_set_layout_info_2d, None).unwrap() };
+        let raster_descriptor_set_layout_2d = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&raster_descriptor_set_layout_info_2d, None)
+                .unwrap()
+        };
 
         let raster_pipeline_layout_info_2d = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
@@ -493,19 +680,37 @@ impl VulkanRenderer {
             p_set_layouts: &raster_descriptor_set_layout_2d,
             ..Default::default()
         };
-        let raster_pipeline_layout_2d = unsafe { ctx.device.create_pipeline_layout(&raster_pipeline_layout_info_2d, None).unwrap() };
-    
+        let raster_pipeline_layout_2d = unsafe {
+            ctx.device
+                .create_pipeline_layout(&raster_pipeline_layout_info_2d, None)
+                .unwrap()
+        };
 
         let vertex_input_binding = vk::VertexInputBindingDescription {
             binding: 0,
             stride: std::mem::size_of::<Vertex>() as u32,
             input_rate: vk::VertexInputRate::VERTEX,
         };
-        
+
         let vertex_input_attributes = [
-            vk::VertexInputAttributeDescription { location: 0, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 0 },
-            vk::VertexInputAttributeDescription { location: 1, binding: 0, format: vk::Format::R32G32B32_SFLOAT, offset: 12 },
-            vk::VertexInputAttributeDescription { location: 2, binding: 0, format: vk::Format::R32G32B32A32_SFLOAT, offset: 24 },
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 12,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 24,
+            },
         ];
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo {
@@ -546,7 +751,7 @@ impl VulkanRenderer {
         let multisampling = vk::PipelineMultisampleStateCreateInfo {
             s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
             sample_shading_enable: vk::FALSE,
-            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            rasterization_samples: vk::SampleCountFlags::TYPE_8,
             ..Default::default()
         };
 
@@ -625,7 +830,15 @@ impl VulkanRenderer {
             ..Default::default()
         };
 
-        let raster_pipeline = unsafe { ctx.device.create_graphics_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&raster_pipeline_info), None).unwrap()[0] };
+        let raster_pipeline = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&raster_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let vertex_binding_description_2d = vk::VertexInputBindingDescription {
             binding: 0,
@@ -671,7 +884,7 @@ impl VulkanRenderer {
                 ..Default::default()
             },
         ];
-        
+
         let depth_stencil_2d = vk::PipelineDepthStencilStateCreateInfo {
             s_type: vk::StructureType::PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO,
             depth_test_enable: vk::FALSE, // 2D overlays without depth testing (painter's algorithm)
@@ -700,13 +913,29 @@ impl VulkanRenderer {
             ..Default::default()
         };
 
-        let raster_pipeline_2d = unsafe { ctx.device.create_graphics_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&raster_pipeline_info_2d), None).unwrap()[0] };
-    
+        let raster_pipeline_2d = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&raster_pipeline_info_2d),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let descriptor_pool_sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 30 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 30 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 30 },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 30,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_count: 30,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_count: 30,
+            },
         ];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
@@ -716,18 +945,61 @@ impl VulkanRenderer {
             flags: vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET,
             ..Default::default()
         };
-        let descriptor_pool = unsafe { ctx.device.create_descriptor_pool(&descriptor_pool_info, None).unwrap() };
+        let descriptor_pool = unsafe {
+            ctx.device
+                .create_descriptor_pool(&descriptor_pool_info, None)
+                .unwrap()
+        };
 
-        let vertex_buffer = Buffer::new(&ctx, (std::mem::size_of::<Vertex>() * 1_000_000) as u64, vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let index_buffer = Buffer::new(&ctx, (std::mem::size_of::<u32>() * 3_000_000) as u64, vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let camera_buffer = Buffer::new(&ctx, std::mem::size_of::<CameraUniform>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let buffer_3d = Buffer::new(&ctx, (std::mem::size_of::<PrimitiveData3D>() * 10000) as u64, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let nv12_constants_buffer = Buffer::new(&ctx, std::mem::size_of::<Nv12Constants>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
+        let vertex_buffer = Buffer::new(
+            &ctx,
+            (std::mem::size_of::<Vertex>() * 1_000_000) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let index_buffer = Buffer::new(
+            &ctx,
+            (std::mem::size_of::<u32>() * 3_000_000) as u64,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let camera_buffer = Buffer::new(
+            &ctx,
+            std::mem::size_of::<CameraUniform>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let buffer_3d = Buffer::new(
+            &ctx,
+            (std::mem::size_of::<PrimitiveData3D>() * 10000) as u64,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let nv12_constants_buffer = Buffer::new(
+            &ctx,
+            std::mem::size_of::<Nv12Constants>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
 
-        let vertex_buffer_2d = Buffer::new(&ctx, (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64, vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let index_buffer_2d = Buffer::new(&ctx, (std::mem::size_of::<u32>() * 3_000_000) as u64, vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-        let camera_buffer_2d = Buffer::new(&ctx, std::mem::size_of::<CameraUniform2D>() as u64, vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::CpuToGpu);
-    
+        let vertex_buffer_2d = Buffer::new(
+            &ctx,
+            (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let index_buffer_2d = Buffer::new(
+            &ctx,
+            (std::mem::size_of::<u32>() * 3_000_000) as u64,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let camera_buffer_2d = Buffer::new(
+            &ctx,
+            std::mem::size_of::<CameraUniform2D>() as u64,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
 
         let command_pool_info = vk::CommandPoolCreateInfo {
             s_type: vk::StructureType::COMMAND_POOL_CREATE_INFO,
@@ -735,9 +1007,13 @@ impl VulkanRenderer {
             flags: vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
             ..Default::default()
         };
-        
+
         let frame_data = std::array::from_fn(|_| {
-            let command_pool = unsafe { ctx.device.create_command_pool(&command_pool_info, None).unwrap() };
+            let command_pool = unsafe {
+                ctx.device
+                    .create_command_pool(&command_pool_info, None)
+                    .unwrap()
+            };
             let alloc_info = vk::CommandBufferAllocateInfo {
                 s_type: vk::StructureType::COMMAND_BUFFER_ALLOCATE_INFO,
                 command_pool,
@@ -745,14 +1021,19 @@ impl VulkanRenderer {
                 command_buffer_count: 1,
                 ..Default::default()
             };
-            let command_buffer = unsafe { ctx.device.allocate_command_buffers(&alloc_info).unwrap()[0] };
+            let command_buffer =
+                unsafe { ctx.device.allocate_command_buffers(&alloc_info).unwrap()[0] };
             let fence_info = vk::FenceCreateInfo {
                 s_type: vk::StructureType::FENCE_CREATE_INFO,
                 flags: vk::FenceCreateFlags::SIGNALED,
                 ..Default::default()
             };
             let fence = unsafe { ctx.device.create_fence(&fence_info, None).unwrap() };
-            FrameData { command_pool, command_buffer, fence }
+            FrameData {
+                command_pool,
+                command_buffer,
+                fence,
+            }
         });
 
         unsafe {
@@ -760,6 +1041,7 @@ impl VulkanRenderer {
             ctx.device.destroy_shader_module(raster_shader, None);
             ctx.device.destroy_shader_module(raster_shader_2d, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
+            ctx.device.destroy_shader_module(composite_shader, None);
         }
 
         Self {
@@ -768,9 +1050,12 @@ impl VulkanRenderer {
             compute_descriptor_set_layout,
             raster_descriptor_set_layout,
             raster_descriptor_set_layout_2d,
+            composite_descriptor_set_layout,
             nv12_descriptor_set_layout,
             compute_pipeline_layout,
             compute_pipeline,
+            composite_pipeline_layout,
+            composite_pipeline,
             nv12_pipeline_layout,
             nv12_pipeline,
             render_pass,
@@ -803,38 +1088,62 @@ impl VulkanRenderer {
         let (has_clip, clip_x, clip_y, clip_w, clip_h) = match scene.clip_rect {
             Some(crate::ClipRect::Pixel(x, y, w, h)) => {
                 (true, x as f32, y as f32, w as f32, h as f32)
-            },
+            }
             Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
                 let (o_left, o_right, o_bottom, o_top) = scene.camera.ortho_params();
                 let log_w = o_right - o_left;
                 let log_h = o_top - o_bottom;
-                
+
                 let tl_x = cx - w / 2.0;
                 let tl_y = cy + h / 2.0;
-                
+
                 let norm_x = (tl_x - o_left) / log_w;
                 let norm_y = (o_top - tl_y) / log_h;
                 let norm_w = w / log_w;
                 let norm_h = h / log_h;
-                
-                (true, norm_x * output_w, norm_y * output_h, norm_w * output_w, norm_h * output_h)
-            },
+
+                (
+                    true,
+                    norm_x * output_w,
+                    norm_y * output_h,
+                    norm_w * output_w,
+                    norm_h * output_h,
+                )
+            }
             None => (false, 0.0, 0.0, 0.0, 0.0),
         };
 
         let mut primitives_3d = Vec::new();
         let mut mesh_vertices = Vec::new();
         let mut mesh_indices = Vec::new();
-        
-        fn collect_3d(m: &dyn crate::mobjects::Mobject, parent_mat: nalgebra::Matrix4<crate::GMFloat>, primitives_3d: &mut Vec<PrimitiveData3D>, mesh_vertices: &mut Vec<Vertex>, mesh_indices: &mut Vec<u32>) {
+
+        fn collect_3d(
+            m: &dyn crate::mobjects::Mobject,
+            parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+            primitives_3d: &mut Vec<PrimitiveData3D>,
+            mesh_vertices: &mut Vec<Vertex>,
+            mesh_indices: &mut Vec<u32>,
+        ) {
             let global_mat = parent_mat * m.get_model_matrix();
-            
+
             if let Some(node) = m.as_scene_node() {
                 if let Some(comp) = &node.component {
-                    collect_3d(comp.as_ref(), global_mat, primitives_3d, mesh_vertices, mesh_indices);
+                    collect_3d(
+                        comp.as_ref(),
+                        global_mat,
+                        primitives_3d,
+                        mesh_vertices,
+                        mesh_indices,
+                    );
                 }
                 for child in &node.children {
-                    collect_3d(child.borrow().as_ref(), global_mat, primitives_3d, mesh_vertices, mesh_indices);
+                    collect_3d(
+                        child.borrow().as_ref(),
+                        global_mat,
+                        primitives_3d,
+                        mesh_vertices,
+                        mesh_indices,
+                    );
                 }
             } else {
                 if let Some(obj_3d) = m.as_3d() {
@@ -843,9 +1152,17 @@ impl VulkanRenderer {
                 if let Some(mesh) = m.as_mesh_3d() {
                     let base_index = mesh_vertices.len() as u32;
                     for v in &mesh.vertices {
-                        let pos = nalgebra::Point3::new(v.position[0] as crate::GMFloat, v.position[1] as crate::GMFloat, v.position[2] as crate::GMFloat);
+                        let pos = nalgebra::Point3::new(
+                            v.position[0] as crate::GMFloat,
+                            v.position[1] as crate::GMFloat,
+                            v.position[2] as crate::GMFloat,
+                        );
                         let t_pos = global_mat.transform_point(&pos);
-                        let n = nalgebra::Vector3::new(v.normal[0] as crate::GMFloat, v.normal[1] as crate::GMFloat, v.normal[2] as crate::GMFloat);
+                        let n = nalgebra::Vector3::new(
+                            v.normal[0] as crate::GMFloat,
+                            v.normal[1] as crate::GMFloat,
+                            v.normal[2] as crate::GMFloat,
+                        );
                         let t_n = global_mat.transform_vector(&n).normalize();
                         mesh_vertices.push(Vertex {
                             position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
@@ -859,29 +1176,49 @@ impl VulkanRenderer {
                 }
             }
         }
-        
+
         for m in &scene.mobjects {
-            collect_3d(m.borrow().as_ref(), nalgebra::Matrix4::identity(), &mut primitives_3d, &mut mesh_vertices, &mut mesh_indices);
+            collect_3d(
+                m.borrow().as_ref(),
+                nalgebra::Matrix4::identity(),
+                &mut primitives_3d,
+                &mut mesh_vertices,
+                &mut mesh_indices,
+            );
         }
 
         let mut mesh_vertices_2d = Vec::new();
         let mut mesh_indices_2d = Vec::new();
-        
-        fn collect_2d(m: &dyn crate::mobjects::Mobject, parent_mat: nalgebra::Matrix4<crate::GMFloat>, mesh_vertices: &mut Vec<Vertex2D>, mesh_indices: &mut Vec<u32>) {
+
+        fn collect_2d(
+            m: &dyn crate::mobjects::Mobject,
+            parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+            mesh_vertices: &mut Vec<Vertex2D>,
+            mesh_indices: &mut Vec<u32>,
+        ) {
             let global_mat = parent_mat * m.get_model_matrix();
             if let Some(node) = m.as_scene_node() {
                 if let Some(comp) = &node.component {
                     collect_2d(comp.as_ref(), global_mat, mesh_vertices, mesh_indices);
                 }
                 for child in &node.children {
-                    collect_2d(child.borrow().as_ref(), global_mat, mesh_vertices, mesh_indices);
+                    collect_2d(
+                        child.borrow().as_ref(),
+                        global_mat,
+                        mesh_vertices,
+                        mesh_indices,
+                    );
                 }
             } else {
                 if let Some(mesh) = m.as_mesh_2d() {
                     let base_index = mesh_vertices.len() as u32;
                     let mesh_mat = global_mat * mesh.model_matrix;
                     for v in &mesh.vertices {
-                        let pos = nalgebra::Point3::new(v.position[0] as crate::GMFloat, v.position[1] as crate::GMFloat, 0.0);
+                        let pos = nalgebra::Point3::new(
+                            v.position[0] as crate::GMFloat,
+                            v.position[1] as crate::GMFloat,
+                            0.0,
+                        );
                         let t_pos = mesh_mat.transform_point(&pos);
                         mesh_vertices.push(Vertex2D {
                             position: [t_pos.x as f32, t_pos.y as f32],
@@ -894,11 +1231,22 @@ impl VulkanRenderer {
                 }
             }
         }
-        
+
         for m in &scene.mobjects {
-            collect_2d(m.borrow().as_ref(), nalgebra::Matrix4::identity(), &mut mesh_vertices_2d, &mut mesh_indices_2d);
+            collect_2d(
+                m.borrow().as_ref(),
+                nalgebra::Matrix4::identity(),
+                &mut mesh_vertices_2d,
+                &mut mesh_indices_2d,
+            );
         }
-    
+
+        let camera_uniform_2d = CameraUniform2D {
+            width: output_w,
+            height: output_h,
+            scale_factor: scene_config.scale_factor as f32,
+            _pad: 0.0,
+        };
 
         let look = scene.camera.look_at_dir();
         let camera_uniform = CameraUniform {
@@ -908,11 +1256,7 @@ impl VulkanRenderer {
                 scene.camera.position.z as f32,
             ],
             _padding0: 0,
-            look_at: [
-                scene.camera.position.x as f32 + look.x as f32,
-                scene.camera.position.y as f32 + look.y as f32,
-                scene.camera.position.z as f32 + look.z as f32,
-            ],
+            look_at: [look.x as f32, look.y as f32, look.z as f32],
             _padding1: 0,
             up: [
                 scene.camera.up_dir().x as f32,
@@ -937,12 +1281,14 @@ impl VulkanRenderer {
             _pad2: 0,
             _pad3: 0,
             proj_mat: {
-                let p = crate::camera::Projection::perspective_wgpu(
+                let mut p = crate::camera::Projection::perspective_wgpu(
                     scene.camera.fov() as f32,
                     output_w / output_h,
                     scene.camera.perspective_params().0 as f32,
                     scene.camera.perspective_params().1 as f32,
                 );
+                // Correct for Vulkan's inverted Y in clip space
+                p[5] *= -1.0;
                 p
             },
         };
@@ -974,9 +1320,11 @@ impl VulkanRenderer {
         mesh_indices_2d: &[u32],
         output: Option<&mut [u8]>,
     ) {
-        self.camera_buffer.write_bytes(0, bytemuck::bytes_of(camera_uniform));
+        self.camera_buffer
+            .write_bytes(0, bytemuck::bytes_of(camera_uniform));
 
-        self.camera_buffer_2d.write_bytes(0, bytemuck::bytes_of(camera_uniform_2d));
+        self.camera_buffer_2d
+            .write_bytes(0, bytemuck::bytes_of(camera_uniform_2d));
         if !mesh_vertices_2d.is_empty() {
             let bytes_v = bytemuck::cast_slice(mesh_vertices_2d);
             let len = (self.vertex_buffer_2d.size as usize).min(bytes_v.len());
@@ -987,12 +1335,15 @@ impl VulkanRenderer {
             let len = (self.index_buffer_2d.size as usize).min(bytes_i.len());
             self.index_buffer_2d.write_bytes(0, &bytes_i[..len]);
         }
-    
-        self.nv12_constants_buffer.write_bytes(0, bytemuck::bytes_of(&Nv12Constants {
-            width,
-            height,
-            _padding: [0; 2],
-        }));
+
+        self.nv12_constants_buffer.write_bytes(
+            0,
+            bytemuck::bytes_of(&Nv12Constants {
+                width,
+                height,
+                _padding: [0; 2],
+            }),
+        );
         if !objects_3d.is_empty() {
             let bytes_3d = bytemuck::cast_slice(objects_3d);
             let len = (self.buffer_3d.size as usize).min(bytes_3d.len());
@@ -1014,29 +1365,108 @@ impl VulkanRenderer {
         let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
 
         let mut cache_guard = self.cache.lock().unwrap();
-        let cache_needs_update = cache_guard.as_ref().map_or(true, |c| c.width != width || c.height != height);
+        let cache_needs_update = cache_guard
+            .as_ref()
+            .map_or(true, |c| c.width != width || c.height != height);
 
         if cache_needs_update {
             if let Some(mut old_cache) = cache_guard.take() {
-                unsafe { self.ctx.device.device_wait_idle().unwrap(); }
+                unsafe {
+                    self.ctx.device.device_wait_idle().unwrap();
+                }
                 old_cache.destroy(&self.ctx);
             }
 
-            let texture = Image::new(&self.ctx, width, height, vk::Format::R8G8B8A8_UNORM, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC, vk::ImageAspectFlags::COLOR);
-            let depth_texture = Image::new(&self.ctx, width, height, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::ImageAspectFlags::DEPTH);
+            let texture = Image::new(
+                &self.ctx,
+                width,
+                height,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_SRC,
+                vk::ImageAspectFlags::COLOR,
+                vk::SampleCountFlags::TYPE_1,
+            );
+            let msaa_texture = Image::new(
+                &self.ctx,
+                width,
+                height,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                vk::SampleCountFlags::TYPE_8,
+            );
+            let msaa_depth_texture = Image::new(
+                &self.ctx,
+                width,
+                height,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                vk::SampleCountFlags::TYPE_8,
+            );
+            let resolved_texture = Image::new(
+                &self.ctx,
+                width,
+                height,
+                vk::Format::R8G8B8A8_UNORM,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                vk::SampleCountFlags::TYPE_1,
+            );
+            let depth_texture = Image::new(
+                &self.ctx,
+                width,
+                height,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                vk::SampleCountFlags::TYPE_1,
+            );
 
             let output_buffer_size = (padded_bytes_per_row * height) as u64;
             let output_buffers = [
-                Buffer::new(&self.ctx, output_buffer_size, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
-                Buffer::new(&self.ctx, output_buffer_size, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
-                Buffer::new(&self.ctx, output_buffer_size, vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
+                Buffer::new(
+                    &self.ctx,
+                    output_buffer_size,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    output_buffer_size,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    output_buffer_size,
+                    vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
             ];
 
             let nv12_buffer_size = (width * height * 3 / 2) as u64;
             let nv12_output_buffers = [
-                Buffer::new(&self.ctx, nv12_buffer_size, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
-                Buffer::new(&self.ctx, nv12_buffer_size, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
-                Buffer::new(&self.ctx, nv12_buffer_size, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST, gpu_allocator::MemoryLocation::GpuToCpu),
+                Buffer::new(
+                    &self.ctx,
+                    nv12_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    nv12_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    nv12_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
             ];
 
             let alloc_info = vk::DescriptorSetAllocateInfo {
@@ -1046,7 +1476,12 @@ impl VulkanRenderer {
                 p_set_layouts: &self.compute_descriptor_set_layout,
                 ..Default::default()
             };
-            let compute_descriptor_set = unsafe { self.ctx.device.allocate_descriptor_sets(&alloc_info).unwrap()[0] };
+            let compute_descriptor_set = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&alloc_info)
+                    .unwrap()[0]
+            };
 
             let alloc_info_raster = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1055,7 +1490,12 @@ impl VulkanRenderer {
                 p_set_layouts: &self.raster_descriptor_set_layout,
                 ..Default::default()
             };
-            let raster_descriptor_set = unsafe { self.ctx.device.allocate_descriptor_sets(&alloc_info_raster).unwrap()[0] };
+            let raster_descriptor_set = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&alloc_info_raster)
+                    .unwrap()[0]
+            };
 
             let alloc_info_raster_2d = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -1064,8 +1504,26 @@ impl VulkanRenderer {
                 p_set_layouts: &self.raster_descriptor_set_layout_2d,
                 ..Default::default()
             };
-            let raster_descriptor_set_2d = unsafe { self.ctx.device.allocate_descriptor_sets(&alloc_info_raster_2d).unwrap()[0] };
-    
+            let raster_descriptor_set_2d = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&alloc_info_raster_2d)
+                    .unwrap()[0]
+            };
+
+            let alloc_info_composite = vk::DescriptorSetAllocateInfo {
+                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptor_pool: self.descriptor_pool,
+                descriptor_set_count: 1,
+                p_set_layouts: &self.composite_descriptor_set_layout,
+                ..Default::default()
+            };
+            let composite_descriptor_set = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&alloc_info_composite)
+                    .unwrap()[0]
+            };
 
             let nv12_layouts = [self.nv12_descriptor_set_layout; 3];
             let nv12_alloc_info = vk::DescriptorSetAllocateInfo {
@@ -1075,11 +1533,22 @@ impl VulkanRenderer {
                 p_set_layouts: nv12_layouts.as_ptr(),
                 ..Default::default()
             };
-            let nv12_descriptor_sets_vec = unsafe { self.ctx.device.allocate_descriptor_sets(&nv12_alloc_info).unwrap() };
-            let nv12_descriptor_sets: [vk::DescriptorSet; 3] = nv12_descriptor_sets_vec.try_into().unwrap();
+            let nv12_descriptor_sets_vec = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&nv12_alloc_info)
+                    .unwrap()
+            };
+            let nv12_descriptor_sets: [vk::DescriptorSet; 3] =
+                nv12_descriptor_sets_vec.try_into().unwrap();
 
             let image_info = vk::DescriptorImageInfo {
                 image_view: texture.view,
+                image_layout: vk::ImageLayout::GENERAL,
+                ..Default::default()
+            };
+            let image_info_resolved = vk::DescriptorImageInfo {
+                image_view: resolved_texture.view,
                 image_layout: vk::ImageLayout::GENERAL,
                 ..Default::default()
             };
@@ -1091,6 +1560,13 @@ impl VulkanRenderer {
             };
             let buffer_3d_info = vk::DescriptorBufferInfo {
                 buffer: self.buffer_3d.vk_buffer,
+                offset: 0,
+                range: vk::WHOLE_SIZE,
+                ..Default::default()
+            };
+
+            let camera_buffer_2d_info = vk::DescriptorBufferInfo {
+                buffer: self.camera_buffer_2d.vk_buffer,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
                 ..Default::default()
@@ -1133,22 +1609,34 @@ impl VulkanRenderer {
                     p_buffer_info: &camera_buffer_info,
                     ..Default::default()
                 },
-
                 vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: raster_descriptor_set_2d,
                     dst_binding: 0,
                     descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                     descriptor_count: 1,
-                    p_buffer_info: &vk::DescriptorBufferInfo {
-                        buffer: self.camera_buffer_2d.vk_buffer,
-                        offset: 0,
-                        range: vk::WHOLE_SIZE,
-                        ..Default::default()
-                    },
+                    p_buffer_info: &camera_buffer_2d_info,
                     ..Default::default()
                 },
-                ];
+                vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: composite_descriptor_set,
+                    dst_binding: 0,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &image_info,
+                    ..Default::default()
+                },
+                vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: composite_descriptor_set,
+                    dst_binding: 1,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &image_info_resolved,
+                    ..Default::default()
+                },
+            ];
 
             let nv12_constants_buffer_info = vk::DescriptorBufferInfo {
                 buffer: self.nv12_constants_buffer.vk_buffer,
@@ -1156,7 +1644,7 @@ impl VulkanRenderer {
                 range: vk::WHOLE_SIZE,
                 ..Default::default()
             };
-            
+
             let mut nv12_buffer_infos = Vec::new();
             for i in 0..3 {
                 nv12_buffer_infos.push(vk::DescriptorBufferInfo {
@@ -1197,9 +1685,17 @@ impl VulkanRenderer {
                 });
             }
 
-            unsafe { self.ctx.device.update_descriptor_sets(&write_descriptor_sets, &[]); }
+            unsafe {
+                self.ctx
+                    .device
+                    .update_descriptor_sets(&write_descriptor_sets, &[]);
+            }
 
-            let attachments = [texture.view, depth_texture.view];
+            let attachments = [
+                msaa_texture.view,
+                msaa_depth_texture.view,
+                resolved_texture.view,
+            ];
             let framebuffer_info = vk::FramebufferCreateInfo {
                 s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
                 render_pass: self.render_pass,
@@ -1210,13 +1706,21 @@ impl VulkanRenderer {
                 layers: 1,
                 ..Default::default()
             };
-            let framebuffer = unsafe { self.ctx.device.create_framebuffer(&framebuffer_info, None).unwrap() };
+            let framebuffer = unsafe {
+                self.ctx
+                    .device
+                    .create_framebuffer(&framebuffer_info, None)
+                    .unwrap()
+            };
 
             *cache_guard = Some(RenderCache {
                 width,
                 height,
                 texture,
                 depth_texture,
+                msaa_texture,
+                msaa_depth_texture,
+                resolved_texture,
                 output_buffers,
                 nv12_output_buffers,
                 nv12_descriptor_sets,
@@ -1224,8 +1728,10 @@ impl VulkanRenderer {
                 compute_descriptor_set,
                 raster_descriptor_set,
                 raster_descriptor_set_2d,
+                composite_descriptor_set,
                 padded_bytes_per_row,
                 framebuffer,
+                rgba_preview_buffer: vec![0; (width * height * 4) as usize],
             });
         }
 
@@ -1234,16 +1740,28 @@ impl VulkanRenderer {
         let fd = &self.frame_data[frame_idx];
 
         unsafe {
-            self.ctx.device.wait_for_fences(std::slice::from_ref(&fd.fence), true, std::u64::MAX).unwrap();
-            self.ctx.device.reset_fences(std::slice::from_ref(&fd.fence)).unwrap();
-            self.ctx.device.reset_command_pool(fd.command_pool, vk::CommandPoolResetFlags::empty()).unwrap();
+            self.ctx
+                .device
+                .wait_for_fences(std::slice::from_ref(&fd.fence), true, std::u64::MAX)
+                .unwrap();
+            self.ctx
+                .device
+                .reset_fences(std::slice::from_ref(&fd.fence))
+                .unwrap();
+            self.ctx
+                .device
+                .reset_command_pool(fd.command_pool, vk::CommandPoolResetFlags::empty())
+                .unwrap();
 
             let begin_info = vk::CommandBufferBeginInfo {
                 s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
                 flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
                 ..Default::default()
             };
-            self.ctx.device.begin_command_buffer(fd.command_buffer, &begin_info).unwrap();
+            self.ctx
+                .device
+                .begin_command_buffer(fd.command_buffer, &begin_info)
+                .unwrap();
 
             let barrier = vk::ImageMemoryBarrier {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
@@ -1274,13 +1792,169 @@ impl VulkanRenderer {
                 std::slice::from_ref(&barrier),
             );
 
-            self.ctx.device.cmd_bind_pipeline(fd.command_buffer, vk::PipelineBindPoint::COMPUTE, self.compute_pipeline);
-            self.ctx.device.cmd_bind_descriptor_sets(fd.command_buffer, vk::PipelineBindPoint::COMPUTE, self.compute_pipeline_layout, 0, std::slice::from_ref(&cache.compute_descriptor_set), &[]);
+            self.ctx.device.cmd_bind_pipeline(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline,
+            );
+            self.ctx.device.cmd_bind_descriptor_sets(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.compute_pipeline_layout,
+                0,
+                std::slice::from_ref(&cache.compute_descriptor_set),
+                &[],
+            );
             let workgroup_x = (width + 15) / 16;
             let workgroup_y = (height + 15) / 16;
-            self.ctx.device.cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+            self.ctx
+                .device
+                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
 
-            let barrier_compute_to_raster = vk::ImageMemoryBarrier {
+            let clear_values = [
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                },
+                vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                },
+                vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 0.0],
+                    },
+                },
+            ];
+
+            let render_pass_begin_info = vk::RenderPassBeginInfo {
+                s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
+                render_pass: self.render_pass,
+                framebuffer: cache.framebuffer,
+                render_area: vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                },
+                clear_value_count: clear_values.len() as u32,
+                p_clear_values: clear_values.as_ptr(),
+                ..Default::default()
+            };
+
+            self.ctx.device.cmd_begin_render_pass(
+                fd.command_buffer,
+                &render_pass_begin_info,
+                vk::SubpassContents::INLINE,
+            );
+
+            let viewport = vk::Viewport {
+                x: 0.0,
+                y: 0.0,
+                width: width as f32,
+                height: height as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            };
+            self.ctx
+                .device
+                .cmd_set_viewport(fd.command_buffer, 0, std::slice::from_ref(&viewport));
+            let scissor = vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D { width, height },
+            };
+            self.ctx
+                .device
+                .cmd_set_scissor(fd.command_buffer, 0, std::slice::from_ref(&scissor));
+
+            if !mesh_indices.is_empty() {
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.raster_pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.raster_pipeline_layout,
+                    0,
+                    std::slice::from_ref(&cache.raster_descriptor_set),
+                    &[],
+                );
+                self.ctx.device.cmd_bind_vertex_buffers(
+                    fd.command_buffer,
+                    0,
+                    std::slice::from_ref(&self.vertex_buffer.vk_buffer),
+                    &[0],
+                );
+                self.ctx.device.cmd_bind_index_buffer(
+                    fd.command_buffer,
+                    self.index_buffer.vk_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                let indices_to_draw =
+                    (mesh_indices.len() as u32).min((self.index_buffer.size / 4) as u32);
+                self.ctx
+                    .device
+                    .cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
+            }
+
+            if !mesh_indices_2d.is_empty() {
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.raster_pipeline_2d,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.raster_pipeline_layout_2d,
+                    0,
+                    std::slice::from_ref(&cache.raster_descriptor_set_2d),
+                    &[],
+                );
+                self.ctx.device.cmd_bind_vertex_buffers(
+                    fd.command_buffer,
+                    0,
+                    std::slice::from_ref(&self.vertex_buffer_2d.vk_buffer),
+                    &[0],
+                );
+                self.ctx.device.cmd_bind_index_buffer(
+                    fd.command_buffer,
+                    self.index_buffer_2d.vk_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                let indices_to_draw =
+                    (mesh_indices_2d.len() as u32).min((self.index_buffer_2d.size / 4) as u32);
+                self.ctx
+                    .device
+                    .cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
+            }
+
+            self.ctx.device.cmd_end_render_pass(fd.command_buffer);
+
+            let composite_barrier_1 = vk::ImageMemoryBarrier {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                old_layout: vk::ImageLayout::GENERAL,
+                new_layout: vk::ImageLayout::GENERAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: cache.resolved_texture.vk_image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ,
+                ..Default::default()
+            };
+            let composite_barrier_2 = vk::ImageMemoryBarrier {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
                 old_layout: vk::ImageLayout::GENERAL,
                 new_layout: vk::ImageLayout::GENERAL,
@@ -1295,80 +1969,63 @@ impl VulkanRenderer {
                     layer_count: 1,
                 },
                 src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
                 ..Default::default()
             };
 
             self.ctx.device.cmd_pipeline_barrier(
                 fd.command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+                    | vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                std::slice::from_ref(&barrier_compute_to_raster),
+                &[composite_barrier_1, composite_barrier_2],
             );
 
-            let clear_values = [
-                vk::ClearValue { color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] } },
-                vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 } },
-            ];
-
-            let render_pass_begin_info = vk::RenderPassBeginInfo {
-                s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
-                render_pass: self.render_pass,
-                framebuffer: cache.framebuffer,
-                render_area: vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } },
-                clear_value_count: clear_values.len() as u32,
-                p_clear_values: clear_values.as_ptr(),
-                ..Default::default()
-            };
-
-            self.ctx.device.cmd_begin_render_pass(fd.command_buffer, &render_pass_begin_info, vk::SubpassContents::INLINE);
-
-            let viewport = vk::Viewport { x: 0.0, y: 0.0, width: width as f32, height: height as f32, min_depth: 0.0, max_depth: 1.0 };
-            self.ctx.device.cmd_set_viewport(fd.command_buffer, 0, std::slice::from_ref(&viewport));
-            let scissor = vk::Rect2D { offset: vk::Offset2D { x: 0, y: 0 }, extent: vk::Extent2D { width, height } };
-            self.ctx.device.cmd_set_scissor(fd.command_buffer, 0, std::slice::from_ref(&scissor));
-
-            if !mesh_indices.is_empty() {
-                self.ctx.device.cmd_bind_pipeline(fd.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.raster_pipeline);
-                self.ctx.device.cmd_bind_descriptor_sets(fd.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.raster_pipeline_layout, 0, std::slice::from_ref(&cache.raster_descriptor_set), &[]);
-                self.ctx.device.cmd_bind_vertex_buffers(fd.command_buffer, 0, std::slice::from_ref(&self.vertex_buffer.vk_buffer), &[0]);
-                self.ctx.device.cmd_bind_index_buffer(fd.command_buffer, self.index_buffer.vk_buffer, 0, vk::IndexType::UINT32);
-                let indices_to_draw = (mesh_indices.len() as u32).min((self.index_buffer.size / 4) as u32);
-                self.ctx.device.cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
-            }
-
-            
-            if !mesh_indices_2d.is_empty() {
-                self.ctx.device.cmd_bind_pipeline(fd.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.raster_pipeline_2d);
-                self.ctx.device.cmd_bind_descriptor_sets(fd.command_buffer, vk::PipelineBindPoint::GRAPHICS, self.raster_pipeline_layout_2d, 0, std::slice::from_ref(&cache.raster_descriptor_set_2d), &[]);
-                self.ctx.device.cmd_bind_vertex_buffers(fd.command_buffer, 0, std::slice::from_ref(&self.vertex_buffer_2d.vk_buffer), &[0]);
-                self.ctx.device.cmd_bind_index_buffer(fd.command_buffer, self.index_buffer_2d.vk_buffer, 0, vk::IndexType::UINT32);
-                let indices_to_draw = (mesh_indices_2d.len() as u32).min((self.index_buffer_2d.size / 4) as u32);
-                self.ctx.device.cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
-            }
-    
-            self.ctx.device.cmd_end_render_pass(fd.command_buffer);
+            self.ctx.device.cmd_bind_pipeline(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.composite_pipeline,
+            );
+            self.ctx.device.cmd_bind_descriptor_sets(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.composite_pipeline_layout,
+                0,
+                std::slice::from_ref(&cache.composite_descriptor_set),
+                &[],
+            );
+            let workgroup_x = (width + 15) / 16;
+            let workgroup_y = (height + 15) / 16;
+            self.ctx
+                .device
+                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
 
             // Compute pass for NV12 conversion
             let image_barrier = vk::ImageMemoryBarrier {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                old_layout: vk::ImageLayout::GENERAL,
                 new_layout: vk::ImageLayout::GENERAL,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 image: cache.texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 },
-                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::SHADER_WRITE,
                 dst_access_mask: vk::AccessFlags::SHADER_READ,
                 ..Default::default()
             };
 
             self.ctx.device.cmd_pipeline_barrier(
                 fd.command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
                 vk::DependencyFlags::empty(),
                 &[],
@@ -1376,57 +2033,86 @@ impl VulkanRenderer {
                 std::slice::from_ref(&image_barrier),
             );
 
-            self.ctx.device.cmd_bind_pipeline(fd.command_buffer, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline);
-            self.ctx.device.cmd_bind_descriptor_sets(fd.command_buffer, vk::PipelineBindPoint::COMPUTE, self.nv12_pipeline_layout, 0, std::slice::from_ref(&cache.nv12_descriptor_sets[frame_idx]), &[]);
+            self.ctx.device.cmd_bind_pipeline(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.nv12_pipeline,
+            );
+            self.ctx.device.cmd_bind_descriptor_sets(
+                fd.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.nv12_pipeline_layout,
+                0,
+                std::slice::from_ref(&cache.nv12_descriptor_sets[frame_idx]),
+                &[],
+            );
             let workgroup_x = (width / 4 + 15) / 16;
             let workgroup_y = (height / 2 + 15) / 16;
-            self.ctx.device.cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+            self.ctx
+                .device
+                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
 
-            if output.is_some() {
-                let image_barrier2 = vk::ImageMemoryBarrier {
-                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                    old_layout: vk::ImageLayout::GENERAL,
-                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: cache.texture.vk_image,
-                    subresource_range: vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 },
-                    src_access_mask: vk::AccessFlags::SHADER_READ,
-                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
-                    ..Default::default()
-                };
+            let image_barrier2 = vk::ImageMemoryBarrier {
+                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                old_layout: vk::ImageLayout::GENERAL,
+                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: cache.texture.vk_image,
+                subresource_range: vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                src_access_mask: vk::AccessFlags::SHADER_READ,
+                dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                ..Default::default()
+            };
 
-                self.ctx.device.cmd_pipeline_barrier(
-                    fd.command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    std::slice::from_ref(&image_barrier2),
-                );
+            self.ctx.device.cmd_pipeline_barrier(
+                fd.command_buffer,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                std::slice::from_ref(&image_barrier2),
+            );
 
-                let buffer_row_length = cache.padded_bytes_per_row / 4;
-                let copy_region = vk::BufferImageCopy {
-                    buffer_offset: 0,
-                    buffer_row_length,
-                    buffer_image_height: height,
-                    image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                    image_extent: vk::Extent3D { width, height, depth: 1 },
-                    ..Default::default()
-                };
+            let buffer_row_length = cache.padded_bytes_per_row / 4;
+            let copy_region = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length,
+                buffer_image_height: height,
+                image_subresource: vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                },
+                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                image_extent: vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                },
+                ..Default::default()
+            };
 
-                self.ctx.device.cmd_copy_image_to_buffer(
-                    fd.command_buffer,
-                    cache.texture.vk_image,
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    cache.output_buffers[frame_idx].vk_buffer,
-                    std::slice::from_ref(&copy_region),
-                );
-            }
+            self.ctx.device.cmd_copy_image_to_buffer(
+                fd.command_buffer,
+                cache.texture.vk_image,
+                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                cache.output_buffers[frame_idx].vk_buffer,
+                std::slice::from_ref(&copy_region),
+            );
 
-            self.ctx.device.end_command_buffer(fd.command_buffer).unwrap();
+            self.ctx
+                .device
+                .end_command_buffer(fd.command_buffer)
+                .unwrap();
 
             let submit_info = vk::SubmitInfo {
                 s_type: vk::StructureType::SUBMIT_INFO,
@@ -1434,20 +2120,31 @@ impl VulkanRenderer {
                 p_command_buffers: &fd.command_buffer,
                 ..Default::default()
             };
-            self.ctx.device.queue_submit(self.ctx.queue, std::slice::from_ref(&submit_info), fd.fence).unwrap();
+            self.ctx
+                .device
+                .queue_submit(self.ctx.queue, std::slice::from_ref(&submit_info), fd.fence)
+                .unwrap();
         }
 
         if let Some(out_buf) = output {
             let read_frame_idx = cache.current_frame % 3;
             let read_fd = &self.frame_data[read_frame_idx];
-            
+
             unsafe {
-                self.ctx.device.wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX).unwrap();
+                self.ctx
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
+                    .unwrap();
             }
 
             if let Some(alloc) = &cache.output_buffers[read_frame_idx].allocation {
                 if let Some(mapped) = alloc.mapped_ptr() {
-                    let padded_data = unsafe { std::slice::from_raw_parts(mapped.as_ptr() as *const u8, (cache.padded_bytes_per_row * height) as usize) };
+                    let padded_data = unsafe {
+                        std::slice::from_raw_parts(
+                            mapped.as_ptr() as *const u8,
+                            (cache.padded_bytes_per_row * height) as usize,
+                        )
+                    };
                     for row in 0..height {
                         let start = (row * cache.padded_bytes_per_row) as usize;
                         let end = start + unpadded_bytes_per_row as usize;
@@ -1460,7 +2157,7 @@ impl VulkanRenderer {
         }
 
         cache.current_frame += 1;
-}
+    }
 
     pub fn get_nv12_bytes(&self) -> Option<&[u8]> {
         let guard = self.cache.lock().unwrap();
@@ -1470,15 +2167,63 @@ impl VulkanRenderer {
             }
             let read_frame_idx = (cache.current_frame - 1) % 3;
             let read_fd = &self.frame_data[read_frame_idx];
-            
+
             unsafe {
-                self.ctx.device.wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX).unwrap();
+                self.ctx
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
+                    .unwrap();
             }
 
             if let Some(alloc) = &cache.nv12_output_buffers[read_frame_idx].allocation {
                 if let Some(mapped) = alloc.mapped_ptr() {
                     let len = (cache.width * cache.height * 3 / 2) as usize;
-                    return Some(unsafe { std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len) });
+                    return Some(unsafe {
+                        std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len)
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_rgba_bytes(&self) -> Option<&[u8]> {
+        let mut guard = self.cache.lock().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            if cache.current_frame == 0 {
+                return None;
+            }
+            let read_frame_idx = (cache.current_frame - 1) % 3;
+            let read_fd = &self.frame_data[read_frame_idx];
+
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
+                    .unwrap();
+            }
+
+            if let Some(alloc) = &cache.output_buffers[read_frame_idx].allocation {
+                if let Some(mapped) = alloc.mapped_ptr() {
+                    let height = cache.height;
+                    let unpadded_bytes_per_row = cache.width * 4;
+                    let padded_data = unsafe {
+                        std::slice::from_raw_parts(
+                            mapped.as_ptr() as *const u8,
+                            (cache.padded_bytes_per_row * height) as usize,
+                        )
+                    };
+                    for row in 0..height {
+                        let start = (row * cache.padded_bytes_per_row) as usize;
+                        let end = start + unpadded_bytes_per_row as usize;
+                        let dst_start = (row * unpadded_bytes_per_row) as usize;
+                        let dst_end = dst_start + unpadded_bytes_per_row as usize;
+                        cache.rgba_preview_buffer[dst_start..dst_end]
+                            .copy_from_slice(&padded_data[start..end]);
+                    }
+                    let ptr = cache.rgba_preview_buffer.as_ptr();
+                    let len = cache.rgba_preview_buffer.len();
+                    return Some(unsafe { std::slice::from_raw_parts(ptr, len) });
                 }
             }
         }

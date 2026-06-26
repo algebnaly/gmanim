@@ -1,9 +1,10 @@
-use ash::{vk, Entry, Instance, Device};
-use std::sync::{Arc, OnceLock, Mutex};
+use ash::{vk, Device, Entry, Instance};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
+use std::sync::{Arc, Mutex, OnceLock};
 
 #[derive(Clone)]
 pub struct VulkanContext {
+    pub entry: Arc<Entry>,
     pub instance: Arc<Instance>,
     pub physical_device: vk::PhysicalDevice,
     pub device: Arc<Device>,
@@ -39,11 +40,16 @@ impl VulkanContext {
         let pdevices = unsafe { instance.enumerate_physical_devices().ok()? };
         let physical_device = pdevices.into_iter().next()?;
 
-        let queue_families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
         let (queue_family_index, _) = queue_families
             .iter()
             .enumerate()
-            .find(|(_, props)| props.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
+            .find(|(_, props)| {
+                props
+                    .queue_flags
+                    .contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)
+            })
             .map(|(i, p)| (i as u32, p))?;
 
         let priorities = [1.0];
@@ -60,7 +66,11 @@ impl VulkanContext {
             ..Default::default()
         };
 
-        let device = unsafe { instance.create_device(physical_device, &device_create_info, None).ok()? };
+        let device = unsafe {
+            instance
+                .create_device(physical_device, &device_create_info, None)
+                .ok()?
+        };
 
         let queue = unsafe { device.get_device_queue(queue_family_index, 0) };
 
@@ -71,9 +81,11 @@ impl VulkanContext {
             debug_settings: Default::default(),
             buffer_device_address: false,
             allocation_sizes: Default::default(),
-        }).ok()?;
+        })
+        .ok()?;
 
         let ctx = Self {
+            entry: Arc::new(entry),
             instance: Arc::new(instance),
             physical_device,
             device: Arc::new(device),

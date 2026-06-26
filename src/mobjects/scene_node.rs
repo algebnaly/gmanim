@@ -1,8 +1,8 @@
+use super::{Draw, Mobject, Transform};
+use crate::{Context, GMFloat};
 use nalgebra::Matrix4;
-use std::rc::Rc;
 use std::cell::RefCell;
-use crate::{GMFloat, Context};
-use super::{Mobject, Transform, Draw};
+use std::rc::Rc;
 
 pub struct SceneNode {
     pub name: String,

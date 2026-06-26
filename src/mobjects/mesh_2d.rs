@@ -1,8 +1,10 @@
-use crate::Color;
 use crate::mobjects::{Draw, Mobject, Transform};
-use nalgebra::Matrix4;
+use crate::Color;
 use crate::GMFloat;
-use lyon::tessellation::{FillVertex, StrokeVertex, FillVertexConstructor, StrokeVertexConstructor};
+use lyon::tessellation::{
+    FillVertex, FillVertexConstructor, StrokeVertex, StrokeVertexConstructor,
+};
+use nalgebra::Matrix4;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]

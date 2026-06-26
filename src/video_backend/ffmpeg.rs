@@ -109,26 +109,35 @@ impl FfmpegBackend {
         let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
         unsafe {
             output_frame.alloc(Pixel::NV12, width, height);
-            
+
             // NV12 has 2 planes:
             // plane 0: Y
             // plane 1: UV
-            
+
             let y_stride_out = output_frame.stride(0) as usize;
             let y_stride_in = width as usize;
-            let y_out = std::slice::from_raw_parts_mut(output_frame.data_mut(0).as_mut_ptr(), y_stride_out * height as usize);
+            let y_out = std::slice::from_raw_parts_mut(
+                output_frame.data_mut(0).as_mut_ptr(),
+                y_stride_out * height as usize,
+            );
             for row in 0..height as usize {
-                y_out[row * y_stride_out .. row * y_stride_out + y_stride_in]
-                    .copy_from_slice(&nv12_data[row * y_stride_in .. row * y_stride_in + y_stride_in]);
+                y_out[row * y_stride_out..row * y_stride_out + y_stride_in].copy_from_slice(
+                    &nv12_data[row * y_stride_in..row * y_stride_in + y_stride_in],
+                );
             }
-            
+
             let uv_stride_out = output_frame.stride(1) as usize;
             let uv_stride_in = width as usize;
-            let uv_out = std::slice::from_raw_parts_mut(output_frame.data_mut(1).as_mut_ptr(), uv_stride_out * (height / 2) as usize);
+            let uv_out = std::slice::from_raw_parts_mut(
+                output_frame.data_mut(1).as_mut_ptr(),
+                uv_stride_out * (height / 2) as usize,
+            );
             let uv_in_offset = (width * height) as usize;
             for row in 0..(height / 2) as usize {
-                uv_out[row * uv_stride_out .. row * uv_stride_out + uv_stride_in]
-                    .copy_from_slice(&nv12_data[uv_in_offset + row * uv_stride_in .. uv_in_offset + row * uv_stride_in + uv_stride_in]);
+                uv_out[row * uv_stride_out..row * uv_stride_out + uv_stride_in].copy_from_slice(
+                    &nv12_data[uv_in_offset + row * uv_stride_in
+                        ..uv_in_offset + row * uv_stride_in + uv_stride_in],
+                );
             }
         }
 

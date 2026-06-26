@@ -32,7 +32,9 @@ pub trait Animation {
     /// Whether this animation is a pure function of alpha.
     /// Pure animations can be fast-forwarded (O(1)).
     /// Incremental animations must be stepped frame-by-frame.
-    fn is_pure(&self) -> bool { true }
+    fn is_pure(&self) -> bool {
+        true
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -148,7 +150,8 @@ impl Animation for Rotate {
 
     fn update(&mut self, alpha: GMFloat, _scene: &mut Scene) {
         if let Some(start) = self.start_matrix {
-            let mat = nalgebra::Matrix4::new_rotation_wrt_point(self.axis_angle * alpha, self.center);
+            let mat =
+                nalgebra::Matrix4::new_rotation_wrt_point(self.axis_angle * alpha, self.center);
             self.target.borrow_mut().set_model_matrix(mat * start);
         }
     }
@@ -296,7 +299,7 @@ impl Timeline {
                     self.current_frame_global += remaining_in_anim;
                     self.current_anim_frame = total;
                     anim.update(1.0, &mut self.scene);
-                    
+
                     if let Some(mut anim) = self.current_anim.take() {
                         anim.finish(&mut self.scene);
                     }
@@ -342,6 +345,14 @@ impl Timeline {
             None
         }
     }
+
+    pub fn image_bytes(&self) -> Option<&[u8]> {
+        if let Some(renderer) = &self.vulkan_renderer {
+            renderer.get_rgba_bytes()
+        } else {
+            None
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -377,7 +388,8 @@ mod tests {
         let line_ref: Rc<RefCell<Box<dyn Mobject>>> = Rc::new(RefCell::new(Box::new(SimpleLine {
             p0: Point3::new(0.0, 0.0, 0.0),
             p1: Point3::new(1.0, 1.0, 0.0),
-            draw_config: Default::default(), model_matrix: nalgebra::Matrix4::identity(),
+            draw_config: Default::default(),
+            model_matrix: nalgebra::Matrix4::identity(),
         })));
         scene.add_ref(line_ref.clone());
 
@@ -386,7 +398,8 @@ mod tests {
             let new_line: Box<dyn Mobject> = Box::new(SimpleLine {
                 p0: Point3::new(i as GMFloat, 0.0, 0.0),
                 p1: Point3::new(i as GMFloat + 1.0, 1.0, 0.0),
-                draw_config: Default::default(), model_matrix: nalgebra::Matrix4::identity(),
+                draw_config: Default::default(),
+                model_matrix: nalgebra::Matrix4::identity(),
             });
             scene.add(new_line);
         }

@@ -21,10 +21,22 @@ impl Projection {
     pub fn perspective_wgpu(fovy: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
         let f = 1.0 / (fovy / 2.0).tan();
         [
-            f / aspect, 0.0, 0.0, 0.0,
-            0.0, f, 0.0, 0.0,
-            0.0, 0.0, far / (near - far), -1.0,
-            0.0, 0.0, (near * far) / (near - far), 0.0,
+            f / aspect,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            f,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            far / (near - far),
+            -1.0,
+            0.0,
+            0.0,
+            (near * far) / (near - far),
+            0.0,
         ]
     }
 }
@@ -186,11 +198,26 @@ impl Camera {
     pub fn set_up_direction(&mut self, up_direction: Vector3<GMFloat>) {
         self.up_direction = up_direction.normalize();
     }
-    pub fn set_orthographic(&mut self, left: GMFloat, right: GMFloat, bottom: GMFloat, top: GMFloat, near: GMFloat, far: GMFloat) {
-        self.projection = Projection::Orthographic(OrthographicSetting::new(left, right, bottom, top, near, far));
+    pub fn set_orthographic(
+        &mut self,
+        left: GMFloat,
+        right: GMFloat,
+        bottom: GMFloat,
+        top: GMFloat,
+        near: GMFloat,
+        far: GMFloat,
+    ) {
+        self.projection = Projection::Orthographic(OrthographicSetting::new(
+            left, right, bottom, top, near, far,
+        ));
     }
     pub fn set_perspective(&mut self, fovy: GMFloat, aspect: GMFloat, near: GMFloat, far: GMFloat) {
-        self.projection = Projection::Perspective(PerspectiveSetting { fovy, aspect, near, far });
+        self.projection = Projection::Perspective(PerspectiveSetting {
+            fovy,
+            aspect,
+            near,
+            far,
+        });
     }
     pub fn get_camera_transform_matrix(&self) -> Matrix4<GMFloat> {
         Isometry3::look_at_rh(

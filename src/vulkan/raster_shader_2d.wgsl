@@ -18,17 +18,17 @@ struct VertexOutput {
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
+    let world_w = camera.width / camera.scale_factor;
+    let world_h = camera.height / camera.scale_factor;
+
+    let x_ndc = model.position.x / (world_w / 2.0);
+    let y_ndc = model.position.y / (world_h / 2.0);
+
     var out: VertexOutput;
-    
-    // Convert from pixel coordinates to NDC
-    // Usually, 2D origin is center. x: [-width/2, width/2], y: [-height/2, height/2]
-    // Orthographic projection:
-    let x_ndc = model.position.x / (camera.width / 2.0);
-    let y_ndc = model.position.y / (camera.height / 2.0);
-    
-    // In Vulkan, Y goes down, but Manim usually maps +Y to UP, so we flip Y if necessary.
-    out.clip_position = vec4<f32>(x_ndc, -y_ndc, 0.5, 1.0);
     out.color = model.color;
+    
+    // In Vulkan, Y goes down, but Manim usually maps +Y to UP, so we flip Y
+    out.clip_position = vec4<f32>(x_ndc, -y_ndc, 0.5, 1.0);
     
     return out;
 }

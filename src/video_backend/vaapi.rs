@@ -609,10 +609,16 @@ fn convert_rgba_to_nv12(
         if let ColorOrder::Nv12 = color_order {
             let src_y = &rgba[..(width * height) as usize];
             let src_uv = &rgba[(width * height) as usize..];
-            for (dst_row, src_row) in y_plane.chunks_exact_mut(y_stride).zip(src_y.chunks_exact(width as usize)) {
+            for (dst_row, src_row) in y_plane
+                .chunks_exact_mut(y_stride)
+                .zip(src_y.chunks_exact(width as usize))
+            {
                 dst_row[..width as usize].copy_from_slice(src_row);
             }
-            for (dst_row, src_row) in uv_plane.chunks_exact_mut(uv_stride).zip(src_uv.chunks_exact(width as usize)) {
+            for (dst_row, src_row) in uv_plane
+                .chunks_exact_mut(uv_stride)
+                .zip(src_uv.chunks_exact(width as usize))
+            {
                 dst_row[..width as usize].copy_from_slice(src_row);
             }
             return;
