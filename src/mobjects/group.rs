@@ -36,4 +36,10 @@ impl Draw for MobjectGroup {
     }
 }
 
-impl Mobject for MobjectGroup {}
+impl Mobject for MobjectGroup {
+    fn visit_children(&self, f: &mut dyn FnMut(&dyn Mobject)) {
+        for child in &self.mobjects {
+            f(child.as_ref());
+        }
+    }
+}

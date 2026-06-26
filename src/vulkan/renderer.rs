@@ -1126,53 +1126,42 @@ impl VulkanRenderer {
         ) {
             let global_mat = parent_mat * m.get_model_matrix();
 
-            if let Some(node) = m.as_scene_node() {
-                if let Some(comp) = &node.component {
-                    collect_3d(
-                        comp.as_ref(),
-                        global_mat,
-                        primitives_3d,
-                        mesh_vertices,
-                        mesh_indices,
+            m.visit_children(&mut |child| {
+                collect_3d(
+                    child,
+                    global_mat,
+                    primitives_3d,
+                    mesh_vertices,
+                    mesh_indices,
+                );
+            });
+
+            if let Some(obj_3d) = m.as_3d() {
+                primitives_3d.push(obj_3d.as_primitive_data(global_mat));
+            }
+            if let Some(mesh) = m.as_mesh_3d() {
+                let base_index = mesh_vertices.len() as u32;
+                for v in &mesh.vertices {
+                    let pos = nalgebra::Point3::new(
+                        v.position[0] as crate::GMFloat,
+                        v.position[1] as crate::GMFloat,
+                        v.position[2] as crate::GMFloat,
                     );
-                }
-                for child in &node.children {
-                    collect_3d(
-                        child.borrow().as_ref(),
-                        global_mat,
-                        primitives_3d,
-                        mesh_vertices,
-                        mesh_indices,
+                    let t_pos = global_mat.transform_point(&pos);
+                    let n = nalgebra::Vector3::new(
+                        v.normal[0] as crate::GMFloat,
+                        v.normal[1] as crate::GMFloat,
+                        v.normal[2] as crate::GMFloat,
                     );
+                    let t_n = global_mat.transform_vector(&n).normalize();
+                    mesh_vertices.push(Vertex {
+                        position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
+                        normal: [t_n.x as f32, t_n.y as f32, t_n.z as f32],
+                        color: v.color,
+                    });
                 }
-            } else {
-                if let Some(obj_3d) = m.as_3d() {
-                    primitives_3d.push(obj_3d.as_primitive_data(global_mat));
-                }
-                if let Some(mesh) = m.as_mesh_3d() {
-                    let base_index = mesh_vertices.len() as u32;
-                    for v in &mesh.vertices {
-                        let pos = nalgebra::Point3::new(
-                            v.position[0] as crate::GMFloat,
-                            v.position[1] as crate::GMFloat,
-                            v.position[2] as crate::GMFloat,
-                        );
-                        let t_pos = global_mat.transform_point(&pos);
-                        let n = nalgebra::Vector3::new(
-                            v.normal[0] as crate::GMFloat,
-                            v.normal[1] as crate::GMFloat,
-                            v.normal[2] as crate::GMFloat,
-                        );
-                        let t_n = global_mat.transform_vector(&n).normalize();
-                        mesh_vertices.push(Vertex {
-                            position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
-                            normal: [t_n.x as f32, t_n.y as f32, t_n.z as f32],
-                            color: v.color,
-                        });
-                    }
-                    for i in &mesh.indices {
-                        mesh_indices.push(*i + base_index);
-                    }
+                for i in &mesh.indices {
+                    mesh_indices.push(*i + base_index);
                 }
             }
         }
@@ -1197,37 +1186,28 @@ impl VulkanRenderer {
             mesh_indices: &mut Vec<u32>,
         ) {
             let global_mat = parent_mat * m.get_model_matrix();
-            if let Some(node) = m.as_scene_node() {
-                if let Some(comp) = &node.component {
-                    collect_2d(comp.as_ref(), global_mat, mesh_vertices, mesh_indices);
-                }
-                for child in &node.children {
-                    collect_2d(
-                        child.borrow().as_ref(),
-                        global_mat,
-                        mesh_vertices,
-                        mesh_indices,
+
+            m.visit_children(&mut |child| {
+                collect_2d(child, global_mat, mesh_vertices, mesh_indices);
+            });
+
+            if let Some(mesh) = m.as_mesh_2d() {
+                let base_index = mesh_vertices.len() as u32;
+                let mesh_mat = global_mat * mesh.model_matrix;
+                for v in &mesh.vertices {
+                    let pos = nalgebra::Point3::new(
+                        v.position[0] as crate::GMFloat,
+                        v.position[1] as crate::GMFloat,
+                        0.0,
                     );
+                    let t_pos = mesh_mat.transform_point(&pos);
+                    mesh_vertices.push(Vertex2D {
+                        position: [t_pos.x as f32, t_pos.y as f32],
+                        color: v.color,
+                    });
                 }
-            } else {
-                if let Some(mesh) = m.as_mesh_2d() {
-                    let base_index = mesh_vertices.len() as u32;
-                    let mesh_mat = global_mat * mesh.model_matrix;
-                    for v in &mesh.vertices {
-                        let pos = nalgebra::Point3::new(
-                            v.position[0] as crate::GMFloat,
-                            v.position[1] as crate::GMFloat,
-                            0.0,
-                        );
-                        let t_pos = mesh_mat.transform_point(&pos);
-                        mesh_vertices.push(Vertex2D {
-                            position: [t_pos.x as f32, t_pos.y as f32],
-                            color: v.color,
-                        });
-                    }
-                    for i in &mesh.indices {
-                        mesh_indices.push(*i + base_index);
-                    }
+                for i in &mesh.indices {
+                    mesh_indices.push(*i + base_index);
                 }
             }
         }

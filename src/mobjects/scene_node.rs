@@ -57,8 +57,13 @@ impl Draw for SceneNode {
 }
 
 impl Mobject for SceneNode {
-    fn as_scene_node(&self) -> Option<&SceneNode> {
-        Some(self)
+    fn visit_children(&self, f: &mut dyn FnMut(&dyn Mobject)) {
+        if let Some(comp) = &self.component {
+            f(comp.as_ref());
+        }
+        for child in &self.children {
+            f(child.borrow().as_ref());
+        }
     }
     fn get_name(&self) -> Option<String> {
         Some(self.name.clone())

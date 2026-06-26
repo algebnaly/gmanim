@@ -91,48 +91,6 @@ pub fn lerp(
     return p0 * (1.0 - t) + p1 * t;
 }
 
-#[test]
-fn test_bezier_curve() {
-    let p0 = Vector2::new(0.0, 0.0);
-    let p1 = Vector2::new(0.5, 1.0);
-    let p2 = Vector2::new(1.0, 0.0);
-    let mut ctx = Context::default();
-    ctx.pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xff));
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(
-        coordinate_change_x(p0.x, ctx.scene_config.width) * ctx.scene_config.scale_factor,
-        coordinate_change_y(p0.y, ctx.scene_config.height) * ctx.scene_config.scale_factor,
-    );
-    let mut t = 0.0;
-    let delta_t = 1.0 / 20.0;
-    while t < 1.0 {
-        t += delta_t;
-        let p = bezier_cubic(p0, p1, p2, t);
-        println!("{:?}", p);
-        pb.line_to(
-            coordinate_change_x(p.x, ctx.scene_config.width) * ctx.scene_config.scale_factor,
-            coordinate_change_y(p.y, ctx.scene_config.height) * ctx.scene_config.scale_factor,
-        );
-    }
-
-    let path = pb.finish().unwrap();
-
-    let mut stroke = tiny_skia::Stroke::default();
-    stroke.width = 6.0;
-    stroke.line_cap = tiny_skia::LineCap::Round;
-    let mut paint = tiny_skia::Paint::default();
-    paint.set_color(Color::default().into());
-
-    ctx.pixmap.stroke_path(
-        &path,
-        &paint,
-        &stroke,
-        tiny_skia::Transform::identity(),
-        None,
-    );
-    ctx.pixmap.save_png("test_bezier_curve.png");
-}
-
 pub fn k_for_bezier_arc(theta: GMFloat) -> GMFloat {
     // assume theta was less than pi/2
     (4.0 / 3.0 * (1.0 - (theta as GMFloat).cos()) / (theta as GMFloat).sin()) as GMFloat

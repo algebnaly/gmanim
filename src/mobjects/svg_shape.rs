@@ -196,21 +196,19 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
     svg_file.read_to_string(&mut svg_str_buf);
     let tree = usvg::Tree::from_str(&svg_str_buf, &Default::default()).unwrap();
     let mut paths: Vec<SVGPath> = vec![];
-    for node in tree.root().children() {
-        let n = node;
-        match n {
+
+    fn extract_paths(node: &Node, paths: &mut Vec<SVGPath>) {
+        match node {
             Node::Group(g) => {
-                //we don't care for now
-            }
-            Node::Image(img) => {
-                //we don't care for now
+                for child in g.children() {
+                    extract_paths(child, paths);
+                }
             }
             Node::Path(path) => {
                 //apply transform
                 let mut svg_path = SVGPath::new();
                 let transform = node.abs_transform();
-                let path_data = path;
-                for e in path_data.data().segments() {
+                for e in path.data().segments() {
                     let pe = process_path_element(e, transform);
                     svg_path.elements.push(pe);
                 }
@@ -218,11 +216,12 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
                 svg_path.update_mesh();
                 paths.push(svg_path);
             }
-            Node::Text(_text) => {
-                // we don't care for now
-            }
             _ => {}
         }
+    }
+
+    for node in tree.root().children() {
+        extract_paths(&node, &mut paths);
     }
 
     let mut grp_mobj = MobjectGroup {

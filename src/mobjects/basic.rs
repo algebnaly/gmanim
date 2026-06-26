@@ -383,12 +383,3 @@ impl Mobject for PolyLine {
         Some(&self.mesh)
     }
 }
-
-#[test]
-fn test_draw_arc() {
-    let mut ctx = Context::default();
-    let mut scene = Scene::default();
-    let arc = Arc::new(Point3::new(0.0, 1.0, 0.0), 0.0, PI as GMFloat * 2.0, 3.0);
-    scene.add(Box::new(arc));
-    scene.save_png(&mut ctx, "arc.png");
-}

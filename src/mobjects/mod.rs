@@ -37,9 +37,7 @@ pub trait Mobject: Transform + Draw {
     fn as_mesh_3d(&self) -> Option<&crate::mobjects::mesh_3d::TriangleMesh3D> {
         None
     }
-    fn as_scene_node(&self) -> Option<&crate::mobjects::scene_node::SceneNode> {
-        None
-    }
+    fn visit_children(&self, _f: &mut dyn FnMut(&dyn Mobject)) {}
     fn get_name(&self) -> Option<String> {
         None
     }

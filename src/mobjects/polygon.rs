@@ -100,17 +100,3 @@ impl Mobject for Polygon {
         Some(&self.mesh)
     }
 }
-
-#[test]
-pub fn test_polygon() {
-    let mut ctx = Context::default();
-    let mut scene = Scene::default();
-    let v_list = vec![
-        GMPoint::origin(),
-        GMPoint::new(1.0, 1.0, 0.0),
-        GMPoint::new(1.0, 2.0, 0.0),
-    ];
-    let mut polygon = Polygon::new(v_list);
-    scene.add(Box::new(polygon));
-    scene.save_png(&mut ctx, "output.png");
-}

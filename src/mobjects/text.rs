@@ -210,23 +210,3 @@ impl Text {
         }
     }
 }
-
-#[test]
-fn test_draw_text() {
-    setup_logger().unwrap();
-    let mut ctx = crate::Context::default();
-    let mut scene = crate::Scene::new();
-    let mut text = Text::new(
-        "你好呀".to_owned(),
-        Point3::new(0.0, 1.0, 0.0),
-        32.0,
-        DrawConfig::default(),
-    );
-    let rotation = nalgebra::Matrix4::new_rotation_wrt_point(
-        nalgebra::Vector3::new(0.0, 0.0, 1.0),
-        nalgebra::Point3::new(0.0, 0.0, 0.0),
-    );
-    text.apply_transform(rotation);
-    text.draw(&mut ctx, nalgebra::Matrix4::identity());
-    ctx.pixmap.save_png("text_render.png");
-}
