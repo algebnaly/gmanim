@@ -5,6 +5,7 @@ pub mod group;
 pub mod object_3d;
 pub mod scene_node;
 pub mod mesh_3d;
+pub mod mesh_2d;
 pub mod path;
 pub mod polygon;
 pub mod svg_shape;
@@ -31,6 +32,9 @@ pub trait Mobject: Transform + Draw {
         None
     }
     fn as_mesh_3d(&self) -> Option<&crate::mobjects::mesh_3d::TriangleMesh3D> {
+        None
+    }
+    fn as_mesh_2d(&self) -> Option<&crate::mobjects::mesh_2d::TriangleMesh2D> {
         None
     }
     fn as_scene_node(&self) -> Option<&crate::mobjects::scene_node::SceneNode> {

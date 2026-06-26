@@ -1,5 +1,10 @@
 use nalgebra::Point3;
-use tiny_skia::{FillRule, LineCap, LineJoin, Paint, PathBuilder, Stroke};
+use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
+use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers};
+use lyon::path::Path;
+use lyon::math::point;
+use std::f32::consts::PI;
+
 
 use crate::{
     mobjects::{Draw, DrawConfig, Mobject, Transform},
@@ -12,6 +17,7 @@ pub struct Dot {
     pub color: Color,
     pub draw_config: DrawConfig,
     pub model_matrix: nalgebra::Matrix4<GMFloat>,
+    pub mesh: TriangleMesh2D,
 }
 
 impl Default for Dot {
@@ -22,6 +28,7 @@ impl Default for Dot {
             color: Color::default(),
             draw_config: DrawConfig::default(),
             model_matrix: nalgebra::Matrix4::identity(),
+            mesh: TriangleMesh2D::default(),
         }
     }
 }
@@ -34,31 +41,13 @@ impl Dot {
             color,
             draw_config,
             model_matrix: nalgebra::Matrix4::identity(),
+            mesh: TriangleMesh2D::default(),
         }
     }
 }
 
 impl Draw for Dot {
-    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = crate::mobjects::get_2d_transform(ctx, global_mat);
-
-        let path = tiny_skia::PathBuilder::from_circle(
-            (self.position.x) as f32 as f32 * ctx.scene_config.scale_factor,
-            (self.position.y) as f32 as f32 * ctx.scene_config.scale_factor,
-            self.radius as f32 * ctx.scene_config.scale_factor, // scale radius
-        )
-        .unwrap();
-
-        let mut paint = tiny_skia::Paint::default();
-        paint.set_color(self.draw_config.color.into());
-        ctx.pixmap.fill_path(
-            &path,
-            &paint,
-            Default::default(),
-            ts_transform,
-            None,
-        );
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
     }
 }
 impl Transform for Dot {
@@ -70,4 +59,8 @@ impl Transform for Dot {
     }
 }
 
-impl Mobject for Dot {}
+impl Mobject for Dot {
+    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
+        Some(&self.mesh)
+    }
+}
