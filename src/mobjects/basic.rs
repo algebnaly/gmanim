@@ -4,6 +4,11 @@ use std::f32::consts::PI;
 use crate::{math_utils::k_for_bezier_arc, Color, Context, GMFloat, Scene};
 
 use super::{get_2d_transform, Draw, DrawConfig, Mobject, Transform};
+use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
+use lyon::tessellation::{BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers};
+use lyon::path::Path;
+use lyon::math::point;
+
 
 pub struct Rectangle {
     pub p0: Point3<GMFloat>, // Top left
@@ -13,6 +18,7 @@ pub struct Rectangle {
     pub color: Color,
     pub draw_config: DrawConfig,
     pub model_matrix: nalgebra::Matrix4<GMFloat>,
+    pub mesh: TriangleMesh2D,
 }
 
 impl Default for Rectangle {
@@ -25,6 +31,7 @@ impl Default for Rectangle {
             color: Color::default(),
             draw_config: DrawConfig::default(),
             model_matrix: nalgebra::Matrix4::identity(),
+            mesh: TriangleMesh2D::default(),
         }
     }
 }
@@ -38,57 +45,54 @@ impl Transform for Rectangle {
     }
 }
 
-impl Draw for Rectangle {
-    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = get_2d_transform(ctx, global_mat);
+impl Rectangle {
+    pub fn update_mesh(&mut self) {
+        let mut builder = Path::builder();
+        builder.begin(point(self.p0.x as f32, self.p0.y as f32));
+        builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
+        builder.line_to(point(self.p2.x as f32, self.p2.y as f32));
+        builder.line_to(point(self.p3.x as f32, self.p3.y as f32));
+        builder.end(true);
+        let path = builder.build();
 
-        let mut pb = tiny_skia::PathBuilder::new();
-        pb.move_to(
-            (self.p0.x) as f32,
-            (self.p0.y) as f32,
-        );
-        pb.line_to(
-            (self.p1.x) as f32,
-            (self.p1.y) as f32,
-        );
-        pb.line_to(
-            (self.p2.x) as f32,
-            (self.p2.y) as f32,
-        );
-        pb.line_to(
-            (self.p3.x) as f32,
-            (self.p3.y) as f32,
-        );
-        pb.close();
-        let path = pb.finish().unwrap();
-
-        let mut paint = tiny_skia::Paint::default();
-        paint.set_color(self.color.into());
-
-        if let Some(mut st) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
-            ctx.pixmap.stroke_path(
-                &path,
-                &paint,
-                &st,
-                ts_transform,
-                None,
-            );
-        }
-
+        let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
+        let color = [self.color.r as f32 / 255.0, self.color.g as f32 / 255.0, self.color.b as f32 / 255.0, self.color.a as f32 / 255.0];
+        
         if self.draw_config.fill {
-            ctx.pixmap.fill_path(
+            let mut fill_tess = FillTessellator::new();
+            fill_tess.tessellate_path(
                 &path,
-                &paint,
-                tiny_skia::FillRule::EvenOdd,
-                ts_transform,
-                None,
-            );
+                &FillOptions::default(),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+            ).unwrap();
         }
+
+        if self.draw_config.stoke_width > 0.0 {
+            let mut stroke_tess = StrokeTessellator::new();
+            stroke_tess.tessellate_path(
+                &path,
+                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+            ).unwrap();
+        }
+
+        self.mesh.vertices = geometry.vertices;
+        self.mesh.indices = geometry.indices;
+        self.mesh.model_matrix = self.model_matrix;
     }
 }
 
-impl Mobject for Rectangle {}
+impl Draw for Rectangle {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
+        // empty
+    }
+}
+
+impl Mobject for Rectangle {
+    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
+        Some(&self.mesh)
+    }
+}
 
 #[derive(Default)]
 pub struct SimpleLine {
@@ -96,16 +100,20 @@ pub struct SimpleLine {
     pub p1: Point3<GMFloat>,
     pub draw_config: DrawConfig,
     pub model_matrix: nalgebra::Matrix4<GMFloat>,
+    pub mesh: TriangleMesh2D,
 }
 
 impl SimpleLine {
     pub fn new(p0: Point3<GMFloat>, p1: Point3<GMFloat>) -> Self {
-        Self {
+        let mut sl = Self {
             p0,
             p1,
             draw_config: DrawConfig::default(),
             model_matrix: nalgebra::Matrix4::identity(),
-        }
+            mesh: TriangleMesh2D::default(),
+        };
+        sl.update_mesh();
+        sl
     }
 }
 
@@ -118,53 +126,62 @@ impl Transform for SimpleLine {
     }
 }
 
-impl Draw for SimpleLine {
-    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = get_2d_transform(ctx, global_mat);
+impl SimpleLine {
+    pub fn update_mesh(&mut self) {
+        let mut builder = Path::builder();
+        builder.begin(point(self.p0.x as f32, self.p0.y as f32));
+        builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
+        builder.end(false);
+        let path = builder.build();
 
-        let mut pb = tiny_skia::PathBuilder::new();
-        pb.move_to(
-            (self.p0.x) as f32,
-            (self.p0.y) as f32,
-        );
-        pb.line_to(
-            (self.p1.x) as f32,
-            (self.p1.y) as f32,
-        );
-        if let Some(path) = pb.finish() {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(self.draw_config.color.into());
-
-            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
-                ctx.pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    ts_transform,
-                    None,
-                );
-            }
+        let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
+        let c = self.draw_config.color;
+        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
+        
+        if self.draw_config.stoke_width > 0.0 {
+            let mut stroke_tess = StrokeTessellator::new();
+            stroke_tess.tessellate_path(
+                &path,
+                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+            ).unwrap();
         }
+
+        self.mesh.vertices = geometry.vertices;
+        self.mesh.indices = geometry.indices;
+        self.mesh.model_matrix = self.model_matrix;
     }
 }
 
-impl Mobject for SimpleLine {}
+impl Draw for SimpleLine {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
+    }
+}
+
+impl Mobject for SimpleLine {
+    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
+        Some(&self.mesh)
+    }
+}
 
 #[derive(Default)]
 pub struct PolyLine {
     pub points: Vec<Point3<GMFloat>>,
     pub draw_config: DrawConfig,
     pub model_matrix: nalgebra::Matrix4<GMFloat>,
+    pub mesh: TriangleMesh2D,
 }
 
 impl PolyLine {
     pub fn new(points: Vec<Point3<GMFloat>>) -> Self {
-        Self {
+        let mut pl = Self {
             points,
             draw_config: DrawConfig::default(),
             model_matrix: nalgebra::Matrix4::identity(),
-        }
+            mesh: TriangleMesh2D::default(),
+        };
+        pl.update_mesh();
+        pl
     }
 }
 
@@ -184,6 +201,7 @@ pub struct Arc {
     pub radius: GMFloat,
     pub draw_config: DrawConfig,
     pub model_matrix: nalgebra::Matrix4<GMFloat>,
+    pub mesh: TriangleMesh2D,
 }
 
 impl Arc {
@@ -193,35 +211,31 @@ impl Arc {
         end_angle: GMFloat,
         radius: GMFloat,
     ) -> Self {
-        Self {
+        let mut a = Self {
             center_point,
             start_angle,
             end_angle,
             radius,
             draw_config: DrawConfig::default(),
             model_matrix: nalgebra::Matrix4::identity(),
-        }
+            mesh: TriangleMesh2D::default(),
+        };
+        a.update_mesh();
+        a
     }
 }
 
-impl Draw for Arc {
-    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = get_2d_transform(ctx, global_mat);
-
-        let mut pb = tiny_skia::PathBuilder::new();
-        
-        let num_curves = ((self.end_angle - self.start_angle).abs() / (PI / 2.0)).ceil() as usize;
+impl Arc {
+    pub fn update_mesh(&mut self) {
+        let mut builder = Path::builder();
+        let num_curves = ((self.end_angle - self.start_angle).abs() / (PI as f32 / 2.0)).ceil() as usize;
         if num_curves == 0 { return; }
 
         let angle_step = (self.end_angle - self.start_angle) / (num_curves as f32);
         
         let start_x = self.center_point.x + self.radius * self.start_angle.cos();
         let start_y = self.center_point.y + self.radius * self.start_angle.sin();
-        pb.move_to(
-            (start_x) as f32,
-            (start_y) as f32
-        );
+        builder.begin(point(start_x as f32, start_y as f32));
 
         let mut current_angle = self.start_angle;
         for _ in 0..num_curves {
@@ -237,28 +251,37 @@ impl Draw for Arc {
             let end_x = self.center_point.x + self.radius * next_angle.cos();
             let end_y = self.center_point.y + self.radius * next_angle.sin();
 
-            pb.cubic_to(
-                (cp1_x) as f32, (cp1_y) as f32,
-                (cp2_x) as f32, (cp2_y) as f32,
-                (end_x) as f32, (end_y) as f32
+            builder.cubic_bezier_to(
+                point(cp1_x as f32, cp1_y as f32),
+                point(cp2_x as f32, cp2_y as f32),
+                point(end_x as f32, end_y as f32)
             );
             current_angle = next_angle;
         }
+        builder.end(false);
+        let path = builder.build();
 
-        if let Some(path) = pb.finish() {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(self.draw_config.color.into());
-
-            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
-                ctx.pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    ts_transform,
-                    None,
-                );
-            }
+        let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
+        let c = self.draw_config.color;
+        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
+        
+        if self.draw_config.stoke_width > 0.0 {
+            let mut stroke_tess = StrokeTessellator::new();
+            stroke_tess.tessellate_path(
+                &path,
+                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+            ).unwrap();
         }
+
+        self.mesh.vertices = geometry.vertices;
+        self.mesh.indices = geometry.indices;
+        self.mesh.model_matrix = self.model_matrix;
+    }
+}
+
+impl Draw for Arc {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
     }
 }
 
@@ -271,46 +294,57 @@ impl Transform for Arc {
     }
 }
 
-impl Mobject for Arc {}
-
-impl Draw for PolyLine {
-    fn draw(&self, ctx: &mut Context, parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        if self.points.is_empty() {
-            return;
-        }
-        let global_mat = parent_matrix * self.model_matrix;
-        let ts_transform = get_2d_transform(ctx, global_mat);
-
-        let mut pb = tiny_skia::PathBuilder::new();
-        let mut first = true;
-        for p in &self.points {
-            let px = (p.x) as f32;
-            let py = (p.y) as f32;
-            if first {
-                pb.move_to(px, py);
-                first = false;
-            } else {
-                pb.line_to(px, py);
-            }
-        }
-        if let Some(path) = pb.finish() {
-            let mut paint = tiny_skia::Paint::default();
-            paint.set_color(self.draw_config.color.into());
-
-            if let Some(mut stroke) = self.draw_config.get_stroke(ctx.scene_config.scale_factor) {
-                ctx.pixmap.stroke_path(
-                    &path,
-                    &paint,
-                    &stroke,
-                    ts_transform,
-                    None,
-                );
-            }
-        }
+impl Mobject for Arc {
+    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
+        Some(&self.mesh)
     }
 }
 
-impl Mobject for PolyLine {}
+impl PolyLine {
+    pub fn update_mesh(&mut self) {
+        if self.points.is_empty() { return; }
+        let mut builder = Path::builder();
+        let mut first = true;
+        for p in &self.points {
+            if first {
+                builder.begin(point(p.x as f32, p.y as f32));
+                first = false;
+            } else {
+                builder.line_to(point(p.x as f32, p.y as f32));
+            }
+        }
+        builder.end(false);
+        let path = builder.build();
+
+        let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
+        let c = self.draw_config.color;
+        let color = [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a as f32 / 255.0];
+        
+        if self.draw_config.stoke_width > 0.0 {
+            let mut stroke_tess = StrokeTessellator::new();
+            stroke_tess.tessellate_path(
+                &path,
+                &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color })
+            ).unwrap();
+        }
+
+        self.mesh.vertices = geometry.vertices;
+        self.mesh.indices = geometry.indices;
+        self.mesh.model_matrix = self.model_matrix;
+    }
+}
+
+impl Draw for PolyLine {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
+    }
+}
+
+impl Mobject for PolyLine {
+    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
+        Some(&self.mesh)
+    }
+}
 
 #[test]
 fn test_draw_arc() {
