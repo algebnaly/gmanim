@@ -17,6 +17,18 @@ pub enum Projection {
     Orthographic(OrthographicSetting),
 }
 
+impl Projection {
+    pub fn perspective_wgpu(fovy: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+        let f = 1.0 / (fovy / 2.0).tan();
+        [
+            f / aspect, 0.0, 0.0, 0.0,
+            0.0, f, 0.0, 0.0,
+            0.0, 0.0, far / (near - far), -1.0,
+            0.0, 0.0, (near * far) / (near - far), 0.0,
+        ]
+    }
+}
+
 impl Default for Projection {
     fn default() -> Self {
         Projection::Perspective(PerspectiveSetting::default())
@@ -34,8 +46,8 @@ pub struct PerspectiveSetting {
 impl Default for PerspectiveSetting {
     fn default() -> Self {
         Self {
-            near: 1.0,
-            far: 2.0,
+            near: 0.1,
+            far: 1000.0,
             fovy: PI / 2.0,
             aspect: 16.0 / 9.0,
         }
@@ -158,6 +170,13 @@ impl Camera {
         match &self.projection {
             Projection::Orthographic(o) => (o.left, o.right, o.bottom, o.top),
             _ => (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+
+    pub fn perspective_params(&self) -> (GMFloat, GMFloat) {
+        match &self.projection {
+            Projection::Perspective(p) => (p.near, p.far),
+            _ => (0.1, 1000.0),
         }
     }
 

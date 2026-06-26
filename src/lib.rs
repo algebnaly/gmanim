@@ -13,7 +13,7 @@ pub mod log_utils;
 pub mod math_utils;
 pub mod mobjects;
 pub mod video_backend;
-pub mod wgpu;
+pub mod vulkan;
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "gmfloat_f16")]{
@@ -40,11 +40,13 @@ impl Color {
     pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
-}
-
-impl From<Color> for tiny_skia::Color {
-    fn from(value: Color) -> Self {
-        Self::from_rgba8(value.r, value.g, value.b, value.a)
+    pub fn to_array(&self) -> [GMFloat; 4] {
+        [
+            self.r as GMFloat / 255.0,
+            self.g as GMFloat / 255.0,
+            self.b as GMFloat / 255.0,
+            self.a as GMFloat / 255.0,
+        ]
     }
 }
 
@@ -59,6 +61,7 @@ impl Default for Color {
     }
 }
 
+#[derive(Clone, Debug, Copy)]
 pub struct SceneConfig {
     pub width: GMFloat,
     pub height: GMFloat,
@@ -68,8 +71,27 @@ pub struct SceneConfig {
 }
 
 pub struct Context {
-    pub pixmap: tiny_skia::Pixmap,
     pub scene_config: SceneConfig,
+}
+
+impl Context {
+    pub fn new(
+        width: GMFloat,
+        height: GMFloat,
+        output_width: u32,
+        output_height: u32,
+        scale_factor: GMFloat,
+    ) -> Self {
+        Context {
+            scene_config: SceneConfig {
+                width,
+                height,
+                output_width,
+                output_height,
+                scale_factor,
+            },
+        }
+    }
 }
 
 impl SceneConfig {
@@ -96,29 +118,9 @@ impl Default for SceneConfig {
 impl Default for Context {
     fn default() -> Self {
         let scene_config = SceneConfig::default();
-        let pixmap =
-            tiny_skia::Pixmap::new(scene_config.output_width, scene_config.output_height).unwrap();
         Self {
-            pixmap,
             scene_config,
         }
-    }
-}
-
-impl Context {
-    fn clear_transparent(&mut self) {
-        self.pixmap
-            .fill(tiny_skia::Color::from_rgba8(0, 0, 0, 0xff));
-    }
-
-    pub fn image_bytes(&self) -> &[u8] {
-        self.pixmap.data()
-    }
-
-    /// Copy rendered pixels directly into the provided buffer (avoids to_vec() allocation).
-    pub fn copy_image_into(&self, dst: &mut [u8]) {
-        let src = self.image_bytes();
-        dst[..src.len()].copy_from_slice(src);
     }
 }
 
@@ -157,16 +159,6 @@ impl Default for Scene {
 }
 
 impl Scene {
-    pub fn save_png(&self, ctx: &mut Context, file_path: &str) {
-        ctx.clear_transparent();
-
-        for m in self.mobjects.iter() {
-            m.borrow().draw(ctx, nalgebra::Matrix4::identity());
-        }
-
-        ctx.pixmap.save_png(file_path);
-    }
-
     pub fn add(
         &mut self,
         mobject: Box<dyn mobjects::Mobject>,
@@ -283,8 +275,7 @@ fn write_frame() {
         let now = std::time::Instant::now();
         let translation =
             nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(0.01, 0.0, 0.0));
-        let translation = nalgebra::Transform3::<GMFloat>::from_matrix_unchecked(translation);
-        scene.mobjects[0].borrow_mut().transform(translation);
+        scene.mobjects[0].borrow_mut().apply_transform(translation);
         ctx.clear_transparent();
         for m in scene.mobjects.iter() {
             m.borrow().draw(&mut ctx, nalgebra::Matrix4::identity());

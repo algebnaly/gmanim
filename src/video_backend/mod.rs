@@ -37,6 +37,7 @@ impl FrameBuffer {
 pub enum ColorOrder {
     Bgra,
     Rgba,
+    Nv12,
 }
 
 impl Display for ColorOrder {
@@ -46,7 +47,10 @@ impl Display for ColorOrder {
                 write!(f, "bgra")
             }
             ColorOrder::Rgba => {
-                write!(f, "rgba")
+                f.write_str("rgba")
+            }
+            ColorOrder::Nv12 => {
+                f.write_str("nv12")
             }
         }
     }
@@ -251,7 +255,10 @@ impl FfmpegPipeBackend {
             child: c,
             stdin: Some(stdin),
             closed: false,
-            frame_size: (video_config.output_width * video_config.output_height * 4) as usize,
+            frame_size: match video_config.color_order {
+                ColorOrder::Nv12 => (video_config.output_width * video_config.output_height * 3 / 2) as usize,
+                _ => (video_config.output_width * video_config.output_height * 4) as usize,
+            },
         }
     }
 

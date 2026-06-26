@@ -17,7 +17,11 @@ struct CameraUniform {
     clip_y: f32,
     clip_w: f32,
     clip_h: f32,
-    _padding2: vec4<u32>,
+    aa_level: u32,
+    num_primitives: u32,
+    _pad2: u32,
+    _pad3: u32,
+    proj_mat: mat4x4<f32>,
 }
 @group(0) @binding(1) var<uniform> camera: CameraUniform;
 
@@ -49,37 +53,13 @@ fn vs_main(model: VertexInput) -> VertexOutput {
         vec4<f32>(-dot(u, camera.pos), -dot(v, camera.pos), -dot(w, camera.pos), 1.0)
     );
     
-    let fov = camera.fov;
-    let aspect = camera.width / camera.height;
-    let n = 0.1;
-    let f = 1000.0;
-    
-    // Proj matrix (Perspective by default)
-    // wgpu uses z in [0, 1] range.
-    var proj_mat = mat4x4<f32>(
-        vec4<f32>(1.0 / (aspect * tan(fov / 2.0)), 0.0, 0.0, 0.0),
-        vec4<f32>(0.0, 1.0 / tan(fov / 2.0), 0.0, 0.0),
-        vec4<f32>(0.0, 0.0, f / (n - f), -1.0),
-        vec4<f32>(0.0, 0.0, (f * n) / (n - f), 0.0)
-    );
-    
-    if camera.proj_type == 1u {
-        // Ortho
-        let l = camera.ortho_left;
-        let r = camera.ortho_right;
-        let b = camera.ortho_bottom;
-        let t = camera.ortho_top;
-        proj_mat = mat4x4<f32>(
-            vec4<f32>(2.0 / (r - l), 0.0, 0.0, 0.0),
-            vec4<f32>(0.0, 2.0 / (t - b), 0.0, 0.0),
-            vec4<f32>(0.0, 0.0, 1.0 / (n - f), 0.0),
-            vec4<f32>(-(r + l)/(r - l), -(t + b)/(t - b), n / (n - f), 1.0)
-        );
-    }
+    let proj_mat = camera.proj_mat;
     
     let world_pos = vec4<f32>(model.position, 1.0);
     out.frag_pos = world_pos.xyz;
-    out.clip_position = proj_mat * view_mat * world_pos;
+    let view_pos = view_mat * world_pos;
+    out.clip_position = proj_mat * view_pos;
+    // out.clip_position.z = out.clip_position.w * 0.5;
     out.normal = model.normal;
     out.color = model.color;
     

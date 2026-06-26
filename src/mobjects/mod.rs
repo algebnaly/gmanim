@@ -4,6 +4,7 @@ pub mod formula;
 pub mod group;
 pub mod object_3d;
 pub mod scene_node;
+pub mod mesh_2d;
 pub mod mesh_3d;
 pub mod path;
 pub mod polygon;
@@ -30,6 +31,9 @@ pub trait Mobject: Transform + Draw {
     fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
         None
     }
+    fn as_mesh_2d(&self) -> Option<&crate::mobjects::mesh_2d::TriangleMesh2D> {
+        None
+    }
     fn as_mesh_3d(&self) -> Option<&crate::mobjects::mesh_3d::TriangleMesh3D> {
         None
     }
@@ -49,23 +53,6 @@ pub trait MobjectClone: Mobject {
 
 
 use nalgebra::Vector3;
-
-pub fn get_2d_transform(ctx: &crate::Context, mat: nalgebra::Matrix4<crate::GMFloat>) -> tiny_skia::Transform {
-    let math_transform = tiny_skia::Transform::from_row(
-        mat.m11 as f32, mat.m21 as f32,
-        mat.m12 as f32, mat.m22 as f32,
-        mat.m14 as f32, mat.m24 as f32,
-    );
-    let math_to_screen = tiny_skia::Transform::from_row(
-        ctx.scene_config.scale_factor, 0.0,
-        0.0, -ctx.scene_config.scale_factor,
-        (ctx.scene_config.width / 2.0) * ctx.scene_config.scale_factor,
-        (ctx.scene_config.height / 2.0) * ctx.scene_config.scale_factor,
-    );
-    math_transform.post_concat(math_to_screen)
-}
-
-
 
 pub trait Transform {
     // Modify the model_matrix natively
@@ -110,20 +97,7 @@ impl Default for DrawConfig {
     }
 }
 
-impl DrawConfig {
-    pub fn get_stroke(&self, _scale_factor: f32) -> Option<tiny_skia::Stroke> {
-        if self.stoke_width <= 0.0 {
-            return None;
-        }
-        let mut stroke = tiny_skia::Stroke::default();
-        stroke.width = self.stoke_width as f32; // Do not multiply by scale_factor here, tiny_skia applies ts_transform's scale automatically!
-        stroke.line_cap = tiny_skia::LineCap::Round;
-        stroke.line_join = tiny_skia::LineJoin::Round;
-        Some(stroke)
-    }
-}
-
-pub fn rotate_matrix(axis: Vector3<GMFloat>, theta: GMFloat) {
+pub fn rotate_matrix(axis: nalgebra::Vector3<GMFloat>, theta: GMFloat) {
     //assume axis is a unit vector
 }
 

@@ -20,7 +20,7 @@ struct CameraUniform {
     clip_w: f32,
     clip_h: f32,
     aa_level: u32,
-    _pad1: u32,
+    num_primitives: u32,
     _pad2: u32,
     _pad3: u32,
 }
@@ -84,7 +84,7 @@ fn sd_capped_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, ra: f32, rb: f32) ->
 fn map(p: vec3<f32>) -> MapResult {
     var min_dist: f32 = 99999.0;
     var best_color: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-    let num_primitives = arrayLength(&primitives);
+    let num_primitives = camera.num_primitives;
     
     for (var i: u32 = 0u; i < num_primitives; i = i + 1u) {
         let prim = primitives[i];
@@ -221,7 +221,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let fov_scale = tan(camera.fov * 0.5);
     
     // Camera coordinate system
-    let cz = normalize(camera.look_at - camera.pos);
+    let cz = camera.look_at;
     let cx = normalize(cross(cz, camera.up));
     let cy = cross(cx, cz);
     let ro = camera.pos;

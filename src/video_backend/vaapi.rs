@@ -606,9 +606,22 @@ fn convert_rgba_to_nv12(
             height: height as u32,
         };
 
+        if let ColorOrder::Nv12 = color_order {
+            let src_y = &rgba[..(width * height) as usize];
+            let src_uv = &rgba[(width * height) as usize..];
+            for (dst_row, src_row) in y_plane.chunks_exact_mut(y_stride).zip(src_y.chunks_exact(width as usize)) {
+                dst_row[..width as usize].copy_from_slice(src_row);
+            }
+            for (dst_row, src_row) in uv_plane.chunks_exact_mut(uv_stride).zip(src_uv.chunks_exact(width as usize)) {
+                dst_row[..width as usize].copy_from_slice(src_row);
+            }
+            return;
+        }
+
         let convert = match color_order {
             ColorOrder::Rgba => rgba_to_yuv_nv12,
             ColorOrder::Bgra => bgra_to_yuv_nv12,
+            ColorOrder::Nv12 => unreachable!(),
         };
         convert(
             &mut image,

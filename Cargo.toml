@@ -18,9 +18,11 @@ cfg-if = "1.0.0"
 ffmpeg-next = "8.1"
 yuv = { version = "0.8.11", features = ["fast_mode"] }
 rayon = "1.12.0"
-wgpu = "29.0.3"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+ash = "0.38.0"
+gpu-allocator = { version = "0.28.0", features = ["vulkan"] }
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
 pollster = "0.4.0"
-bytemuck = "1.25.0"
 
 [features]
 default = ["gmfloat_f32"]

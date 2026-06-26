@@ -50,7 +50,7 @@ impl FfmpegBackend {
 
         v_enc.set_width(video_config.output_width);
         v_enc.set_height(video_config.output_height);
-        v_enc.set_format(Pixel::YUV420P);
+        v_enc.set_format(Pixel::NV12);
         v_enc.set_time_base((1, video_config.framerate as i32));
         v_enc.set_gop(12);
 
@@ -98,32 +98,39 @@ impl FfmpegBackend {
             v_stream_idx,
             a_stream_idx,
             frame_count: 0,
-            frame_size: (video_config.output_width * video_config.output_height * 4) as usize,
+            frame_size: (video_config.output_width * video_config.output_height * 3 / 2) as usize,
         }
     }
 
-    pub fn write_frame(&mut self, frame_data: &[u8]) {
+    pub fn write_frame(&mut self, nv12_data: &[u8]) {
         let width = self.v_enc.width();
         let height = self.v_enc.height();
-        let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
-        unsafe {
-            input_frame.alloc(pixel::Pixel::RGBA, width, height);
-        }
-
-        let stride = (self.v_enc.width() * 4) as usize;
-
-        unsafe {
-            let mut data = input_frame.data_mut(0);
-            data.copy_from_slice(frame_data); // assume no padding needed
-        }
 
         let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
         unsafe {
-            output_frame.alloc(Pixel::YUV420P, width, height);
+            output_frame.alloc(Pixel::NV12, width, height);
+            
+            // NV12 has 2 planes:
+            // plane 0: Y
+            // plane 1: UV
+            
+            let y_stride_out = output_frame.stride(0) as usize;
+            let y_stride_in = width as usize;
+            let y_out = std::slice::from_raw_parts_mut(output_frame.data_mut(0).as_mut_ptr(), y_stride_out * height as usize);
+            for row in 0..height as usize {
+                y_out[row * y_stride_out .. row * y_stride_out + y_stride_in]
+                    .copy_from_slice(&nv12_data[row * y_stride_in .. row * y_stride_in + y_stride_in]);
+            }
+            
+            let uv_stride_out = output_frame.stride(1) as usize;
+            let uv_stride_in = width as usize;
+            let uv_out = std::slice::from_raw_parts_mut(output_frame.data_mut(1).as_mut_ptr(), uv_stride_out * (height / 2) as usize);
+            let uv_in_offset = (width * height) as usize;
+            for row in 0..(height / 2) as usize {
+                uv_out[row * uv_stride_out .. row * uv_stride_out + uv_stride_in]
+                    .copy_from_slice(&nv12_data[uv_in_offset + row * uv_stride_in .. uv_in_offset + row * uv_stride_in + uv_stride_in]);
+            }
         }
-        do_scale(&input_frame, &mut output_frame);
-        // self.scaler.run(&input_frame, &mut output_frame).unwrap(); // TODO: need measure time here
-        let d = output_frame.data(0);
 
         output_frame.set_pts(Some(self.frame_count as i64));
         self.frame_count += 1;

@@ -18,7 +18,7 @@ pub trait Object3D: Sync + Send {
     fn color(&self, p: &Point3<GMFloat>) -> Color;
 
     /// Returns the GPU-compatible primitive data
-    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::wgpu::renderer::PrimitiveData3D;
+    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::vulkan::renderer::PrimitiveData3D;
 }
 
 
@@ -42,9 +42,9 @@ impl Object3D for Sphere3D {
     fn color(&self, _p: &Point3<GMFloat>) -> Color {
         self.color
     }
-    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::wgpu::renderer::PrimitiveData3D {
+    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::vulkan::renderer::PrimitiveData3D {
         let center = global_mat.transform_point(&self.center);
-        crate::wgpu::renderer::PrimitiveData3D {
+        crate::vulkan::renderer::PrimitiveData3D {
             color: [
                 self.color.r as f32 / 255.0,
                 self.color.g as f32 / 255.0,
@@ -115,10 +115,10 @@ impl Object3D for LineSegment3D {
     fn color(&self, _p: &Point3<GMFloat>) -> Color {
         self.color
     }
-    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::wgpu::renderer::PrimitiveData3D {
+    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::vulkan::renderer::PrimitiveData3D {
         let a = global_mat.transform_point(&self.a);
         let b = global_mat.transform_point(&self.b);
-        crate::wgpu::renderer::PrimitiveData3D {
+        crate::vulkan::renderer::PrimitiveData3D {
             color: [
                 self.color.r as f32 / 255.0,
                 self.color.g as f32 / 255.0,
@@ -216,10 +216,10 @@ impl Object3D for Arrow3D {
         self.color
     }
 
-    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::wgpu::renderer::PrimitiveData3D {
+    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::vulkan::renderer::PrimitiveData3D {
         let start = global_mat.transform_point(&self.start);
         let end = global_mat.transform_point(&self.end);
-        crate::wgpu::renderer::PrimitiveData3D {
+        crate::vulkan::renderer::PrimitiveData3D {
             color: [
                 self.color.r as f32 / 255.0,
                 self.color.g as f32 / 255.0,
@@ -288,12 +288,12 @@ impl Object3D for Box3DSdf {
         self.color
     }
     
-    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::wgpu::renderer::PrimitiveData3D {
+    fn as_primitive_data(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> crate::vulkan::renderer::PrimitiveData3D {
         let center = global_mat.transform_point(&self.center);
         let x_axis = global_mat.transform_vector(&self.x_axis);
         let y_axis = global_mat.transform_vector(&self.y_axis);
         let z_axis = global_mat.transform_vector(&self.z_axis);
-        crate::wgpu::renderer::PrimitiveData3D {
+        crate::vulkan::renderer::PrimitiveData3D {
             color: [
                 self.color.r as f32 / 255.0,
                 self.color.g as f32 / 255.0,
@@ -357,10 +357,11 @@ mod tests {
     use crate::animation::{Rotate, Timeline, Wait};
     use crate::camera::{Camera, PerspectiveSetting, Projection};
     use crate::video_backend::ffmpeg::FfmpegBackend;
-    use crate::video_backend::VideoBackend;
-    use crate::video_backend::{vaapi::FfmpegVaapiBackend, ColorOrder, VideoConfig};
-    use crate::{Context, Scene, SceneConfig};
-    use tiny_skia::Pixmap;
+    use crate::{
+        mobjects::SimpleLine,
+        video_backend::{vaapi::FfmpegVaapiBackend, ColorOrder, VideoConfig},
+        SceneConfig, Context, Scene,
+    };
 
     #[test]
     fn test_scene_3d() {
@@ -389,6 +390,7 @@ mod tests {
             head_radius: 0.3,
             head_length: 0.6,
             color: Color::new(255, 50, 50, 255), // Red
+            model_matrix: nalgebra::Matrix4::identity(),
         }));
 
         // Add 3D Line segment
@@ -397,6 +399,7 @@ mod tests {
             b: Point3::new(1.0, -2.0, 1.0),
             radius: 0.15,
             color: Color::new(50, 200, 50, 255), // Green
+            model_matrix: nalgebra::Matrix4::identity(),
         }));
 
         // Add 3D sphere
@@ -404,6 +407,7 @@ mod tests {
             center: Point3::new(0.0, 0.0, 0.0),
             radius: 0.5,
             color: Color::new(50, 100, 255, 255), // Blue
+            model_matrix: nalgebra::Matrix4::identity(),
         }));
 
         let mut timeline = Timeline::new(scene, ctx);
@@ -415,6 +419,7 @@ mod tests {
         timeline.render(|_ctx| {
             // Frame is rendered, WGPU ran!
         });
+    }
     #[test]
     fn test_arrow_perspective() {
         let width = 1920u32;
@@ -443,12 +448,96 @@ mod tests {
             head_radius: 0.05,
             head_length: 0.1,
             color: Color::new(255, 50, 50, 255),
+            model_matrix: nalgebra::Matrix4::identity(),
         }));
 
         let mut timeline = Timeline::new(scene, ctx);
         // Only render 1 frame to test perspective
         timeline.render(|_ctx| {});
     }
+
+    #[test]
+    fn bench_scene_3d_encode() {
+        let width = 1920u32;
+        let height = 1080u32;
+
+        let ctx = Context {
+            scene_config: SceneConfig {
+                width: 16.0,
+                height: 9.0,
+                output_width: width,
+                output_height: height,
+                scale_factor: height as GMFloat / 16.0,
+            },
+        };
+
+        let mut scene = Scene::default();
+        scene.camera.position = Point3::new(0.0, 0.0, 2.0);
+        scene.camera.set_look_at(Vector3::new(0.0, 0.0, -1.0));
+
+        // Generate 500 spheres for heavy load using Rasterization!
+        for i in 0..500 {
+            let x = (i as f32 % 10.0) - 5.0 + 0.5;
+            let y = ((i / 10) as f32 % 10.0) - 5.0 + 0.5;
+            let z = ((i / 100) as f32 % 10.0) - 5.0;
+            scene.add(Box::new(crate::mobjects::mesh_3d::TriangleMesh3D::uv_sphere(
+                Point3::new(x as GMFloat, y as GMFloat, z as GMFloat),
+                0.4,
+                24, // segments
+                24, // rings
+                Color::new(200, 100, 50, 255),
+            )));
+        }
+
+        struct RotateCamera { frames: u32 }
+        impl crate::animation::Animation for RotateCamera {
+            fn update(&mut self, alpha: GMFloat, scene: &mut Scene) {
+                let angle = alpha as f32 * std::f32::consts::PI * 2.0;
+                let center_z = -3.0;
+                let radius = 5.0;
+                let cam_x = angle.sin() * radius;
+                let cam_z = center_z + angle.cos() * radius;
+                scene.camera.position = nalgebra::Point3::new(cam_x as GMFloat, 0.0, cam_z as GMFloat);
+                scene.camera.set_look_at(nalgebra::Vector3::new(-cam_x as GMFloat, 0.0, (center_z - cam_z) as GMFloat));
+            }
+            fn total_frames(&self) -> u32 { self.frames }
+        }
+
+        let mut timeline = Timeline::new(scene, ctx);
+        timeline.play(RotateCamera { frames: 300 });
+
+        let video_config = VideoConfig {
+            filename: "bench_core_nv12.mp4".to_owned(),
+            framerate: 60,
+            output_width: width,
+            output_height: height,
+            color_order: ColorOrder::Nv12,
+        };
+
+        let mut video_backend = VideoBackend {
+            backend_type: crate::video_backend::VideoBackendType::FfmpegPipe(
+                crate::video_backend::FfmpegPipeBackend::new(
+                    &video_config,
+                    crate::video_backend::FfmpegPipeEncoder::Libx264,
+                    false,
+                )
+            )
+        };
+
+        let start = std::time::Instant::now();
+        while timeline.step_frame() {
+            let mut buf = video_backend.acquire_buffer();
+            if let Some(nv12) = timeline.nv12_image_bytes() {
+                buf.as_mut_slice().copy_from_slice(nv12);
+            } else {
+                println!("Frame NV12 bytes is None!");
+                buf.as_mut_slice().fill(0);
+            }
+            video_backend.submit_frame(buf);
+        }
+        video_backend.close().unwrap();
+        
+        println!("Rust Core 3D Encode time for 180 frames: {:?}", start.elapsed());
+    }
 }
 
-}

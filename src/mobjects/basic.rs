@@ -90,6 +90,7 @@ impl Draw for Rectangle {
 
 impl Mobject for Rectangle {}
 
+#[derive(Default)]
 pub struct SimpleLine {
     pub p0: Point3<GMFloat>,
     pub p1: Point3<GMFloat>,
@@ -150,6 +151,7 @@ impl Draw for SimpleLine {
 
 impl Mobject for SimpleLine {}
 
+#[derive(Default)]
 pub struct PolyLine {
     pub points: Vec<Point3<GMFloat>>,
     pub draw_config: DrawConfig,

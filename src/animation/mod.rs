@@ -194,11 +194,12 @@ pub struct Timeline {
     pub scene: Scene,
     pub ctx: Context,
     actions: VecDeque<TimelineAction>,
-    wgpu_renderer: Option<crate::wgpu::renderer::WgpuRenderer>,
+    vulkan_renderer: Option<crate::vulkan::renderer::VulkanRenderer>,
     current_anim: Option<Box<dyn Animation>>,
     current_anim_frame: u32,
     pub total_cached_frames: u32,
     pub current_frame_global: u32,
+    pub cached_nv12_data: Option<Vec<u8>>,
 }
 
 impl Timeline {
@@ -207,11 +208,12 @@ impl Timeline {
             scene,
             ctx,
             actions: VecDeque::new(),
-            wgpu_renderer: None,
+            vulkan_renderer: None,
             current_anim: None,
             current_anim_frame: 0,
             total_cached_frames: 0,
             current_frame_global: 0,
+            cached_nv12_data: None,
         }
     }
 
@@ -320,85 +322,24 @@ impl Timeline {
     }
 
     pub fn render_current_state(&mut self) {
-        let output_w = self.ctx.scene_config.output_width as f32;
-        let output_h = self.ctx.scene_config.output_height as f32;
-
-        if self.wgpu_renderer.is_none() {
-            if let Some(wgpu_ctx) = pollster::block_on(crate::wgpu::context::WgpuContext::new()) {
-                self.wgpu_renderer = Some(crate::wgpu::renderer::WgpuRenderer::new(
-                    std::sync::Arc::new(wgpu_ctx),
+        if self.vulkan_renderer.is_none() {
+            if let Some(vk_ctx) = pollster::block_on(crate::vulkan::context::VulkanContext::new()) {
+                self.vulkan_renderer = Some(crate::vulkan::renderer::VulkanRenderer::new(
+                    std::sync::Arc::new(vk_ctx),
                 ));
             }
         }
 
-        if let Some(renderer) = &mut self.wgpu_renderer {
-            renderer.render_scene(&self.scene, &self.ctx.scene_config, Some(self.ctx.pixmap.data_mut()));
+        if let Some(renderer) = &mut self.vulkan_renderer {
+            renderer.render_scene(&self.scene, &self.ctx.scene_config, None);
+        }
+    }
+
+    pub fn nv12_image_bytes(&self) -> Option<&[u8]> {
+        if let Some(renderer) = &self.vulkan_renderer {
+            renderer.get_nv12_bytes()
         } else {
-            self.ctx.clear_transparent();
-        }
-
-        for m in &self.scene.mobjects {
-            if m.borrow().as_3d().is_none() {
-                m.borrow().draw(&mut self.ctx, nalgebra::Matrix4::identity());
-            }
-        }
-
-        let (has_clip, clip_x, clip_y, clip_w, clip_h) = match self.scene.clip_rect {
-            Some(crate::ClipRect::Pixel(x, y, w, h)) => {
-                (true, x as f32, y as f32, w as f32, h as f32)
-            },
-            Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
-                let (o_left, o_right, o_bottom, o_top) = self.scene.camera.ortho_params();
-                let log_w = o_right - o_left;
-                let log_h = o_top - o_bottom;
-                
-                let tl_x = cx - w / 2.0;
-                let tl_y = cy + h / 2.0;
-                
-                let norm_x = (tl_x - o_left) / log_w;
-                let norm_y = (o_top - tl_y) / log_h;
-                let norm_w = w / log_w;
-                let norm_h = h / log_h;
-                
-                (true, norm_x * output_w, norm_y * output_h, norm_w * output_w, norm_h * output_h)
-            },
-            None => (false, 0.0, 0.0, 0.0, 0.0),
-        };
-
-        if has_clip {
-            let mut paint = tiny_skia::Paint::default();
-            paint.blend_mode = tiny_skia::BlendMode::Clear;
-            let width = self.ctx.scene_config.output_width as f32;
-            let height = self.ctx.scene_config.output_height as f32;
-            let cx = clip_x;
-            let cy = clip_y;
-            let cw = clip_w;
-            let ch = clip_h;
-            
-            // Top
-            if cy > 0.0 {
-                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, 0.0, width, cy) {
-                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                }
-            }
-            // Bottom
-            if cy + ch < height {
-                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy + ch, width, height - (cy + ch)) {
-                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                }
-            }
-            // Left
-            if cx > 0.0 {
-                if let Some(r) = tiny_skia::Rect::from_xywh(0.0, cy, cx, ch) {
-                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                }
-            }
-            // Right
-            if cx + cw < width {
-                if let Some(r) = tiny_skia::Rect::from_xywh(cx + cw, cy, width - (cx + cw), ch) {
-                    self.ctx.pixmap.fill_rect(r, &paint, tiny_skia::Transform::identity(), None);
-                }
-            }
+            None
         }
     }
 }
@@ -415,7 +356,6 @@ mod tests {
         video_backend::{vaapi::FfmpegVaapiBackend, ColorOrder, VideoConfig},
         SceneConfig,
     };
-    use tiny_skia::Pixmap;
 
     #[test]
     fn test_timeline_rotate_vaapi() {
@@ -437,7 +377,7 @@ mod tests {
         let line_ref: Rc<RefCell<Box<dyn Mobject>>> = Rc::new(RefCell::new(Box::new(SimpleLine {
             p0: Point3::new(0.0, 0.0, 0.0),
             p1: Point3::new(1.0, 1.0, 0.0),
-            draw_config: Default::default(),
+            draw_config: Default::default(), model_matrix: nalgebra::Matrix4::identity(),
         })));
         scene.add_ref(line_ref.clone());
 
@@ -446,7 +386,7 @@ mod tests {
             let new_line: Box<dyn Mobject> = Box::new(SimpleLine {
                 p0: Point3::new(i as GMFloat, 0.0, 0.0),
                 p1: Point3::new(i as GMFloat + 1.0, 1.0, 0.0),
-                draw_config: Default::default(),
+                draw_config: Default::default(), model_matrix: nalgebra::Matrix4::identity(),
             });
             scene.add(new_line);
         }
