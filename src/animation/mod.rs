@@ -262,6 +262,14 @@ impl Timeline {
         has_more
     }
 
+    pub fn step_frame_for_vulkan_video(&mut self) -> bool {
+        let has_more = self.advance_frame();
+        if has_more {
+            self.render_current_state_for_vulkan_video();
+        }
+        has_more
+    }
+
     /// Advance the timeline state by one frame without rendering.
     pub fn advance_frame(&mut self) -> bool {
         let initial_frame = self.current_frame_global;
@@ -338,9 +346,38 @@ impl Timeline {
         }
     }
 
+    pub fn render_current_state_for_vulkan_video(&mut self) {
+        if self.vulkan_renderer.is_none() {
+            if let Some(vk_ctx) = pollster::block_on(crate::vulkan::context::VulkanContext::new()) {
+                self.vulkan_renderer = Some(crate::vulkan::renderer::VulkanRenderer::new(
+                    std::sync::Arc::new(vk_ctx),
+                ));
+            }
+        }
+
+        if let Some(renderer) = &mut self.vulkan_renderer {
+            renderer.render_scene_with_outputs(
+                &self.scene,
+                &self.ctx.scene_config,
+                None,
+                crate::vulkan::renderer::RenderOutputs::VULKAN_VIDEO_ONLY,
+            );
+        }
+    }
+
     pub fn nv12_image_bytes(&self) -> Option<&[u8]> {
         if let Some(renderer) = &self.vulkan_renderer {
             renderer.get_nv12_bytes()
+        } else {
+            None
+        }
+    }
+
+    pub fn vulkan_video_frame(
+        &self,
+    ) -> Option<crate::video_backend::vulkan_h264::VulkanVideoFrame> {
+        if let Some(renderer) = &self.vulkan_renderer {
+            renderer.get_vulkan_video_frame()
         } else {
             None
         }

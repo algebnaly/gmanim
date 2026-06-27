@@ -9,12 +9,14 @@ use crate::video_backend::ffmpeg::FfmpegBackend;
 use crate::video_backend::vaapi::FfmpegVaapiBackend;
 pub mod ffmpeg;
 pub mod vaapi;
+pub mod vulkan_h264;
 
 const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
     FfmpegPipe(FfmpegPipeBackend),
     Ffmpeg(FfmpegBackend),
     Vaapi(FfmpegVaapiBackend),
+    VulkanH264(vulkan_h264::VulkanH264Backend),
     BgraRAW(BgraRAWBackend),
     Gstreamer,
 }
@@ -102,6 +104,9 @@ pub struct BgraRAWBackend {
 impl VideoBackend {
     pub fn acquire_buffer(&mut self) -> FrameBuffer {
         match &mut self.backend_type {
+            VideoBackendType::VulkanH264(_) => {
+                panic!("Vulkan H.264 backend requires GPU frame submission, not CPU buffers")
+            }
             VideoBackendType::Vaapi(f) => f.acquire_buffer(),
             VideoBackendType::FfmpegPipe(f) => FrameBuffer {
                 data: vec![0u8; f.frame_size],
@@ -118,6 +123,9 @@ impl VideoBackend {
 
     pub fn submit_frame(&mut self, buf: FrameBuffer) {
         match &mut self.backend_type {
+            VideoBackendType::VulkanH264(_) => {
+                panic!("Vulkan H.264 backend requires GPU frame submission, not CPU buffers")
+            }
             VideoBackendType::Vaapi(f) => f.submit_frame(buf),
             VideoBackendType::FfmpegPipe(f) => {
                 use std::io::Write;
@@ -139,6 +147,7 @@ impl VideoBackend {
             VideoBackendType::FfmpegPipe(f) => f.close(),
             VideoBackendType::Ffmpeg(f) => f.finish(),
             VideoBackendType::Vaapi(f) => f.finish(),
+            VideoBackendType::VulkanH264(f) => f.finish(),
             _ => Ok(()),
         }
     }
@@ -314,7 +323,7 @@ mod tests {
             color_order: ColorOrder::Rgba,
         };
 
-        let mut backend = FfmpegVaapiBackend::new(&config);
+        let mut backend = FfmpegVaapiBackend::try_new(&config, 3).unwrap();
 
         // Test zero-copy path: acquire → fill → submit
         let mut buf = backend.acquire_buffer();

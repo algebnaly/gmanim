@@ -1,8 +1,17 @@
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D};
 use crate::mobjects::mesh_3d::{TriangleMesh3D, Vertex};
+use crate::video_backend::vulkan_h264::VulkanVideoFrame;
 use crate::vulkan::context::VulkanContext;
 use ash::vk;
 use std::sync::Arc;
+
+// The encoder keeps 8 frames in flight; one extra image prevents the renderer
+// from overwriting an image before submit-side backpressure can release a slot.
+const VIDEO_NV12_IMAGE_COUNT: usize = 9;
+const VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW: i32 = 1_000_156_003;
+const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW: u32 = 0x0000_4000;
+const VK_IMAGE_ASPECT_PLANE_0_BIT_RAW: u32 = 0x0000_0010;
+const VK_IMAGE_ASPECT_PLANE_1_BIT_RAW: u32 = 0x0000_0020;
 
 fn compile_wgsl_full(ctx: &VulkanContext, source: &str) -> vk::ShaderModule {
     let module = naga::front::wgsl::parse_str(source).unwrap();
@@ -191,6 +200,145 @@ impl Image {
     }
 }
 
+pub struct VideoNv12Image {
+    pub vk_image: vk::Image,
+    pub allocation: Option<gpu_allocator::vulkan::Allocation>,
+    pub color_view: vk::ImageView,
+    pub y_view: vk::ImageView,
+    pub uv_view: vk::ImageView,
+    pub format: vk::Format,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl VideoNv12Image {
+    pub fn new(ctx: &VulkanContext, width: u32, height: u32) -> Self {
+        let format = vk::Format::from_raw(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW);
+        let usage = vk::ImageUsageFlags::STORAGE
+            | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW);
+        let mut queue_family_indices = Vec::new();
+        queue_family_indices.push(ctx.queue_family_index);
+        if let Some(video_queue_family_index) = ctx.video_encode_queue_family_index {
+            if video_queue_family_index != ctx.queue_family_index {
+                queue_family_indices.push(video_queue_family_index);
+            }
+        }
+        let sharing_mode = if queue_family_indices.len() > 1 {
+            vk::SharingMode::CONCURRENT
+        } else {
+            vk::SharingMode::EXCLUSIVE
+        };
+        let image_info = vk::ImageCreateInfo {
+            s_type: vk::StructureType::IMAGE_CREATE_INFO,
+            flags: vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
+            image_type: vk::ImageType::TYPE_2D,
+            format,
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage,
+            sharing_mode,
+            queue_family_index_count: queue_family_indices.len() as u32,
+            p_queue_family_indices: queue_family_indices.as_ptr(),
+            initial_layout: vk::ImageLayout::UNDEFINED,
+            ..Default::default()
+        };
+
+        let vk_image = unsafe { ctx.device.create_image(&image_info, None).unwrap() };
+        let requirements = unsafe { ctx.device.get_image_memory_requirements(vk_image) };
+        let allocation = ctx
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "video-nv12-image",
+                requirements,
+                location: gpu_allocator::MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
+            })
+            .unwrap();
+
+        unsafe {
+            ctx.device
+                .bind_image_memory(vk_image, allocation.memory(), allocation.offset())
+                .unwrap();
+        }
+
+        let color_view =
+            Self::create_view(ctx, vk_image, format, vk::ImageAspectFlags::COLOR, usage);
+        let y_view = Self::create_view(
+            ctx,
+            vk_image,
+            vk::Format::R8_UNORM,
+            vk::ImageAspectFlags::from_raw(VK_IMAGE_ASPECT_PLANE_0_BIT_RAW),
+            vk::ImageUsageFlags::STORAGE,
+        );
+        let uv_view = Self::create_view(
+            ctx,
+            vk_image,
+            vk::Format::R8G8_UNORM,
+            vk::ImageAspectFlags::from_raw(VK_IMAGE_ASPECT_PLANE_1_BIT_RAW),
+            vk::ImageUsageFlags::STORAGE,
+        );
+
+        Self {
+            vk_image,
+            allocation: Some(allocation),
+            color_view,
+            y_view,
+            uv_view,
+            format,
+            width,
+            height,
+        }
+    }
+
+    fn create_view(
+        ctx: &VulkanContext,
+        image: vk::Image,
+        format: vk::Format,
+        aspect_mask: vk::ImageAspectFlags,
+        usage: vk::ImageUsageFlags,
+    ) -> vk::ImageView {
+        let mut usage_info = vk::ImageViewUsageCreateInfo::default().usage(usage);
+        let view_info = vk::ImageViewCreateInfo {
+            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
+            p_next: (&mut usage_info as *mut vk::ImageViewUsageCreateInfo).cast(),
+            image,
+            view_type: vk::ImageViewType::TYPE_2D,
+            format,
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            ..Default::default()
+        };
+        unsafe { ctx.device.create_image_view(&view_info, None).unwrap() }
+    }
+
+    pub fn destroy(&mut self, ctx: &VulkanContext) {
+        unsafe {
+            ctx.device.destroy_image_view(self.uv_view, None);
+            ctx.device.destroy_image_view(self.y_view, None);
+            ctx.device.destroy_image_view(self.color_view, None);
+            ctx.device.destroy_image(self.vk_image, None);
+        }
+        if let Some(allocation) = self.allocation.take() {
+            ctx.allocator.lock().unwrap().free(allocation).unwrap();
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Nv12Constants {
@@ -256,6 +404,9 @@ pub struct RenderCache {
     pub output_buffers: [Buffer; 3],
     pub nv12_output_buffers: [Buffer; 3],
     pub nv12_descriptor_sets: [vk::DescriptorSet; 3],
+    pub video_nv12_images: Vec<VideoNv12Image>,
+    pub video_nv12_descriptor_sets: Vec<vk::DescriptorSet>,
+    pub video_nv12_layouts: Vec<vk::ImageLayout>,
     pub current_frame: usize,
     pub compute_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set: vk::DescriptorSet,
@@ -282,6 +433,9 @@ impl RenderCache {
         for buf in &mut self.nv12_output_buffers {
             buf.destroy(ctx);
         }
+        for image in &mut self.video_nv12_images {
+            image.destroy(ctx);
+        }
     }
 }
 
@@ -289,6 +443,27 @@ pub struct FrameData {
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
     pub fence: vk::Fence,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct RenderOutputs {
+    pub cpu_nv12: bool,
+    pub vulkan_video: bool,
+    pub cpu_rgba: bool,
+}
+
+impl RenderOutputs {
+    pub const ALL: Self = Self {
+        cpu_nv12: true,
+        vulkan_video: true,
+        cpu_rgba: true,
+    };
+
+    pub const VULKAN_VIDEO_ONLY: Self = Self {
+        cpu_nv12: false,
+        vulkan_video: true,
+        cpu_rgba: false,
+    };
 }
 
 pub struct VulkanRenderer {
@@ -300,6 +475,7 @@ pub struct VulkanRenderer {
     raster_descriptor_set_layout_2d: vk::DescriptorSetLayout,
     composite_descriptor_set_layout: vk::DescriptorSetLayout,
     nv12_descriptor_set_layout: vk::DescriptorSetLayout,
+    video_nv12_descriptor_set_layout: vk::DescriptorSetLayout,
 
     compute_pipeline_layout: vk::PipelineLayout,
     compute_pipeline: vk::Pipeline,
@@ -307,6 +483,8 @@ pub struct VulkanRenderer {
     composite_pipeline: vk::Pipeline,
     nv12_pipeline_layout: vk::PipelineLayout,
     nv12_pipeline: vk::Pipeline,
+    video_nv12_pipeline_layout: vk::PipelineLayout,
+    video_nv12_pipeline: vk::Pipeline,
 
     render_pass: vk::RenderPass,
     raster_pipeline_layout: vk::PipelineLayout,
@@ -335,6 +513,7 @@ impl VulkanRenderer {
         let raster_shader = compile_wgsl_full(&ctx, include_str!("raster_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
         let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
+        let video_nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12_image.wgsl"));
         let composite_shader = compile_wgsl_full(&ctx, include_str!("composite_shader.wgsl"));
 
         let composite_bindings = [
@@ -400,6 +579,41 @@ impl VulkanRenderer {
                 .unwrap()
         };
 
+        let video_nv12_bindings = [
+            vk::DescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 2,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+        ];
+        let video_nv12_layout_info = vk::DescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            binding_count: video_nv12_bindings.len() as u32,
+            p_bindings: video_nv12_bindings.as_ptr(),
+            ..Default::default()
+        };
+        let video_nv12_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&video_nv12_layout_info, None)
+                .unwrap()
+        };
+
         let nv12_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
             set_layout_count: 1,
@@ -431,6 +645,40 @@ impl VulkanRenderer {
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&nv12_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+
+        let video_nv12_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+            set_layout_count: 1,
+            p_set_layouts: &video_nv12_descriptor_set_layout,
+            ..Default::default()
+        };
+        let video_nv12_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&video_nv12_pipeline_layout_info, None)
+                .unwrap()
+        };
+        let video_nv12_stage = vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: vk::ShaderStageFlags::COMPUTE,
+            module: video_nv12_shader,
+            p_name: main_name.as_ptr(),
+            ..Default::default()
+        };
+        let video_nv12_pipeline_info = vk::ComputePipelineCreateInfo {
+            s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+            stage: video_nv12_stage,
+            layout: video_nv12_pipeline_layout,
+            ..Default::default()
+        };
+        let video_nv12_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&video_nv12_pipeline_info),
                     None,
                 )
                 .unwrap()[0]
@@ -926,22 +1174,22 @@ impl VulkanRenderer {
         let descriptor_pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 30,
+                descriptor_count: 80,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
-                descriptor_count: 30,
+                descriptor_count: 40,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
-                descriptor_count: 30,
+                descriptor_count: 40,
             },
         ];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
             pool_size_count: descriptor_pool_sizes.len() as u32,
             p_pool_sizes: descriptor_pool_sizes.as_ptr(),
-            max_sets: 10,
+            max_sets: 32,
             flags: vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET,
             ..Default::default()
         };
@@ -1041,6 +1289,7 @@ impl VulkanRenderer {
             ctx.device.destroy_shader_module(raster_shader, None);
             ctx.device.destroy_shader_module(raster_shader_2d, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
+            ctx.device.destroy_shader_module(video_nv12_shader, None);
             ctx.device.destroy_shader_module(composite_shader, None);
         }
 
@@ -1052,12 +1301,15 @@ impl VulkanRenderer {
             raster_descriptor_set_layout_2d,
             composite_descriptor_set_layout,
             nv12_descriptor_set_layout,
+            video_nv12_descriptor_set_layout,
             compute_pipeline_layout,
             compute_pipeline,
             composite_pipeline_layout,
             composite_pipeline,
             nv12_pipeline_layout,
             nv12_pipeline,
+            video_nv12_pipeline_layout,
+            video_nv12_pipeline,
             render_pass,
             raster_pipeline_layout,
             raster_pipeline,
@@ -1082,6 +1334,17 @@ impl VulkanRenderer {
         scene_config: &crate::SceneConfig,
         output: Option<&mut [u8]>,
     ) {
+        self.render_scene_with_outputs(scene, scene_config, output, RenderOutputs::ALL);
+    }
+
+    pub fn render_scene_with_outputs(
+        &mut self,
+        scene: &crate::Scene,
+        scene_config: &crate::SceneConfig,
+        output: Option<&mut [u8]>,
+        mut outputs: RenderOutputs,
+    ) {
+        outputs.cpu_rgba |= output.is_some();
         let output_w = scene_config.output_width as f32;
         let output_h = scene_config.output_height as f32;
 
@@ -1268,6 +1531,7 @@ impl VulkanRenderer {
             &mesh_vertices_2d,
             &mesh_indices_2d,
             output,
+            outputs,
         );
     }
 
@@ -1283,6 +1547,7 @@ impl VulkanRenderer {
         mesh_vertices_2d: &[Vertex2D],
         mesh_indices_2d: &[u32],
         output: Option<&mut [u8]>,
+        outputs: RenderOutputs,
     ) {
         self.camera_buffer
             .write_bytes(0, bytemuck::bytes_of(camera_uniform));
@@ -1506,6 +1771,26 @@ impl VulkanRenderer {
             let nv12_descriptor_sets: [vk::DescriptorSet; 3] =
                 nv12_descriptor_sets_vec.try_into().unwrap();
 
+            let video_nv12_images = (0..VIDEO_NV12_IMAGE_COUNT)
+                .map(|_| VideoNv12Image::new(&self.ctx, width, height))
+                .collect::<Vec<_>>();
+            let video_nv12_layouts = vec![vk::ImageLayout::UNDEFINED; VIDEO_NV12_IMAGE_COUNT];
+            let video_nv12_set_layouts =
+                vec![self.video_nv12_descriptor_set_layout; VIDEO_NV12_IMAGE_COUNT];
+            let video_nv12_alloc_info = vk::DescriptorSetAllocateInfo {
+                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptor_pool: self.descriptor_pool,
+                descriptor_set_count: VIDEO_NV12_IMAGE_COUNT as u32,
+                p_set_layouts: video_nv12_set_layouts.as_ptr(),
+                ..Default::default()
+            };
+            let video_nv12_descriptor_sets = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&video_nv12_alloc_info)
+                    .unwrap()
+            };
+
             let image_info = vk::DescriptorImageInfo {
                 image_view: texture.view,
                 image_layout: vk::ImageLayout::GENERAL,
@@ -1649,6 +1934,56 @@ impl VulkanRenderer {
                 });
             }
 
+            let mut video_nv12_input_infos = Vec::new();
+            let mut video_nv12_y_infos = Vec::new();
+            let mut video_nv12_uv_infos = Vec::new();
+            for image in &video_nv12_images {
+                video_nv12_input_infos.push(vk::DescriptorImageInfo {
+                    image_view: texture.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                });
+                video_nv12_y_infos.push(vk::DescriptorImageInfo {
+                    image_view: image.y_view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                });
+                video_nv12_uv_infos.push(vk::DescriptorImageInfo {
+                    image_view: image.uv_view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                });
+            }
+            for i in 0..VIDEO_NV12_IMAGE_COUNT {
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_binding: 0,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &video_nv12_input_infos[i],
+                    ..Default::default()
+                });
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &video_nv12_y_infos[i],
+                    ..Default::default()
+                });
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_binding: 2,
+                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &video_nv12_uv_infos[i],
+                    ..Default::default()
+                });
+            }
+
             unsafe {
                 self.ctx
                     .device
@@ -1688,6 +2023,9 @@ impl VulkanRenderer {
                 output_buffers,
                 nv12_output_buffers,
                 nv12_descriptor_sets,
+                video_nv12_images,
+                video_nv12_descriptor_sets,
+                video_nv12_layouts,
                 current_frame: 0,
                 compute_descriptor_set,
                 raster_descriptor_set,
@@ -1701,6 +2039,7 @@ impl VulkanRenderer {
 
         let mut cache = cache_guard.as_mut().unwrap();
         let frame_idx = cache.current_frame % 3;
+        let video_frame_idx = cache.current_frame % cache.video_nv12_images.len();
         let fd = &self.frame_data[frame_idx];
 
         unsafe {
@@ -1967,8 +2306,7 @@ impl VulkanRenderer {
                 .device
                 .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
 
-            // Compute pass for NV12 conversion
-            let image_barrier = vk::ImageMemoryBarrier {
+            let postprocess_barrier = vk::ImageMemoryBarrier {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
                 old_layout: vk::ImageLayout::GENERAL,
                 new_layout: vk::ImageLayout::GENERAL,
@@ -1994,84 +2332,138 @@ impl VulkanRenderer {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                std::slice::from_ref(&image_barrier),
+                std::slice::from_ref(&postprocess_barrier),
             );
 
-            self.ctx.device.cmd_bind_pipeline(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.nv12_pipeline,
-            );
-            self.ctx.device.cmd_bind_descriptor_sets(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.nv12_pipeline_layout,
-                0,
-                std::slice::from_ref(&cache.nv12_descriptor_sets[frame_idx]),
-                &[],
-            );
-            let workgroup_x = (width / 4 + 15) / 16;
-            let workgroup_y = (height / 2 + 15) / 16;
-            self.ctx
-                .device
-                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+            if outputs.cpu_nv12 {
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.nv12_pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.nv12_pipeline_layout,
+                    0,
+                    std::slice::from_ref(&cache.nv12_descriptor_sets[frame_idx]),
+                    &[],
+                );
+                let workgroup_x = (width / 4 + 15) / 16;
+                let workgroup_y = (height / 2 + 15) / 16;
+                self.ctx
+                    .device
+                    .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+            }
 
-            let image_barrier2 = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: cache.texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::SHADER_READ,
-                dst_access_mask: vk::AccessFlags::TRANSFER_READ,
-                ..Default::default()
-            };
+            if outputs.vulkan_video {
+                let video_nv12_image = &cache.video_nv12_images[video_frame_idx];
+                let video_nv12_barrier = vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    old_layout: cache.video_nv12_layouts[video_frame_idx],
+                    new_layout: vk::ImageLayout::GENERAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image: video_nv12_image.vk_image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_access_mask: vk::AccessFlags::empty(),
+                    dst_access_mask: vk::AccessFlags::SHADER_WRITE,
+                    ..Default::default()
+                };
+                self.ctx.device.cmd_pipeline_barrier(
+                    fd.command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&video_nv12_barrier),
+                );
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.video_nv12_pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.video_nv12_pipeline_layout,
+                    0,
+                    std::slice::from_ref(&cache.video_nv12_descriptor_sets[video_frame_idx]),
+                    &[],
+                );
+                let workgroup_x = (width + 15) / 16;
+                let workgroup_y = (height + 15) / 16;
+                self.ctx
+                    .device
+                    .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+                cache.video_nv12_layouts[video_frame_idx] = vk::ImageLayout::GENERAL;
+            }
 
-            self.ctx.device.cmd_pipeline_barrier(
-                fd.command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&image_barrier2),
-            );
+            if outputs.cpu_rgba {
+                let image_barrier2 = vk::ImageMemoryBarrier {
+                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
+                    old_layout: vk::ImageLayout::GENERAL,
+                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    image: cache.texture.vk_image,
+                    subresource_range: vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    src_access_mask: vk::AccessFlags::SHADER_READ,
+                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
+                    ..Default::default()
+                };
 
-            let buffer_row_length = cache.padded_bytes_per_row / 4;
-            let copy_region = vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length,
-                buffer_image_height: height,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                },
-                ..Default::default()
-            };
+                self.ctx.device.cmd_pipeline_barrier(
+                    fd.command_buffer,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    std::slice::from_ref(&image_barrier2),
+                );
 
-            self.ctx.device.cmd_copy_image_to_buffer(
-                fd.command_buffer,
-                cache.texture.vk_image,
-                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                cache.output_buffers[frame_idx].vk_buffer,
-                std::slice::from_ref(&copy_region),
-            );
+                let buffer_row_length = cache.padded_bytes_per_row / 4;
+                let copy_region = vk::BufferImageCopy {
+                    buffer_offset: 0,
+                    buffer_row_length,
+                    buffer_image_height: height,
+                    image_subresource: vk::ImageSubresourceLayers {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        mip_level: 0,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    },
+                    image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+                    image_extent: vk::Extent3D {
+                        width,
+                        height,
+                        depth: 1,
+                    },
+                    ..Default::default()
+                };
+
+                self.ctx.device.cmd_copy_image_to_buffer(
+                    fd.command_buffer,
+                    cache.texture.vk_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    cache.output_buffers[frame_idx].vk_buffer,
+                    std::slice::from_ref(&copy_region),
+                );
+            }
 
             self.ctx
                 .device
@@ -2147,6 +2539,36 @@ impl VulkanRenderer {
                     });
                 }
             }
+        }
+        None
+    }
+
+    pub fn get_vulkan_video_frame(&self) -> Option<VulkanVideoFrame> {
+        let guard = self.cache.lock().unwrap();
+        if let Some(cache) = guard.as_ref() {
+            if cache.current_frame == 0 || cache.video_nv12_images.is_empty() {
+                return None;
+            }
+            let read_frame_idx = (cache.current_frame - 1) % 3;
+            let video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_images.len();
+            let read_fd = &self.frame_data[read_frame_idx];
+
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
+                    .unwrap();
+            }
+
+            let image = &cache.video_nv12_images[video_frame_idx];
+            return Some(VulkanVideoFrame {
+                image: image.vk_image,
+                image_view: image.color_view,
+                image_layout: cache.video_nv12_layouts[video_frame_idx],
+                format: image.format,
+                width: image.width,
+                height: image.height,
+            });
         }
         None
     }

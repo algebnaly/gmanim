@@ -506,12 +506,13 @@ impl FfmpegVaapiBackend {
     pub fn try_new(config: &VideoConfig, queue_depth: usize) -> io::Result<Self> {
         let config_clone = config.clone();
         let frame_size = config.output_width as usize * config.output_height as usize * 4;
+        let encoder = Encoder::try_new(&config_clone, "/dev/dri/renderD128")?;
 
         let (sender, receiver) = sync_channel(queue_depth);
         let (recycle_tx, recycle_rx) = sync_channel(queue_depth + 1);
 
         let worker = thread::spawn(move || {
-            let mut encoder = Encoder::new(&config_clone);
+            let mut encoder = encoder;
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WorkerMessage::Frame(buf) => {
