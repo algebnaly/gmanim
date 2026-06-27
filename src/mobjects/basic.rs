@@ -12,38 +12,28 @@ use lyon::tessellation::{
 };
 
 pub struct Rectangle {
+    pub base: crate::mobjects::MobjectBase,
     pub p0: Point3<GMFloat>, // Top left
     pub p1: Point3<GMFloat>, // Bottom left
     pub p2: Point3<GMFloat>, // Bottom right
     pub p3: Point3<GMFloat>, // Top right
     pub color: Color,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
 impl Default for Rectangle {
     fn default() -> Self {
         Rectangle {
+            base: crate::mobjects::MobjectBase::new("Rectangle"),
             p0: Point3::new(0.0, 0.0, 0.0),
             p1: Point3::new(1.0, 0.0, 0.0),
             p2: Point3::new(1.0, 1.0, 0.0),
             p3: Point3::new(0.0, 1.0, 0.0),
             color: Color::default(),
             draw_config: DrawConfig::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         }
-    }
-}
-
-impl Transform for Rectangle {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-        self.mesh.model_matrix = mat;
     }
 }
 
@@ -89,7 +79,7 @@ impl Rectangle {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 }
 
@@ -100,40 +90,46 @@ impl Draw for Rectangle {
 }
 
 impl Mobject for Rectangle {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
 #[derive(Default)]
 pub struct SimpleLine {
+    pub base: crate::mobjects::MobjectBase,
     pub p0: Point3<GMFloat>,
     pub p1: Point3<GMFloat>,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
 impl SimpleLine {
     pub fn new(p0: Point3<GMFloat>, p1: Point3<GMFloat>) -> Self {
         let mut sl = Self {
+            base: crate::mobjects::MobjectBase::new("SimpleLine"),
             p0,
             p1,
             draw_config: DrawConfig::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         };
         sl.update_mesh();
         sl
-    }
-}
-
-impl Transform for SimpleLine {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
     }
 }
 
@@ -167,7 +163,7 @@ impl SimpleLine {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 }
 
@@ -176,25 +172,40 @@ impl Draw for SimpleLine {
 }
 
 impl Mobject for SimpleLine {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
 #[derive(Default)]
 pub struct PolyLine {
+    pub base: crate::mobjects::MobjectBase,
     pub points: Vec<Point3<GMFloat>>,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
 impl PolyLine {
     pub fn new(points: Vec<Point3<GMFloat>>) -> Self {
         let mut pl = Self {
+            base: crate::mobjects::MobjectBase::new("PolyLine"),
             points,
             draw_config: DrawConfig::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         };
         pl.update_mesh();
@@ -202,22 +213,13 @@ impl PolyLine {
     }
 }
 
-impl Transform for PolyLine {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 pub struct Arc {
+    pub base: crate::mobjects::MobjectBase,
     pub center_point: Point3<GMFloat>,
     pub start_angle: GMFloat,
     pub end_angle: GMFloat,
     pub radius: GMFloat,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
@@ -229,12 +231,12 @@ impl Arc {
         radius: GMFloat,
     ) -> Self {
         let mut a = Self {
+            base: crate::mobjects::MobjectBase::new("Arc"),
             center_point,
             start_angle,
             end_angle,
             radius,
             draw_config: DrawConfig::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         };
         a.update_mesh();
@@ -307,7 +309,7 @@ impl Arc {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 }
 
@@ -315,18 +317,24 @@ impl Draw for Arc {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
-impl Transform for Arc {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 impl Mobject for Arc {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
@@ -370,7 +378,7 @@ impl PolyLine {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 }
 
@@ -379,7 +387,22 @@ impl Draw for PolyLine {
 }
 
 impl Mobject for PolyLine {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }

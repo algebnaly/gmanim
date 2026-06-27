@@ -52,15 +52,6 @@ impl Default for ThreeDViewport {
     }
 }
 
-impl Transform for ThreeDViewport {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 impl Draw for ThreeDViewport {
     fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {
         // Will be replaced by GPU logic

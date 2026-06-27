@@ -40,6 +40,9 @@ impl Color {
     pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
     }
+    pub fn white() -> Self {
+        Self::new(255, 255, 255, 255)
+    }
     pub fn to_array(&self) -> [GMFloat; 4] {
         [
             self.r as GMFloat / 255.0,
@@ -129,7 +132,7 @@ pub enum ClipRect {
 }
 
 pub struct Scene {
-    pub mobjects: Vec<Rc<RefCell<Box<dyn mobjects::Mobject>>>>,
+    pub mobjects: Vec<mobjects::MobjectRef>,
     pub camera: camera::Camera,
     pub light_pos: Point3<GMFloat>,
     pub light_color: Color,
@@ -157,15 +160,12 @@ impl Default for Scene {
 }
 
 impl Scene {
-    pub fn add(
-        &mut self,
-        mobject: Box<dyn mobjects::Mobject>,
-    ) -> Rc<RefCell<Box<dyn mobjects::Mobject>>> {
-        let rc = Rc::new(RefCell::new(mobject));
-        self.mobjects.push(rc.clone());
-        rc
+    pub fn add(&mut self, mobject: impl mobjects::Mobject + 'static) {
+        self.mobjects
+            .push(std::rc::Rc::new(std::cell::RefCell::new(mobject)));
     }
-    pub fn add_ref(&mut self, mobject_ref: Rc<RefCell<Box<dyn mobjects::Mobject>>>) {
-        self.mobjects.push(mobject_ref.clone());
+
+    pub fn add_ref(&mut self, mobject: mobjects::MobjectRef) {
+        self.mobjects.push(mobject);
     }
 }

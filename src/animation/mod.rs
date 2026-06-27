@@ -69,7 +69,7 @@ impl Default for AnimationConfig {
 
 /// Translate a mobject by a displacement vector over the animation duration.
 pub struct Move {
-    pub target: Rc<RefCell<Box<dyn Mobject>>>,
+    pub target: crate::mobjects::MobjectRef,
     pub displacement: Vector3<GMFloat>,
     pub config: AnimationConfig,
     pub start_matrix: Option<nalgebra::Matrix4<GMFloat>>,
@@ -77,7 +77,7 @@ pub struct Move {
 
 impl Move {
     pub fn new(
-        target: Rc<RefCell<Box<dyn Mobject>>>,
+        target: crate::mobjects::MobjectRef,
         displacement: Vector3<GMFloat>,
         total_frames: u32,
     ) -> Self {
@@ -112,7 +112,7 @@ impl Animation for Move {
 
 /// Rotate a mobject around a point over the animation duration.
 pub struct Rotate {
-    pub target: Rc<RefCell<Box<dyn Mobject>>>,
+    pub target: crate::mobjects::MobjectRef,
     pub axis_angle: Vector3<GMFloat>,
     pub center: Point3<GMFloat>,
     pub config: AnimationConfig,
@@ -121,7 +121,7 @@ pub struct Rotate {
 
 impl Rotate {
     pub fn new(
-        target: Rc<RefCell<Box<dyn Mobject>>>,
+        target: crate::mobjects::MobjectRef,
         axis_angle: Vector3<GMFloat>,
         center: Point3<GMFloat>,
         total_frames: u32,

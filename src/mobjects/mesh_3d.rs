@@ -12,6 +12,7 @@ pub struct Vertex {
 }
 
 pub struct TriangleMesh3D {
+    pub base: super::MobjectBase,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub model_matrix: Matrix4<GMFloat>,
@@ -20,6 +21,7 @@ pub struct TriangleMesh3D {
 impl TriangleMesh3D {
     pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
         Self {
+            base: super::MobjectBase::new("TriangleMesh3D"),
             vertices,
             indices,
             model_matrix: Matrix4::identity(),
@@ -193,24 +195,27 @@ impl TriangleMesh3D {
     }
 }
 
-impl Transform for TriangleMesh3D {
-    fn get_model_matrix(&self) -> Matrix4<GMFloat> {
-        self.model_matrix
-    }
-
-    fn set_model_matrix(&mut self, mat: Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 impl Draw for TriangleMesh3D {
-    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: Matrix4<GMFloat>) {
-        // Mesh rendering is delegated to vulkan renderer.
-    }
+    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {}
 }
 
 impl Mobject for TriangleMesh3D {
-    fn as_mesh_3d(&self) -> Option<&TriangleMesh3D> {
-        Some(self)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_3d(self, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &super::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut super::MobjectBase {
+        &mut self.base
     }
 }

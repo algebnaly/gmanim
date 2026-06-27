@@ -60,18 +60,38 @@ fn test_formula_to_mobject() {
     // The SVGShape parser should have populated the elements,
     // but update_mesh() must be called to populate the mesh.
     // In our open_svg_file, update_mesh is already called!
-    use crate::mobjects::Mobject;
+    use crate::mobjects::{Mobject, RenderVisitor};
 
-    // A pi symbol has paths, so we should have some vertices.
-    let mut vertex_count = 0;
-    for child in mobj.mobjects.iter() {
-        if let Some(mesh) = child.as_mesh_2d() {
-            vertex_count += mesh.vertices.len();
+    struct TestVisitor {
+        vertex_count: usize,
+    }
+    impl RenderVisitor for TestVisitor {
+        fn push_mesh_2d(
+            &mut self,
+            mesh: &crate::mobjects::mesh_2d::TriangleMesh2D,
+            _transform: nalgebra::Matrix4<crate::GMFloat>,
+        ) {
+            self.vertex_count += mesh.vertices.len();
+        }
+        fn push_mesh_3d(
+            &mut self,
+            _mesh: &crate::mobjects::mesh_3d::TriangleMesh3D,
+            _transform: nalgebra::Matrix4<crate::GMFloat>,
+        ) {
+        }
+        fn push_object_3d(
+            &mut self,
+            _obj: &dyn crate::mobjects::object_3d::Object3D,
+            _transform: nalgebra::Matrix4<crate::GMFloat>,
+        ) {
         }
     }
 
+    let mut visitor = TestVisitor { vertex_count: 0 };
+    mobj.submit_to_renderer(&mut visitor, nalgebra::Matrix4::identity());
+
     assert!(
-        vertex_count > 0,
+        visitor.vertex_count > 0,
         "Formula parsing failed to generate vertices"
     );
 }

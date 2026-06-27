@@ -1117,83 +1117,25 @@ impl VulkanRenderer {
         let mut mesh_vertices = Vec::new();
         let mut mesh_indices = Vec::new();
 
-        fn collect_3d(
-            m: &dyn crate::mobjects::Mobject,
-            parent_mat: nalgebra::Matrix4<crate::GMFloat>,
-            primitives_3d: &mut Vec<PrimitiveData3D>,
-            mesh_vertices: &mut Vec<Vertex>,
-            mesh_indices: &mut Vec<u32>,
-        ) {
-            let global_mat = parent_mat * m.get_model_matrix();
-
-            m.visit_children(&mut |child| {
-                collect_3d(
-                    child,
-                    global_mat,
-                    primitives_3d,
-                    mesh_vertices,
-                    mesh_indices,
-                );
-            });
-
-            if let Some(obj_3d) = m.as_3d() {
-                primitives_3d.push(obj_3d.as_primitive_data(global_mat));
-            }
-            if let Some(mesh) = m.as_mesh_3d() {
-                let base_index = mesh_vertices.len() as u32;
-                for v in &mesh.vertices {
-                    let pos = nalgebra::Point3::new(
-                        v.position[0] as crate::GMFloat,
-                        v.position[1] as crate::GMFloat,
-                        v.position[2] as crate::GMFloat,
-                    );
-                    let t_pos = global_mat.transform_point(&pos);
-                    let n = nalgebra::Vector3::new(
-                        v.normal[0] as crate::GMFloat,
-                        v.normal[1] as crate::GMFloat,
-                        v.normal[2] as crate::GMFloat,
-                    );
-                    let t_n = global_mat.transform_vector(&n).normalize();
-                    mesh_vertices.push(Vertex {
-                        position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
-                        normal: [t_n.x as f32, t_n.y as f32, t_n.z as f32],
-                        color: v.color,
-                    });
-                }
-                for i in &mesh.indices {
-                    mesh_indices.push(*i + base_index);
-                }
-            }
-        }
-
-        for m in &scene.mobjects {
-            collect_3d(
-                m.borrow().as_ref(),
-                nalgebra::Matrix4::identity(),
-                &mut primitives_3d,
-                &mut mesh_vertices,
-                &mut mesh_indices,
-            );
-        }
-
         let mut mesh_vertices_2d = Vec::new();
         let mut mesh_indices_2d = Vec::new();
 
-        fn collect_2d(
-            m: &dyn crate::mobjects::Mobject,
-            parent_mat: nalgebra::Matrix4<crate::GMFloat>,
-            mesh_vertices: &mut Vec<Vertex2D>,
-            mesh_indices: &mut Vec<u32>,
-        ) {
-            let global_mat = parent_mat * m.get_model_matrix();
+        struct VulkanDataCollector<'a> {
+            primitives_3d: &'a mut Vec<PrimitiveData3D>,
+            mesh_vertices: &'a mut Vec<Vertex>,
+            mesh_indices: &'a mut Vec<u32>,
+            mesh_vertices_2d: &'a mut Vec<Vertex2D>,
+            mesh_indices_2d: &'a mut Vec<u32>,
+        }
 
-            m.visit_children(&mut |child| {
-                collect_2d(child, global_mat, mesh_vertices, mesh_indices);
-            });
-
-            if let Some(mesh) = m.as_mesh_2d() {
-                let base_index = mesh_vertices.len() as u32;
-                let mesh_mat = global_mat * mesh.model_matrix;
+        impl<'a> crate::mobjects::RenderVisitor for VulkanDataCollector<'a> {
+            fn push_mesh_2d(
+                &mut self,
+                mesh: &crate::mobjects::mesh_2d::TriangleMesh2D,
+                transform: nalgebra::Matrix4<crate::GMFloat>,
+            ) {
+                let base_index = self.mesh_vertices_2d.len() as u32;
+                let mesh_mat = transform * mesh.model_matrix;
                 for v in &mesh.vertices {
                     let pos = nalgebra::Point3::new(
                         v.position[0] as crate::GMFloat,
@@ -1201,24 +1143,66 @@ impl VulkanRenderer {
                         0.0,
                     );
                     let t_pos = mesh_mat.transform_point(&pos);
-                    mesh_vertices.push(Vertex2D {
+                    self.mesh_vertices_2d.push(Vertex2D {
                         position: [t_pos.x as f32, t_pos.y as f32],
                         color: v.color,
                     });
                 }
                 for i in &mesh.indices {
-                    mesh_indices.push(*i + base_index);
+                    self.mesh_indices_2d.push(*i + base_index);
                 }
+            }
+
+            fn push_mesh_3d(
+                &mut self,
+                mesh: &crate::mobjects::mesh_3d::TriangleMesh3D,
+                transform: nalgebra::Matrix4<crate::GMFloat>,
+            ) {
+                let base_index = self.mesh_vertices.len() as u32;
+                for v in &mesh.vertices {
+                    let pos = nalgebra::Point3::new(
+                        v.position[0] as crate::GMFloat,
+                        v.position[1] as crate::GMFloat,
+                        v.position[2] as crate::GMFloat,
+                    );
+                    let t_pos = transform.transform_point(&pos);
+                    let n = nalgebra::Vector3::new(
+                        v.normal[0] as crate::GMFloat,
+                        v.normal[1] as crate::GMFloat,
+                        v.normal[2] as crate::GMFloat,
+                    );
+                    let t_n = transform.transform_vector(&n).normalize();
+                    self.mesh_vertices.push(Vertex {
+                        position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
+                        normal: [t_n.x as f32, t_n.y as f32, t_n.z as f32],
+                        color: v.color,
+                    });
+                }
+                for i in &mesh.indices {
+                    self.mesh_indices.push(*i + base_index);
+                }
+            }
+
+            fn push_object_3d(
+                &mut self,
+                obj: &dyn crate::mobjects::object_3d::Object3D,
+                transform: nalgebra::Matrix4<crate::GMFloat>,
+            ) {
+                self.primitives_3d.push(obj.as_primitive_data(transform));
             }
         }
 
+        let mut collector = VulkanDataCollector {
+            primitives_3d: &mut primitives_3d,
+            mesh_vertices: &mut mesh_vertices,
+            mesh_indices: &mut mesh_indices,
+            mesh_vertices_2d: &mut mesh_vertices_2d,
+            mesh_indices_2d: &mut mesh_indices_2d,
+        };
+
         for m in &scene.mobjects {
-            collect_2d(
-                m.borrow().as_ref(),
-                nalgebra::Matrix4::identity(),
-                &mut mesh_vertices_2d,
-                &mut mesh_indices_2d,
-            );
+            m.borrow()
+                .submit_to_renderer(&mut collector, nalgebra::Matrix4::identity());
         }
 
         let camera_uniform_2d = CameraUniform2D {

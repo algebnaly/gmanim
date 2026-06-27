@@ -13,12 +13,12 @@ use super::path::PathElement;
 use super::{coordinate_change_x, coordinate_change_y, DrawConfig, Mobject, Transform};
 
 pub struct Text {
+    pub base: crate::mobjects::MobjectBase,
     pub text: String,
     glyph_paths: Vec<GlyphPath>,
     pub position: Point3<GMFloat>,
     pub font_size: GMFloat,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl PathElement {
@@ -48,15 +48,6 @@ pub enum FontConfig {
     Default,
     FontName(String),
     FontFile(String),
-}
-
-impl Transform for Text {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
 }
 
 struct GlyphPath {
@@ -147,7 +138,14 @@ impl Draw for Text {
     }
 }
 
-impl Mobject for Text {}
+impl Mobject for Text {
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
+    }
+}
 
 impl Text {
     pub fn new(
@@ -160,12 +158,12 @@ impl Text {
         if text.len() == 0 {
             info!("text len is 0");
             return Text {
+                base: crate::mobjects::MobjectBase::new("Text"),
                 text,
                 glyph_paths,
                 position,
                 font_size,
                 draw_config,
-                model_matrix: nalgebra::Matrix4::identity(),
             };
         }
         let mut f = fs::File::open("/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc")
@@ -201,12 +199,12 @@ impl Text {
             glyph_paths.push(glyph_path);
         }
         Text {
+            base: crate::mobjects::MobjectBase::new("Text"),
             text,
             glyph_paths,
             position,
             font_size,
             draw_config,
-            model_matrix: nalgebra::Matrix4::identity(),
         }
     }
 }

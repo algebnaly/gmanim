@@ -13,22 +13,22 @@ use crate::{
 };
 
 pub struct Dot {
+    pub base: crate::mobjects::MobjectBase,
     pub position: Point3<GMFloat>,
     pub radius: GMFloat,
     pub color: Color,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
 impl Default for Dot {
     fn default() -> Self {
         Self {
+            base: crate::mobjects::MobjectBase::new("Dot"),
             position: Point3::origin(),
             radius: 0.05,
             color: Color::default(),
             draw_config: DrawConfig::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         }
     }
@@ -42,11 +42,11 @@ impl Dot {
         draw_config: DrawConfig,
     ) -> Self {
         Self {
+            base: crate::mobjects::MobjectBase::new("Dot"),
             position,
             radius,
             color,
             draw_config,
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         }
     }
@@ -55,17 +55,24 @@ impl Dot {
 impl Draw for Dot {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
-impl Transform for Dot {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
 
 impl Mobject for Dot {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }

@@ -21,20 +21,20 @@ use lyon::tessellation::{
 
 #[derive(Debug)]
 pub struct SVGPath {
+    pub base: crate::mobjects::MobjectBase,
     pub elements: Vec<PathElement>,
     pub is_closed: bool,
     pub draw_config: DrawConfig,
-    pub model_matrix: nalgebra::Matrix4<crate::GMFloat>,
     pub mesh: TriangleMesh2D,
 }
 
 impl SVGPath {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            base: crate::mobjects::MobjectBase::new("SVGPath"),
             elements: vec![],
             is_closed: false,
             draw_config: Default::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
             mesh: TriangleMesh2D::default(),
         }
     }
@@ -141,7 +141,7 @@ impl SVGPath {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 
     pub fn flip_y_coordinate(&mut self) {
@@ -168,22 +168,28 @@ impl SVGPath {
     }
 }
 
-impl super::Transform for SVGPath {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<crate::GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<crate::GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 impl Draw for SVGPath {
     fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {}
 }
 
 impl Mobject for SVGPath {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
@@ -225,12 +231,12 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
     }
 
     let mut grp_mobj = MobjectGroup {
-        mobjects: paths
-            .into_iter()
-            .map(|p| Box::new(p) as Box<dyn Mobject>)
-            .collect(),
-        model_matrix: nalgebra::Matrix4::identity(),
+        base: crate::mobjects::MobjectBase::new("FormulaGroup"),
     };
+    grp_mobj.base.children = paths
+        .into_iter()
+        .map(|p| std::rc::Rc::new(std::cell::RefCell::new(p)) as crate::mobjects::MobjectRef)
+        .collect();
     let scaling_matrix =
         nalgebra::Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::new(0.01, -0.01, 1.0));
     grp_mobj.apply_transform(scaling_matrix);

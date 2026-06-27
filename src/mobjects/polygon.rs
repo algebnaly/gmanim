@@ -11,19 +11,19 @@ use crate::{Color, Context, GMFloat, GMPoint, Scene};
 use super::{Draw, DrawConfig, Mobject, Transform};
 
 pub struct Polygon {
+    pub base: crate::mobjects::MobjectBase,
     pub vertices: Vec<GMPoint>,
     pub draw_config: DrawConfig,
     pub mesh: TriangleMesh2D,
-    pub model_matrix: nalgebra::Matrix4<crate::GMFloat>,
 }
 
 impl Polygon {
     pub fn new(vertices: Vec<GMPoint>) -> Self {
         let mut p = Self {
+            base: crate::mobjects::MobjectBase::new("Polygon"),
             vertices,
             draw_config: DrawConfig::default(),
             mesh: TriangleMesh2D::default(),
-            model_matrix: nalgebra::Matrix4::identity(),
         };
         p.update_mesh();
         p
@@ -78,16 +78,7 @@ impl Polygon {
 
         self.mesh.vertices = geometry.vertices;
         self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.model_matrix;
-    }
-}
-
-impl Transform for Polygon {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<crate::GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<crate::GMFloat>) {
-        self.model_matrix = mat;
+        self.mesh.model_matrix = self.base.model_matrix;
     }
 }
 
@@ -96,7 +87,22 @@ impl Draw for Polygon {
 }
 
 impl Mobject for Polygon {
-    fn as_mesh_2d(&self) -> Option<&TriangleMesh2D> {
-        Some(&self.mesh)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }

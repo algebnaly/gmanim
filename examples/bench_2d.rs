@@ -1,7 +1,7 @@
 use gmanim_core::{
     animation::{Animation, Timeline},
     math_utils::constants::PI,
-    mobjects::{Mobject, Rectangle, Transform},
+    mobjects::{Rectangle, Transform},
     video_backend::{ColorOrder, VideoBackend, VideoBackendType, VideoConfig},
     Color, Context, GMFloat, Scene, SceneConfig,
 };
@@ -14,7 +14,6 @@ impl Animation for RotateRectangles {
     fn update(&mut self, alpha: GMFloat, scene: &mut Scene) {
         let angle = alpha as f32 * PI * 2.0;
         for (i, m) in scene.mobjects.iter().enumerate() {
-            let mut m_mut = m.borrow_mut();
             let x = (i as f32 % 40.0) - 20.0;
             let y = ((i / 40) as f32 % 25.0) - 12.5;
             let matrix = nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
@@ -22,7 +21,7 @@ impl Animation for RotateRectangles {
                 y as GMFloat,
                 0.0,
             )) * nalgebra::Matrix4::from_euler_angles(0.0, 0.0, angle + i as f32);
-            m_mut.set_model_matrix(matrix);
+            m.borrow_mut().set_model_matrix(matrix);
         }
     }
     fn total_frames(&self) -> u32 {
@@ -64,7 +63,7 @@ fn main() {
             0.0,
         )));
         rect.update_mesh();
-        scene.add(Box::new(rect));
+        scene.add(rect);
     }
 
     let mut timeline = Timeline::new(scene, ctx);

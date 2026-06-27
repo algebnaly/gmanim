@@ -11,7 +11,7 @@ use crate::{Color, Context, GMFloat};
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Represents an object defined by a Signed Distance Function.
-pub trait Object3D: Sync + Send {
+pub trait Object3D {
     /// Returns the shortest distance from point `p` to the surface of the object (Used by CPU rendering).
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat;
     /// Returns the color of the object at point `p`.
@@ -30,15 +30,14 @@ pub trait Object3D: Sync + Send {
 
 /// A 3D Sphere
 pub struct Sphere3D {
-    pub center: Point3<GMFloat>,
+    pub base: crate::mobjects::MobjectBase,
     pub radius: GMFloat,
     pub color: Color,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Object3D for Sphere3D {
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat {
-        (p - self.center).norm() - self.radius
+        (p - Point3::origin()).norm() - self.radius
     }
     fn color(&self, _p: &Point3<GMFloat>) -> Color {
         self.color
@@ -47,7 +46,7 @@ impl Object3D for Sphere3D {
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
-        let center = global_mat.transform_point(&self.center);
+        let center = global_mat.transform_point(&Point3::origin());
         crate::vulkan::renderer::PrimitiveData3D {
             color: [
                 self.color.r as f32 / 255.0,
@@ -74,39 +73,37 @@ impl Object3D for Sphere3D {
         }
     }
 }
-
-impl Transform for Sphere3D {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
 impl Draw for Sphere3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for Sphere3D {
-    fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
-        Some(self)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
     }
 
-    fn set_position(&mut self, pos: nalgebra::Point3<GMFloat>) {
-        self.center = pos;
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
     }
-
-    fn get_position(&self) -> nalgebra::Point3<GMFloat> {
-        self.center
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
 /// A 3D Line Segment (Capsule)
 pub struct LineSegment3D {
+    pub base: crate::mobjects::MobjectBase,
     pub a: Point3<GMFloat>,
     pub b: Point3<GMFloat>,
     pub radius: GMFloat,
     pub color: Color,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Object3D for LineSegment3D {
@@ -151,21 +148,27 @@ impl Object3D for LineSegment3D {
         }
     }
 }
-
-impl Transform for LineSegment3D {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
 impl Draw for LineSegment3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for LineSegment3D {
-    fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
-        Some(self)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
@@ -184,13 +187,13 @@ fn sd_capped_cone_local(axial: GMFloat, radial: GMFloat, h: GMFloat, r: GMFloat)
 
 /// A 3D Arrow (Union of a line segment and a cone)
 pub struct Arrow3D {
+    pub base: crate::mobjects::MobjectBase,
     pub start: Point3<GMFloat>,
     pub end: Point3<GMFloat>,
     pub shaft_radius: GMFloat,
     pub head_radius: GMFloat,
     pub head_length: GMFloat,
     pub color: Color,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Object3D for Arrow3D {
@@ -255,37 +258,42 @@ impl Object3D for Arrow3D {
         }
     }
 }
-
-impl Transform for Arrow3D {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
 impl Draw for Arrow3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for Arrow3D {
-    fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
-        Some(self)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
+    }
+
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
+    }
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
 pub struct Box3DSdf {
-    pub center: Point3<GMFloat>,
+    pub base: crate::mobjects::MobjectBase,
     pub size: Vector3<GMFloat>,
     pub x_axis: Vector3<GMFloat>,
     pub y_axis: Vector3<GMFloat>,
     pub z_axis: Vector3<GMFloat>,
     pub color: Color,
-    pub model_matrix: nalgebra::Matrix4<GMFloat>,
 }
 
 impl Object3D for Box3DSdf {
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat {
-        let pt = p - self.center;
+        let pt = p - Point3::origin();
         let local_p = Vector3::new(
             pt.dot(&self.x_axis),
             pt.dot(&self.y_axis),
@@ -310,7 +318,7 @@ impl Object3D for Box3DSdf {
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
-        let center = global_mat.transform_point(&self.center);
+        let center = global_mat.transform_point(&Point3::origin());
         let x_axis = global_mat.transform_vector(&self.x_axis);
         let y_axis = global_mat.transform_vector(&self.y_axis);
         let z_axis = global_mat.transform_vector(&self.z_axis);
@@ -341,30 +349,28 @@ impl Object3D for Box3DSdf {
     }
 }
 
-impl Transform for Box3DSdf {
-    fn get_model_matrix(&self) -> nalgebra::Matrix4<GMFloat> {
-        self.model_matrix
-    }
-    fn set_model_matrix(&mut self, mat: nalgebra::Matrix4<GMFloat>) {
-        self.model_matrix = mat;
-    }
-}
-
 impl Draw for Box3DSdf {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for Box3DSdf {
-    fn as_3d(&self) -> Option<&dyn crate::mobjects::object_3d::Object3D> {
-        Some(self)
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        let global_mat = parent_mat * self.base.model_matrix;
+        for child in self.base.children.iter() {
+            child.borrow().submit_to_renderer(visitor, global_mat);
+        }
     }
 
-    fn set_position(&mut self, pos: nalgebra::Point3<GMFloat>) {
-        self.center = pos;
+    fn base(&self) -> &crate::mobjects::MobjectBase {
+        &self.base
     }
-
-    fn get_position(&self) -> nalgebra::Point3<GMFloat> {
-        self.center
+    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
+        &mut self.base
     }
 }
 
