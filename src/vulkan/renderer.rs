@@ -102,6 +102,53 @@ impl Buffer {
     }
 }
 
+fn msaa_to_vk_sample_count(msaa_samples: u32) -> vk::SampleCountFlags {
+    match msaa_samples {
+        1 => vk::SampleCountFlags::TYPE_1,
+        2 => vk::SampleCountFlags::TYPE_2,
+        4 => vk::SampleCountFlags::TYPE_4,
+        8 => vk::SampleCountFlags::TYPE_8,
+        16 => vk::SampleCountFlags::TYPE_16,
+        32 => vk::SampleCountFlags::TYPE_32,
+        64 => vk::SampleCountFlags::TYPE_64,
+        _ => vk::SampleCountFlags::TYPE_8,
+    }
+}
+
+fn get_max_usable_sample_count(
+    ctx: &VulkanContext,
+    requested: vk::SampleCountFlags,
+) -> vk::SampleCountFlags {
+    let properties = unsafe {
+        ctx.instance
+            .get_physical_device_properties(ctx.physical_device)
+    };
+    let counts = properties.limits.framebuffer_color_sample_counts
+        & properties.limits.framebuffer_depth_sample_counts;
+
+    if counts.contains(requested) {
+        return requested;
+    }
+
+    // Fallback to highest supported
+    let fallbacks = [
+        vk::SampleCountFlags::TYPE_64,
+        vk::SampleCountFlags::TYPE_32,
+        vk::SampleCountFlags::TYPE_16,
+        vk::SampleCountFlags::TYPE_8,
+        vk::SampleCountFlags::TYPE_4,
+        vk::SampleCountFlags::TYPE_2,
+        vk::SampleCountFlags::TYPE_1,
+    ];
+
+    for &fallback in &fallbacks {
+        if counts.contains(fallback) && fallback.as_raw() <= requested.as_raw() {
+            return fallback;
+        }
+    }
+    vk::SampleCountFlags::TYPE_1
+}
+
 pub struct Image {
     pub vk_image: vk::Image,
     pub allocation: Option<gpu_allocator::vulkan::Allocation>,
@@ -468,6 +515,8 @@ impl RenderOutputs {
 
 pub struct VulkanRenderer {
     ctx: Arc<VulkanContext>,
+    msaa_samples: u32,
+    ssaa_factor: u32,
 
     descriptor_pool: vk::DescriptorPool,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -508,7 +557,10 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    pub fn new(ctx: Arc<VulkanContext>) -> Self {
+    pub fn new(ctx: Arc<VulkanContext>, msaa_samples: u32, ssaa_factor: u32) -> Self {
+        let requested_sample_count = msaa_to_vk_sample_count(msaa_samples);
+        let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
+
         let compute_shader = compile_wgsl_full(&ctx, include_str!("shader.wgsl"));
         let raster_shader = compile_wgsl_full(&ctx, include_str!("raster_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
@@ -816,7 +868,7 @@ impl VulkanRenderer {
 
         let color_attachment = vk::AttachmentDescription {
             format: vk::Format::R8G8B8A8_UNORM,
-            samples: vk::SampleCountFlags::TYPE_8,
+            samples: sample_count,
             load_op: vk::AttachmentLoadOp::CLEAR,
             store_op: vk::AttachmentStoreOp::DONT_CARE,
             stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
@@ -828,7 +880,7 @@ impl VulkanRenderer {
 
         let depth_attachment = vk::AttachmentDescription {
             format: vk::Format::D32_SFLOAT,
-            samples: vk::SampleCountFlags::TYPE_8,
+            samples: sample_count,
             load_op: vk::AttachmentLoadOp::CLEAR,
             store_op: vk::AttachmentStoreOp::DONT_CARE,
             stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
@@ -999,7 +1051,7 @@ impl VulkanRenderer {
         let multisampling = vk::PipelineMultisampleStateCreateInfo {
             s_type: vk::StructureType::PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
             sample_shading_enable: vk::FALSE,
-            rasterization_samples: vk::SampleCountFlags::TYPE_8,
+            rasterization_samples: sample_count,
             ..Default::default()
         };
 
@@ -1325,6 +1377,8 @@ impl VulkanRenderer {
             camera_buffer_2d,
             frame_data,
             cache: std::sync::Mutex::new(None),
+            msaa_samples: sample_count.as_raw(),
+            ssaa_factor,
         }
     }
 
@@ -1619,26 +1673,26 @@ impl VulkanRenderer {
             );
             let msaa_texture = Image::new(
                 &self.ctx,
-                width,
-                height,
+                width * self.ssaa_factor,
+                height * self.ssaa_factor,
                 vk::Format::R8G8B8A8_UNORM,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT,
                 vk::ImageAspectFlags::COLOR,
-                vk::SampleCountFlags::TYPE_8,
+                msaa_to_vk_sample_count(self.msaa_samples),
             );
             let msaa_depth_texture = Image::new(
                 &self.ctx,
-                width,
-                height,
+                width * self.ssaa_factor,
+                height * self.ssaa_factor,
                 vk::Format::D32_SFLOAT,
                 vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
                 vk::ImageAspectFlags::DEPTH,
-                vk::SampleCountFlags::TYPE_8,
+                msaa_to_vk_sample_count(self.msaa_samples),
             );
             let resolved_texture = Image::new(
                 &self.ctx,
-                width,
-                height,
+                width * self.ssaa_factor,
+                height * self.ssaa_factor,
                 vk::Format::R8G8B8A8_UNORM,
                 vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
                 vk::ImageAspectFlags::COLOR,
@@ -2000,8 +2054,8 @@ impl VulkanRenderer {
                 render_pass: self.render_pass,
                 attachment_count: attachments.len() as u32,
                 p_attachments: attachments.as_ptr(),
-                width,
-                height,
+                width: width * self.ssaa_factor,
+                height: height * self.ssaa_factor,
                 layers: 1,
                 ..Default::default()
             };
@@ -2139,7 +2193,10 @@ impl VulkanRenderer {
                 framebuffer: cache.framebuffer,
                 render_area: vk::Rect2D {
                     offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D { width, height },
+                    extent: vk::Extent2D {
+                        width: width * self.ssaa_factor,
+                        height: height * self.ssaa_factor,
+                    },
                 },
                 clear_value_count: clear_values.len() as u32,
                 p_clear_values: clear_values.as_ptr(),
@@ -2155,8 +2212,8 @@ impl VulkanRenderer {
             let viewport = vk::Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: width as f32,
-                height: height as f32,
+                width: (width * self.ssaa_factor) as f32,
+                height: (height * self.ssaa_factor) as f32,
                 min_depth: 0.0,
                 max_depth: 1.0,
             };
@@ -2165,7 +2222,10 @@ impl VulkanRenderer {
                 .cmd_set_viewport(fd.command_buffer, 0, std::slice::from_ref(&viewport));
             let scissor = vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D { width, height },
+                extent: vk::Extent2D {
+                    width: width * self.ssaa_factor,
+                    height: height * self.ssaa_factor,
+                },
             };
             self.ctx
                 .device

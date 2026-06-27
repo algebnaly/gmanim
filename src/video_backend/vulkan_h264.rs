@@ -166,12 +166,14 @@ struct H264RateControlSettings {
 fn default_h264_rate_control_settings(
     mode: vk::VideoEncodeRateControlModeFlagsKHR,
     framerate: u32,
+    bitrate: Option<u64>,
 ) -> H264RateControlSettings {
+    let target = bitrate.unwrap_or(H264_TARGET_BITRATE);
     H264RateControlSettings {
         mode,
         framerate,
-        average_bitrate: H264_TARGET_BITRATE,
-        max_bitrate: H264_MAX_BITRATE.max(H264_TARGET_BITRATE),
+        average_bitrate: target,
+        max_bitrate: H264_MAX_BITRATE.max(target),
         min_qp: H264_MIN_QP.clamp(0, 51),
         max_qp: H264_MAX_QP.clamp(H264_MIN_QP, 51),
     }
@@ -522,7 +524,11 @@ fn create_video_session(
         dpb_memory: vk::DeviceMemory::null(),
         dpb_views: Vec::new(),
         slots: Vec::new(),
-        rate_control: make_h264_rate_control_settings(&encode_caps, config.framerate),
+        rate_control: make_h264_rate_control_settings(
+            &encode_caps,
+            config.framerate,
+            config.bitrate,
+        ),
     };
 
     let result = bind_video_session_memory(ctx, &mut resources)
@@ -540,6 +546,7 @@ fn create_video_session(
 fn make_h264_rate_control_settings(
     encode_caps: &vk::VideoEncodeCapabilitiesKHR,
     framerate: u32,
+    bitrate: Option<u64>,
 ) -> Option<H264RateControlSettings> {
     let mode = if encode_caps
         .rate_control_modes
@@ -554,7 +561,7 @@ fn make_h264_rate_control_settings(
     } else {
         return None;
     };
-    Some(default_h264_rate_control_settings(mode, framerate))
+    Some(default_h264_rate_control_settings(mode, framerate, bitrate))
 }
 
 fn choose_video_format(
@@ -1862,6 +1869,7 @@ mod tests {
             output_width: width,
             output_height: height,
             color_order: ColorOrder::Nv12,
+            bitrate: None,
         }
     }
 
@@ -1942,8 +1950,11 @@ mod tests {
 
     #[test]
     fn default_rate_control_settings_are_valid_for_h264() {
-        let settings =
-            default_h264_rate_control_settings(vk::VideoEncodeRateControlModeFlagsKHR::VBR, 60);
+        let mut settings = default_h264_rate_control_settings(
+            vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+            60,
+            None,
+        );
 
         assert!(settings.average_bitrate > 0);
         assert!(settings.max_bitrate >= settings.average_bitrate);

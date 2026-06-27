@@ -61,6 +61,7 @@ pub struct VideoConfig {
     pub output_width: u32,
     pub output_height: u32,
     pub color_order: ColorOrder,
+    pub bitrate: Option<u64>,
 }
 
 pub enum FfmpegPipeEncoder {
@@ -321,6 +322,7 @@ mod tests {
             output_width: 128,
             output_height: 128,
             color_order: ColorOrder::Rgba,
+            bitrate: None,
         };
 
         let mut backend = FfmpegVaapiBackend::try_new(&config, 3).unwrap();

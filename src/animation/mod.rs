@@ -337,6 +337,8 @@ impl Timeline {
             if let Some(vk_ctx) = pollster::block_on(crate::vulkan::context::VulkanContext::new()) {
                 self.vulkan_renderer = Some(crate::vulkan::renderer::VulkanRenderer::new(
                     std::sync::Arc::new(vk_ctx),
+                    self.ctx.scene_config.msaa_samples,
+                    self.ctx.scene_config.ssaa_factor,
                 ));
             }
         }
@@ -351,6 +353,8 @@ impl Timeline {
             if let Some(vk_ctx) = pollster::block_on(crate::vulkan::context::VulkanContext::new()) {
                 self.vulkan_renderer = Some(crate::vulkan::renderer::VulkanRenderer::new(
                     std::sync::Arc::new(vk_ctx),
+                    self.ctx.scene_config.msaa_samples,
+                    self.ctx.scene_config.ssaa_factor,
                 ));
             }
         }

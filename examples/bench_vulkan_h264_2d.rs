@@ -42,6 +42,8 @@ fn main() -> std::io::Result<()> {
             output_width: width,
             output_height: height,
             scale_factor: height as GMFloat / 9.0,
+            msaa_samples: 8,
+            ssaa_factor: 2,
         },
     };
 
@@ -75,6 +77,7 @@ fn main() -> std::io::Result<()> {
         output_width: width,
         output_height: height,
         color_order: ColorOrder::Nv12,
+        bitrate: None,
     };
     let mut video_backend = pollster::block_on(VulkanH264Backend::try_new(&video_config))?;
 
