@@ -187,11 +187,23 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     if (hit) {
         let p = ro + rd * t;
         let normal = calc_normal(p);
-        let light_dir = -normalize(camera.look_at); // Directional light following camera
+        let view_dir = -normalize(camera.look_at);
+        var up = vec3<f32>(0.0, 1.0, 0.0);
+        if (abs(view_dir.y) > 0.99) {
+            up = vec3<f32>(1.0, 0.0, 0.0);
+        }
+        let right = normalize(cross(view_dir, up));
+        let cam_up = cross(right, view_dir);
+
+        let key_light_dir = normalize(view_dir + right * 0.8 + cam_up * 0.6);
+        let fill_light_dir = normalize(view_dir - right * 0.8 - cam_up * 0.2);
         
-        let ambient = 0.3;
-        let diff = max(dot(normal, light_dir), 0.0);
-        let light_intensity = ambient + diff * 0.7;
+        let ambient = 0.35;
+        let diff_key = max(dot(normal, key_light_dir), 0.0);
+        let diff_fill = max(dot(normal, fill_light_dir), 0.0);
+        
+        // Raymarching spec can be added too if desired, but for now just diffuse + ambient
+        let light_intensity = ambient + diff_key * 0.6 + diff_fill * 0.3;
         
         final_color = vec4<f32>(hit_color.rgb * light_intensity, hit_color.a);
     }

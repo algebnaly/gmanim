@@ -39,6 +39,34 @@ impl Projection {
             0.0,
         ]
     }
+
+    pub fn orthographic_wgpu(
+        left: f32,
+        right: f32,
+        bottom: f32,
+        top: f32,
+        near: f32,
+        far: f32,
+    ) -> [f32; 16] {
+        [
+            2.0 / (right - left),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            2.0 / (top - bottom),
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0 / (near - far),
+            0.0,
+            -(right + left) / (right - left),
+            -(top + bottom) / (top - bottom),
+            near / (near - far),
+            1.0,
+        ]
+    }
 }
 
 impl Default for Projection {
@@ -180,10 +208,10 @@ impl Camera {
         }
     }
 
-    pub fn ortho_params(&self) -> (GMFloat, GMFloat, GMFloat, GMFloat) {
+    pub fn ortho_params(&self) -> (GMFloat, GMFloat, GMFloat, GMFloat, GMFloat, GMFloat) {
         match &self.projection {
-            Projection::Orthographic(o) => (o.left, o.right, o.bottom, o.top),
-            _ => (0.0, 0.0, 0.0, 0.0),
+            Projection::Orthographic(o) => (o.left, o.right, o.bottom, o.top, o.near, o.far),
+            _ => (0.0, 0.0, 0.0, 0.0, 0.1, 1000.0),
         }
     }
 

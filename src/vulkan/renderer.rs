@@ -1444,7 +1444,7 @@ impl VulkanRenderer {
                 (true, x as f32, y as f32, w as f32, h as f32)
             }
             Some(crate::ClipRect::Logical(cx, cy, w, h)) => {
-                let (o_left, o_right, o_bottom, o_top) = scene.camera.ortho_params();
+                let (o_left, o_right, o_bottom, o_top, _, _) = scene.camera.ortho_params();
                 let log_w = o_right - o_left;
                 let log_h = o_top - o_bottom;
 
@@ -1599,13 +1599,27 @@ impl VulkanRenderer {
             _pad2: 0,
             _pad3: 0,
             proj_mat: {
-                let p = crate::camera::Projection::perspective_wgpu(
-                    scene.camera.fov() as f32,
-                    output_w / output_h,
-                    scene.camera.perspective_params().0 as f32,
-                    scene.camera.perspective_params().1 as f32,
-                );
-                p
+                if scene.camera.proj_type() == 0 {
+                    crate::camera::Projection::perspective_wgpu(
+                        scene.camera.fov() as f32,
+                        output_w / output_h,
+                        scene.camera.perspective_params().0 as f32,
+                        scene.camera.perspective_params().1 as f32,
+                    )
+                } else {
+                    let aspect = output_w / output_h;
+                    let ortho_params = scene.camera.ortho_params();
+                    // ortho_params returns (left, right, bottom, top, near, far) where left/right are often without aspect ratio applied
+                    // Actually, let's just use the exact params from the camera
+                    crate::camera::Projection::orthographic_wgpu(
+                        ortho_params.0 as f32,
+                        ortho_params.1 as f32,
+                        ortho_params.2 as f32,
+                        ortho_params.3 as f32,
+                        ortho_params.4 as f32,
+                        ortho_params.5 as f32,
+                    )
+                }
             },
         };
 

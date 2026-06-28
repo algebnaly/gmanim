@@ -68,18 +68,30 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
-    let light_dir = -normalize(camera.look_at); // Directional light (平行光) following camera
-    let light_color = vec3<f32>(1.0, 1.0, 1.0);
-    let ambient = 0.3;
+    let view_dir = -normalize(camera.look_at);
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(view_dir.y) > 0.99) {
+        up = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let right = normalize(cross(view_dir, up));
+    let cam_up = cross(right, view_dir);
+
+    // 3-point lighting setup relative to camera
+    let key_light_dir = normalize(view_dir + right * 0.8 + cam_up * 0.6);
+    let fill_light_dir = normalize(view_dir - right * 0.8 - cam_up * 0.2);
+    
+    let ambient = 0.35;
     
     let norm = normalize(in.normal);
     let final_norm = select(-norm, norm, is_front);
-    let diff = max(dot(final_norm, light_dir), 0.0);
     
-    let view_dir = normalize(camera.pos - in.frag_pos);
-    let reflect_dir = reflect(-light_dir, final_norm);
-    let spec = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0);
+    let diff_key = max(dot(final_norm, key_light_dir), 0.0);
+    let diff_fill = max(dot(final_norm, fill_light_dir), 0.0);
     
-    let result = (ambient + diff + spec) * in.color.rgb;
+    let frag_view_dir = normalize(camera.pos - in.frag_pos);
+    let reflect_dir = reflect(-key_light_dir, final_norm);
+    let spec = pow(max(dot(frag_view_dir, reflect_dir), 0.0), 32.0) * 0.4;
+    
+    let result = (ambient + diff_key * 0.6 + diff_fill * 0.3 + spec) * in.color.rgb;
     return vec4<f32>(result, in.color.a);
 }
