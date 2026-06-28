@@ -43,7 +43,7 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     
     // View matrix
-    let w = normalize(camera.pos - camera.look_at);
+    let w = -normalize(camera.look_at);
     let u = normalize(cross(camera.up, w));
     let v = cross(w, u);
     let view_mat = mat4x4<f32>(
@@ -68,13 +68,12 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
-    let light_pos = vec3<f32>(10.0, 10.0, 10.0);
+    let light_dir = -normalize(camera.look_at); // Directional light (平行光) following camera
     let light_color = vec3<f32>(1.0, 1.0, 1.0);
-    let ambient = 0.2;
+    let ambient = 0.3;
     
     let norm = normalize(in.normal);
     let final_norm = select(-norm, norm, is_front);
-    let light_dir = normalize(light_pos - in.frag_pos);
     let diff = max(dot(final_norm, light_dir), 0.0);
     
     let view_dir = normalize(camera.pos - in.frag_pos);

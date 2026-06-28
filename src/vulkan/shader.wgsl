@@ -187,12 +187,11 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
     if (hit) {
         let p = ro + rd * t;
         let normal = calc_normal(p);
-        let light_pos = vec3<f32>(10.0, 10.0, 10.0); // Simple hardcoded light for now
-        let light_dir = normalize(light_pos - p);
+        let light_dir = -normalize(camera.look_at); // Directional light following camera
         
-        let ambient = 0.2;
+        let ambient = 0.3;
         let diff = max(dot(normal, light_dir), 0.0);
-        let light_intensity = ambient + diff * 0.8;
+        let light_intensity = ambient + diff * 0.7;
         
         final_color = vec4<f32>(hit_color.rgb * light_intensity, hit_color.a);
     }

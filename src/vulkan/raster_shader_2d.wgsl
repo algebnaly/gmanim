@@ -27,8 +27,8 @@ fn vs_main(model: VertexInput) -> VertexOutput {
     var out: VertexOutput;
     out.color = model.color;
     
-    // In Vulkan, Y goes down, but Manim usually maps +Y to UP, so we flip Y
-    out.clip_position = vec4<f32>(x_ndc, -y_ndc, 0.5, 1.0);
+    // wgpu automatically handles coordinate system mapping
+    out.clip_position = vec4<f32>(x_ndc, y_ndc, 0.5, 1.0);
     
     return out;
 }

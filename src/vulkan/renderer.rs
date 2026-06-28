@@ -1078,7 +1078,7 @@ impl VulkanRenderer {
             polygon_mode: vk::PolygonMode::FILL,
             line_width: 1.0,
             cull_mode: vk::CullModeFlags::NONE,
-            front_face: vk::FrontFace::COUNTER_CLOCKWISE,
+            front_face: vk::FrontFace::CLOCKWISE, // naga flips Y, which reverses winding order
             depth_bias_enable: vk::FALSE,
             ..Default::default()
         };
@@ -1599,14 +1599,12 @@ impl VulkanRenderer {
             _pad2: 0,
             _pad3: 0,
             proj_mat: {
-                let mut p = crate::camera::Projection::perspective_wgpu(
+                let p = crate::camera::Projection::perspective_wgpu(
                     scene.camera.fov() as f32,
                     output_w / output_h,
                     scene.camera.perspective_params().0 as f32,
                     scene.camera.perspective_params().1 as f32,
                 );
-                // Correct for Vulkan's inverted Y in clip space
-                p[5] *= -1.0;
                 p
             },
         };

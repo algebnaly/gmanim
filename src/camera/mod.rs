@@ -68,9 +68,11 @@ impl Default for PerspectiveSetting {
 
 impl PerspectiveSetting {
     pub fn get_perspective_project_matrix(&self) -> Matrix4<GMFloat> {
-        Perspective3::new(self.aspect, self.fovy, self.near, self.far)
+        let mut mat = Perspective3::new(self.aspect, self.fovy, self.near, self.far)
             .as_matrix()
-            .to_owned()
+            .to_owned();
+        mat[(1, 1)] *= -1.0;
+        mat
     }
 }
 
