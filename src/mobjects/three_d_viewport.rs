@@ -1,9 +1,9 @@
 use std::f32::INFINITY;
 
-use crate::{math_utils::constants::PI, mobjects::Transform, Color};
+use crate::{Color, math_utils::constants::PI, mobjects::Transform};
 use nalgebra::{Isometry2, Matrix2, Point2, Point3, Point4, RealField};
 
-use crate::{camera::Camera, GMFloat};
+use crate::{GMFloat, camera::Camera};
 
 use super::Draw;
 

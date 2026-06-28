@@ -2,15 +2,15 @@ use std::fs;
 use std::io::Read;
 
 use log::info;
-use rusttype::{point, Font, Scale};
+use rusttype::{Font, Scale, point};
 
 use crate::log_utils::setup_logger;
 use crate::mobjects::Draw;
-use crate::{log_utils, GMFloat};
+use crate::{GMFloat, log_utils};
 use nalgebra::{Point2, Point3, Vector3};
 
 use super::path::PathElement;
-use super::{coordinate_change_x, coordinate_change_y, DrawConfig, Mobject, Transform};
+use super::{DrawConfig, Mobject, Transform, coordinate_change_x, coordinate_change_y};
 
 pub struct Text {
     pub base: crate::mobjects::MobjectBase,

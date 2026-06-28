@@ -207,3 +207,4 @@ pub fn coordinate_change_x(position_x: GMFloat, scene_width: GMFloat) -> GMFloat
 pub fn coordinate_change_y(position_y: GMFloat, scene_height: GMFloat) -> GMFloat {
     scene_height / 2.0 - position_y
 }
+pub mod wrapper_3d;

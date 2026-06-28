@@ -2,7 +2,7 @@ use std::hint::black_box;
 use std::io::{self, Write};
 use std::time::Instant;
 
-use ffmpeg_next::format::{pixel, Pixel};
+use ffmpeg_next::format::{Pixel, pixel};
 
 use ffmpeg_next::Dictionary;
 use ffmpeg_next::{ChannelLayout, StreamMut};
@@ -23,6 +23,7 @@ pub struct FfmpegBackend {
     // scaler: scaling::context::Context,
     frame_count: u64,
     pub frame_size: usize,
+    color_order: crate::video_backend::ColorOrder,
 }
 
 impl FfmpegBackend {
@@ -50,9 +51,15 @@ impl FfmpegBackend {
 
         v_enc.set_width(video_config.output_width);
         v_enc.set_height(video_config.output_height);
-        v_enc.set_format(Pixel::NV12);
+        match video_config.color_order {
+            crate::video_backend::ColorOrder::Yuv444p => v_enc.set_format(Pixel::YUV444P),
+            _ => v_enc.set_format(Pixel::NV12),
+        }
         v_enc.set_time_base((1, video_config.framerate as i32));
         v_enc.set_gop(12);
+        if let Some(br) = video_config.bitrate {
+            v_enc.set_bit_rate(br as usize);
+        }
 
         if global_header {
             v_enc.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
@@ -98,7 +105,13 @@ impl FfmpegBackend {
             v_stream_idx,
             a_stream_idx,
             frame_count: 0,
-            frame_size: (video_config.output_width * video_config.output_height * 3 / 2) as usize,
+            frame_size: match video_config.color_order {
+                crate::video_backend::ColorOrder::Yuv444p => {
+                    (video_config.output_width * video_config.output_height * 3) as usize
+                }
+                _ => (video_config.output_width * video_config.output_height * 3 / 2) as usize,
+            },
+            color_order: video_config.color_order,
         }
     }
 
@@ -108,36 +121,82 @@ impl FfmpegBackend {
 
         let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
         unsafe {
-            output_frame.alloc(Pixel::NV12, width, height);
+            let pix_fmt = match self.color_order {
+                crate::video_backend::ColorOrder::Yuv444p => Pixel::YUV444P,
+                _ => Pixel::NV12,
+            };
+            output_frame.alloc(pix_fmt, width, height);
 
-            // NV12 has 2 planes:
-            // plane 0: Y
-            // plane 1: UV
+            if matches!(self.color_order, crate::video_backend::ColorOrder::Yuv444p) {
+                // YUV444p has 3 planes (Y, U, V), each full resolution WxH
+                let y_stride_out = output_frame.stride(0) as usize;
+                let u_stride_out = output_frame.stride(1) as usize;
+                let v_stride_out = output_frame.stride(2) as usize;
+                let stride_in = width as usize;
 
-            let y_stride_out = output_frame.stride(0) as usize;
-            let y_stride_in = width as usize;
-            let y_out = std::slice::from_raw_parts_mut(
-                output_frame.data_mut(0).as_mut_ptr(),
-                y_stride_out * height as usize,
-            );
-            for row in 0..height as usize {
-                y_out[row * y_stride_out..row * y_stride_out + y_stride_in].copy_from_slice(
-                    &nv12_data[row * y_stride_in..row * y_stride_in + y_stride_in],
+                let y_out = std::slice::from_raw_parts_mut(
+                    output_frame.data_mut(0).as_mut_ptr(),
+                    y_stride_out * height as usize,
                 );
-            }
+                for row in 0..height as usize {
+                    y_out[row * y_stride_out..row * y_stride_out + stride_in]
+                        .copy_from_slice(&nv12_data[row * stride_in..row * stride_in + stride_in]);
+                }
 
-            let uv_stride_out = output_frame.stride(1) as usize;
-            let uv_stride_in = width as usize;
-            let uv_out = std::slice::from_raw_parts_mut(
-                output_frame.data_mut(1).as_mut_ptr(),
-                uv_stride_out * (height / 2) as usize,
-            );
-            let uv_in_offset = (width * height) as usize;
-            for row in 0..(height / 2) as usize {
-                uv_out[row * uv_stride_out..row * uv_stride_out + uv_stride_in].copy_from_slice(
-                    &nv12_data[uv_in_offset + row * uv_stride_in
-                        ..uv_in_offset + row * uv_stride_in + uv_stride_in],
+                let u_offset = (width * height) as usize;
+                let u_out = std::slice::from_raw_parts_mut(
+                    output_frame.data_mut(1).as_mut_ptr(),
+                    u_stride_out * height as usize,
                 );
+                for row in 0..height as usize {
+                    u_out[row * u_stride_out..row * u_stride_out + stride_in].copy_from_slice(
+                        &nv12_data
+                            [u_offset + row * stride_in..u_offset + row * stride_in + stride_in],
+                    );
+                }
+
+                let v_offset = u_offset + (width * height) as usize;
+                let v_out = std::slice::from_raw_parts_mut(
+                    output_frame.data_mut(2).as_mut_ptr(),
+                    v_stride_out * height as usize,
+                );
+                for row in 0..height as usize {
+                    v_out[row * v_stride_out..row * v_stride_out + stride_in].copy_from_slice(
+                        &nv12_data
+                            [v_offset + row * stride_in..v_offset + row * stride_in + stride_in],
+                    );
+                }
+            } else {
+                // NV12 has 2 planes:
+                // plane 0: Y
+                // plane 1: UV
+
+                let y_stride_out = output_frame.stride(0) as usize;
+                let y_stride_in = width as usize;
+                let y_out = std::slice::from_raw_parts_mut(
+                    output_frame.data_mut(0).as_mut_ptr(),
+                    y_stride_out * height as usize,
+                );
+                for row in 0..height as usize {
+                    y_out[row * y_stride_out..row * y_stride_out + y_stride_in].copy_from_slice(
+                        &nv12_data[row * y_stride_in..row * y_stride_in + y_stride_in],
+                    );
+                }
+
+                let uv_stride_out = output_frame.stride(1) as usize;
+                let uv_stride_in = width as usize;
+                let uv_out = std::slice::from_raw_parts_mut(
+                    output_frame.data_mut(1).as_mut_ptr(),
+                    uv_stride_out * (height / 2) as usize,
+                );
+                let uv_in_offset = (width * height) as usize;
+                for row in 0..(height / 2) as usize {
+                    uv_out[row * uv_stride_out..row * uv_stride_out + uv_stride_in]
+                        .copy_from_slice(
+                            &nv12_data[uv_in_offset + row * uv_stride_in
+                                ..uv_in_offset + row * uv_stride_in + uv_stride_in],
+                        );
+                }
             }
         }
 
@@ -189,12 +248,12 @@ fn do_scale(
     input_frame: &ffmpeg_next::util::frame::Video,
     output_frame: &mut ffmpeg_next::util::frame::Video,
 ) {
-    use yuv::rgba_to_yuv420;
     use yuv::BufferStoreMut;
     use yuv::YuvConversionMode;
     use yuv::YuvPlanarImageMut;
     use yuv::YuvRange;
     use yuv::YuvStandardMatrix;
+    use yuv::rgba_to_yuv420;
 
     let y_stride = output_frame.plane_width(0);
     let u_stride = output_frame.plane_width(1);
@@ -372,12 +431,12 @@ fn test_bench_scaler() {
 
     let now = Instant::now();
 
-    use yuv::rgba_to_yuv420;
     use yuv::BufferStoreMut;
     use yuv::YuvConversionMode;
     use yuv::YuvPlanarImageMut;
     use yuv::YuvRange;
     use yuv::YuvStandardMatrix;
+    use yuv::rgba_to_yuv420;
 
     let y_stride = output_frame.plane_width(0);
     let u_stride = output_frame.plane_width(1);

@@ -8,8 +8,8 @@ use nalgebra::Point3;
 use std::f32::consts::PI;
 
 use crate::{
-    mobjects::{Draw, DrawConfig, Mobject, Transform},
     Color, Context, GMFloat,
+    mobjects::{Draw, DrawConfig, Mobject, Transform},
 };
 
 pub struct Dot {

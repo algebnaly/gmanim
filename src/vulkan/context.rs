@@ -1,4 +1,4 @@
-use ash::{vk, Device, Entry, Instance};
+use ash::{Device, Entry, Instance, vk};
 use gpu_allocator::vulkan::{Allocator, AllocatorCreateDesc};
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex, OnceLock};

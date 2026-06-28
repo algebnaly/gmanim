@@ -1,16 +1,16 @@
 use std::{fs, io::Read};
 
 use nalgebra::Vector2;
-use usvg::{tiny_skia_path::PathSegment, Group, Node};
+use usvg::{Group, Node, tiny_skia_path::PathSegment};
 
 use crate::{
-    math_utils::{point2d_to_point3d, point3d_to_point2d},
     Context, GMFloat, Scene,
+    math_utils::{point2d_to_point3d, point3d_to_point2d},
 };
 
 use super::{
-    coordinate_change_x, coordinate_change_y, group::MobjectGroup, path::PathElement, Draw,
-    DrawConfig, Mobject, Transform,
+    Draw, DrawConfig, Mobject, Transform, coordinate_change_x, coordinate_change_y,
+    group::MobjectGroup, path::PathElement,
 };
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;

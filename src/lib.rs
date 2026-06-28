@@ -71,8 +71,21 @@ pub struct SceneConfig {
     pub output_width: u32,
     pub output_height: u32,
     pub scale_factor: GMFloat,
+}
+
+#[derive(Clone, Copy)]
+pub struct RendererConfig {
     pub msaa_samples: u32,
     pub ssaa_factor: u32,
+}
+
+impl Default for RendererConfig {
+    fn default() -> Self {
+        Self {
+            msaa_samples: 8,
+            ssaa_factor: 1,
+        }
+    }
 }
 
 pub struct Context {
@@ -94,8 +107,6 @@ impl Context {
                 output_width,
                 output_height,
                 scale_factor,
-                msaa_samples: 8,
-                ssaa_factor: 1,
             },
         }
     }
@@ -118,8 +129,6 @@ impl Default for SceneConfig {
             output_width: 1920,
             output_height: 1080,
             scale_factor: 1920.0 / 16.0,
-            msaa_samples: 8,
-            ssaa_factor: 1,
         }
     }
 }

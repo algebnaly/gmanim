@@ -451,6 +451,8 @@ pub struct RenderCache {
     pub output_buffers: [Buffer; 3],
     pub nv12_output_buffers: [Buffer; 3],
     pub nv12_descriptor_sets: [vk::DescriptorSet; 3],
+    pub yuv444p_output_buffers: [Buffer; 3],
+    pub yuv444p_descriptor_sets: [vk::DescriptorSet; 3],
     pub video_nv12_images: Vec<VideoNv12Image>,
     pub video_nv12_descriptor_sets: Vec<vk::DescriptorSet>,
     pub video_nv12_layouts: Vec<vk::ImageLayout>,
@@ -480,6 +482,9 @@ impl RenderCache {
         for buf in &mut self.nv12_output_buffers {
             buf.destroy(ctx);
         }
+        for buf in &mut self.yuv444p_output_buffers {
+            buf.destroy(ctx);
+        }
         for image in &mut self.video_nv12_images {
             image.destroy(ctx);
         }
@@ -497,6 +502,7 @@ pub struct RenderOutputs {
     pub cpu_nv12: bool,
     pub vulkan_video: bool,
     pub cpu_rgba: bool,
+    pub cpu_yuv444p: bool,
 }
 
 impl RenderOutputs {
@@ -504,12 +510,14 @@ impl RenderOutputs {
         cpu_nv12: true,
         vulkan_video: true,
         cpu_rgba: true,
+        cpu_yuv444p: true,
     };
 
     pub const VULKAN_VIDEO_ONLY: Self = Self {
         cpu_nv12: false,
         vulkan_video: true,
         cpu_rgba: false,
+        cpu_yuv444p: false,
     };
 }
 
@@ -534,6 +542,7 @@ pub struct VulkanRenderer {
     nv12_pipeline: vk::Pipeline,
     video_nv12_pipeline_layout: vk::PipelineLayout,
     video_nv12_pipeline: vk::Pipeline,
+    yuv444p_pipeline: vk::Pipeline,
 
     render_pass: vk::RenderPass,
     raster_pipeline_layout: vk::PipelineLayout,
@@ -557,7 +566,9 @@ pub struct VulkanRenderer {
 }
 
 impl VulkanRenderer {
-    pub fn new(ctx: Arc<VulkanContext>, msaa_samples: u32, ssaa_factor: u32) -> Self {
+    pub fn new(ctx: Arc<VulkanContext>, config: crate::RendererConfig) -> Self {
+        let msaa_samples = config.msaa_samples;
+        let ssaa_factor = config.ssaa_factor;
         let requested_sample_count = msaa_to_vk_sample_count(msaa_samples);
         let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
 
@@ -566,6 +577,7 @@ impl VulkanRenderer {
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
         let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
         let video_nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12_image.wgsl"));
+        let yuv444p_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_yuv444p.wgsl"));
         let composite_shader = compile_wgsl_full(&ctx, include_str!("composite_shader.wgsl"));
 
         let composite_bindings = [
@@ -731,6 +743,29 @@ impl VulkanRenderer {
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&video_nv12_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+
+        let yuv444p_stage = vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: vk::ShaderStageFlags::COMPUTE,
+            module: yuv444p_shader,
+            p_name: main_name.as_ptr(),
+            ..Default::default()
+        };
+        let yuv444p_pipeline_info = vk::ComputePipelineCreateInfo {
+            s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+            stage: yuv444p_stage,
+            layout: nv12_pipeline_layout,
+            ..Default::default()
+        };
+        let yuv444p_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&yuv444p_pipeline_info),
                     None,
                 )
                 .unwrap()[0]
@@ -1342,6 +1377,7 @@ impl VulkanRenderer {
             ctx.device.destroy_shader_module(raster_shader_2d, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
             ctx.device.destroy_shader_module(video_nv12_shader, None);
+            ctx.device.destroy_shader_module(yuv444p_shader, None);
             ctx.device.destroy_shader_module(composite_shader, None);
         }
 
@@ -1362,6 +1398,7 @@ impl VulkanRenderer {
             nv12_pipeline,
             video_nv12_pipeline_layout,
             video_nv12_pipeline,
+            yuv444p_pipeline,
             render_pass,
             raster_pipeline_layout,
             raster_pipeline,
@@ -1752,6 +1789,28 @@ impl VulkanRenderer {
                 ),
             ];
 
+            let yuv444p_buffer_size = (width * height * 3) as u64;
+            let yuv444p_output_buffers = [
+                Buffer::new(
+                    &self.ctx,
+                    yuv444p_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    yuv444p_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+                Buffer::new(
+                    &self.ctx,
+                    yuv444p_buffer_size,
+                    vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    gpu_allocator::MemoryLocation::GpuToCpu,
+                ),
+            ];
+
             let alloc_info = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
                 descriptor_pool: self.descriptor_pool,
@@ -1824,6 +1883,22 @@ impl VulkanRenderer {
             };
             let nv12_descriptor_sets: [vk::DescriptorSet; 3] =
                 nv12_descriptor_sets_vec.try_into().unwrap();
+
+            let yuv444p_alloc_info = vk::DescriptorSetAllocateInfo {
+                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptor_pool: self.descriptor_pool,
+                descriptor_set_count: 3,
+                p_set_layouts: nv12_layouts.as_ptr(),
+                ..Default::default()
+            };
+            let yuv444p_descriptor_sets_vec = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&yuv444p_alloc_info)
+                    .unwrap()
+            };
+            let yuv444p_descriptor_sets: [vk::DescriptorSet; 3] =
+                yuv444p_descriptor_sets_vec.try_into().unwrap();
 
             let video_nv12_images = (0..VIDEO_NV12_IMAGE_COUNT)
                 .map(|_| VideoNv12Image::new(&self.ctx, width, height))
@@ -1988,6 +2063,45 @@ impl VulkanRenderer {
                 });
             }
 
+            let mut yuv444p_buffer_infos = Vec::new();
+            for i in 0..3 {
+                yuv444p_buffer_infos.push(vk::DescriptorBufferInfo {
+                    buffer: yuv444p_output_buffers[i].vk_buffer,
+                    offset: 0,
+                    range: vk::WHOLE_SIZE,
+                });
+            }
+
+            for i in 0..3 {
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: yuv444p_descriptor_sets[i],
+                    dst_binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &image_info,
+                    ..Default::default()
+                });
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: yuv444p_descriptor_sets[i],
+                    dst_binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_count: 1,
+                    p_buffer_info: &yuv444p_buffer_infos[i],
+                    ..Default::default()
+                });
+                write_descriptor_sets.push(vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: yuv444p_descriptor_sets[i],
+                    dst_binding: 2,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_count: 1,
+                    p_buffer_info: &nv12_constants_buffer_info,
+                    ..Default::default()
+                });
+            }
+
             let mut video_nv12_input_infos = Vec::new();
             let mut video_nv12_y_infos = Vec::new();
             let mut video_nv12_uv_infos = Vec::new();
@@ -2077,6 +2191,8 @@ impl VulkanRenderer {
                 output_buffers,
                 nv12_output_buffers,
                 nv12_descriptor_sets,
+                yuv444p_output_buffers,
+                yuv444p_descriptor_sets,
                 video_nv12_images,
                 video_nv12_descriptor_sets,
                 video_nv12_layouts,
@@ -2416,6 +2532,27 @@ impl VulkanRenderer {
                     .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
             }
 
+            if outputs.cpu_yuv444p {
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.yuv444p_pipeline,
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.nv12_pipeline_layout,
+                    0,
+                    std::slice::from_ref(&cache.yuv444p_descriptor_sets[frame_idx]),
+                    &[],
+                );
+                let workgroup_x = (width / 4 + 15) / 16;
+                let workgroup_y = (height + 15) / 16;
+                self.ctx
+                    .device
+                    .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
+            }
+
             if outputs.vulkan_video {
                 let video_nv12_image = &cache.video_nv12_images[video_frame_idx];
                 let video_nv12_barrier = vk::ImageMemoryBarrier {
@@ -2594,6 +2731,34 @@ impl VulkanRenderer {
             if let Some(alloc) = &cache.nv12_output_buffers[read_frame_idx].allocation {
                 if let Some(mapped) = alloc.mapped_ptr() {
                     let len = (cache.width * cache.height * 3 / 2) as usize;
+                    return Some(unsafe {
+                        std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len)
+                    });
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_yuv444p_bytes(&self) -> Option<&[u8]> {
+        let guard = self.cache.lock().unwrap();
+        if let Some(cache) = guard.as_ref() {
+            if cache.current_frame == 0 {
+                return None;
+            }
+            let read_frame_idx = (cache.current_frame - 1) % 3;
+            let read_fd = &self.frame_data[read_frame_idx];
+
+            unsafe {
+                self.ctx
+                    .device
+                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
+                    .unwrap();
+            }
+
+            if let Some(alloc) = &cache.yuv444p_output_buffers[read_frame_idx].allocation {
+                if let Some(mapped) = alloc.mapped_ptr() {
+                    let len = (cache.width * cache.height * 3) as usize;
                     return Some(unsafe {
                         std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len)
                     });

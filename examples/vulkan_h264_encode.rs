@@ -2,11 +2,11 @@ use std::io;
 use std::process::Command;
 
 use gmanim_core::{
+    Color, Context, GMFloat, Scene, SceneConfig,
     animation::{Animation, Timeline},
     math_utils::constants::PI,
     mobjects::{Rectangle, Transform},
-    video_backend::{vulkan_h264::VulkanH264Backend, ColorOrder, VideoConfig},
-    Color, Context, GMFloat, Scene, SceneConfig,
+    video_backend::{ColorOrder, VideoConfig, vulkan_h264::VulkanH264Backend},
 };
 
 struct OrbitRects {
@@ -48,9 +48,7 @@ fn main() -> io::Result<()> {
             height: 9.0,
             output_width: width,
             output_height: height,
-            scale_factor: height as GMFloat / 9.0,
-            msaa_samples: 16,
-            ssaa_factor: 1,
+            scale_factor: 1920.0 / 16.0,
         },
     };
 
@@ -93,9 +91,24 @@ fn main() -> io::Result<()> {
 
     let start = std::time::Instant::now();
     let mut rendered = 0u32;
-    while timeline.step_frame_for_vulkan_video() {
-        let frame = timeline
-            .vulkan_video_frame()
+    let vk_ctx = pollster::block_on(gmanim_core::vulkan::context::VulkanContext::new()).unwrap();
+    let mut renderer = gmanim_core::vulkan::renderer::VulkanRenderer::new(
+        std::sync::Arc::new(vk_ctx),
+        gmanim_core::RendererConfig {
+            msaa_samples: 16,
+            ssaa_factor: 1,
+        },
+    );
+
+    while timeline.advance_frame() {
+        renderer.render_scene_with_outputs(
+            &timeline.scene,
+            &timeline.ctx.scene_config,
+            None,
+            gmanim_core::vulkan::renderer::RenderOutputs::VULKAN_VIDEO_ONLY,
+        );
+        let frame = renderer
+            .get_vulkan_video_frame()
             .ok_or_else(|| io::Error::other("renderer did not produce a Vulkan video frame"))?;
         backend.submit_vulkan_frame(frame)?;
         rendered += 1;

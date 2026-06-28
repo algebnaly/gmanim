@@ -1,6 +1,6 @@
-use crate::mobjects::{Draw, Mobject, Transform};
 use crate::Color;
 use crate::GMFloat;
+use crate::mobjects::{Draw, Mobject, Transform};
 use lyon::tessellation::{
     FillVertex, FillVertexConstructor, StrokeVertex, StrokeVertexConstructor,
 };

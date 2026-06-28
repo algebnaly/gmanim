@@ -1,8 +1,8 @@
 use nalgebra::Vector2;
 
 use crate::{
-    mobjects::{coordinate_change_x, coordinate_change_y},
     Color, Context, GMFloat,
+    mobjects::{coordinate_change_x, coordinate_change_y},
 };
 
 pub mod constants;

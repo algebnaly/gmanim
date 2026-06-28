@@ -67,17 +67,18 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     let light_pos = vec3<f32>(10.0, 10.0, 10.0);
     let light_color = vec3<f32>(1.0, 1.0, 1.0);
     let ambient = 0.2;
     
     let norm = normalize(in.normal);
+    let final_norm = select(-norm, norm, is_front);
     let light_dir = normalize(light_pos - in.frag_pos);
-    let diff = max(dot(norm, light_dir), 0.0);
+    let diff = max(dot(final_norm, light_dir), 0.0);
     
     let view_dir = normalize(camera.pos - in.frag_pos);
-    let reflect_dir = reflect(-light_dir, norm);
+    let reflect_dir = reflect(-light_dir, final_norm);
     let spec = pow(max(dot(view_dir, reflect_dir), 0.0), 32.0);
     
     let result = (ambient + diff + spec) * in.color.rgb;

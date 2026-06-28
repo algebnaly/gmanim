@@ -25,15 +25,15 @@ use std::ffi::{CStr, CString};
 use std::io;
 use std::path::Path;
 use std::ptr;
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, sync_channel};
 use std::thread::{self, JoinHandle};
 
 use std::{error::Error, fmt};
 
 use ffmpeg_next::ffi;
 use yuv::{
-    bgra_to_yuv_nv12, rgba_to_yuv_nv12, BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode,
-    YuvRange, YuvStandardMatrix,
+    BufferStoreMut, YuvBiPlanarImageMut, YuvConversionMode, YuvRange, YuvStandardMatrix,
+    bgra_to_yuv_nv12, rgba_to_yuv_nv12,
 };
 
 use crate::video_backend::{ColorOrder, VideoConfig};
@@ -74,8 +74,8 @@ fn check(context: &'static str, code: i32) -> io::Result<()> {
 // Encoder — synchronous, single-threaded H.264 encoder (private)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Number of pre-allocated GPU surfaces for round-robin encoding.
-const HW_FRAME_POOL_SIZE: usize = 16;
+/// Number of pre-allocated// 0 means dynamic allocation. This avoids deadlocks when the encoder holds many frames.
+const HW_FRAME_POOL_SIZE: usize = 0;
 
 /// Synchronous VAAPI H.264 encoder (internal implementation detail).
 ///
@@ -91,20 +91,17 @@ struct Encoder {
     // VAAPI device & frame pool
     device_ref: *mut ffi::AVBufferRef,
     frames_ref: *mut ffi::AVBufferRef,
-    hw_frames: Vec<*mut ffi::AVFrame>,
-    next_hw_frame: usize,
 
     // CPU-side staging frame (NV12)
     sw_frame: *mut ffi::AVFrame,
-
-    // Reusable packet
     packet: *mut ffi::AVPacket,
 
-    // State
     width: usize,
     height: usize,
     color_order: ColorOrder,
+
     frame_count: i64,
+    in_flight_frames: usize,
     closed: bool,
 }
 
@@ -185,7 +182,7 @@ impl Encoder {
         (*frames_ctx).sw_format = ffi::AVPixelFormat::AV_PIX_FMT_NV12;
         (*frames_ctx).width = config.output_width as i32;
         (*frames_ctx).height = config.output_height as i32;
-        (*frames_ctx).initial_pool_size = HW_FRAME_POOL_SIZE as i32;
+        (*frames_ctx).initial_pool_size = 64; // fixed pool size
         check("av_hwframe_ctx_init", ffi::av_hwframe_ctx_init(frames_ref))?;
 
         // Codec context
@@ -225,7 +222,6 @@ impl Encoder {
 
         // Allocate frames
         let sw_frame = Self::alloc_sw_frame(config)?;
-        let hw_frames = Self::alloc_hw_frames(frames_ref, config)?;
         let packet = ffi::av_packet_alloc();
         if packet.is_null() {
             return Err(io::Error::other("av_packet_alloc failed"));
@@ -237,14 +233,13 @@ impl Encoder {
             codec_ctx,
             device_ref,
             frames_ref,
-            hw_frames,
-            next_hw_frame: 0,
             sw_frame,
             packet,
             width: config.output_width as usize,
             height: config.output_height as usize,
             color_order: config.color_order,
             frame_count: 0,
+            in_flight_frames: 0,
             closed: false,
         })
     }
@@ -269,7 +264,7 @@ impl Encoder {
             num: config.framerate as i32,
             den: 1,
         };
-        (*ctx).bit_rate = 2_000_000;
+        (*ctx).bit_rate = config.bitrate.unwrap_or(2_000_000) as i64;
         (*ctx).gop_size = config.framerate as i32;
         (*ctx).max_b_frames = 0;
         (*ctx).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
@@ -294,33 +289,6 @@ impl Encoder {
         check("av_frame_get_buffer", ffi::av_frame_get_buffer(frame, 32))?;
         Ok(frame)
     }
-
-    #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn alloc_hw_frames(
-        frames_ref: *mut ffi::AVBufferRef,
-        config: &VideoConfig,
-    ) -> io::Result<Vec<*mut ffi::AVFrame>> {
-        let mut frames = Vec::with_capacity(HW_FRAME_POOL_SIZE);
-        for _ in 0..HW_FRAME_POOL_SIZE {
-            let frame = ffi::av_frame_alloc();
-            if frame.is_null() {
-                return Err(io::Error::other("av_frame_alloc for hw_frame failed"));
-            }
-            (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
-            (*frame).width = config.output_width as i32;
-            (*frame).height = config.output_height as i32;
-            (*frame).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
-            if (*frame).hw_frames_ctx.is_null() {
-                return Err(io::Error::other("av_buffer_ref for hw_frame failed"));
-            }
-            check(
-                "av_hwframe_get_buffer",
-                ffi::av_hwframe_get_buffer(frames_ref, frame, 0),
-            )?;
-            frames.push(frame);
-        }
-        Ok(frames)
-    }
 }
 
 // --- Frame encoding ---
@@ -329,15 +297,22 @@ impl Encoder {
     /// Encode one RGBA/BGRA frame (convert → upload → encode, synchronously).
     #[allow(unsafe_op_in_unsafe_fn)]
     fn write_frame(&mut self, frame_data: &[u8]) {
-        assert_eq!(frame_data.len(), self.width * self.height * 4);
-
         unsafe {
+            // Prevent deadlock by limiting in-flight frames to 10
+            while self.in_flight_frames >= 10 {
+                if self.drain_packets_once().unwrap() {
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+
             // 1. Convert RGBA → NV12
             check(
                 "av_frame_make_writable",
                 ffi::av_frame_make_writable(self.sw_frame),
             )
             .unwrap();
+
             convert_rgba_to_nv12(
                 self.sw_frame,
                 frame_data,
@@ -347,28 +322,40 @@ impl Encoder {
             );
             (*self.sw_frame).pts = self.frame_count;
 
-            // 2. Upload NV12 → GPU surface
-            let hw_frame = self.next_hw_surface();
+            // 2. Allocate hardware frame
+            let mut hw_frame = ffi::av_frame_alloc();
+            (*hw_frame).format = ffi::AVPixelFormat::AV_PIX_FMT_VAAPI as i32;
+            (*hw_frame).hw_frames_ctx = ffi::av_buffer_ref(self.frames_ref);
             check(
-                "av_frame_make_writable",
-                ffi::av_frame_make_writable(hw_frame),
+                "av_hwframe_get_buffer",
+                ffi::av_hwframe_get_buffer(self.frames_ref, hw_frame, 0),
             )
             .unwrap();
+
+            // 3. Upload NV12 to VAAPI surface
             check(
                 "av_hwframe_transfer_data",
                 ffi::av_hwframe_transfer_data(hw_frame, self.sw_frame, 0),
             )
             .unwrap();
+
+            // 4. Encode
             (*hw_frame).pts = self.frame_count;
+            loop {
+                let ret = ffi::avcodec_send_frame(self.codec_ctx, hw_frame);
+                if ret == ffi::AVERROR(ffi::EAGAIN) {
+                    if !self.drain_packets_once().unwrap() {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    continue;
+                }
+                check("avcodec_send_frame", ret).unwrap();
+                break;
+            }
 
-            // 3. Encode + mux
-            check(
-                "avcodec_send_frame",
-                ffi::avcodec_send_frame(self.codec_ctx, hw_frame),
-            )
-            .unwrap();
+            self.in_flight_frames += 1;
+            ffi::av_frame_free(&mut hw_frame);
             self.drain_packets().unwrap();
-
             self.frame_count += 1;
         }
     }
@@ -382,9 +369,10 @@ impl Encoder {
         unsafe {
             check(
                 "avcodec_send_frame (flush)",
-                ffi::avcodec_send_frame(self.codec_ctx, ptr::null()),
-            )?;
-            self.drain_packets()?;
+                ffi::avcodec_send_frame(self.codec_ctx, ptr::null_mut()),
+            )
+            .unwrap();
+            self.drain_packets().unwrap();
             check("av_write_trailer", ffi::av_write_trailer(self.format_ctx))?;
         }
         self.closed = true;
@@ -392,34 +380,39 @@ impl Encoder {
         Ok(())
     }
 
-    fn next_hw_surface(&mut self) -> *mut ffi::AVFrame {
-        let frame = self.hw_frames[self.next_hw_frame];
-        self.next_hw_frame = (self.next_hw_frame + 1) % self.hw_frames.len();
-        frame
-    }
-
     /// Drain all available encoded packets from the encoder and write to muxer.
     #[allow(unsafe_op_in_unsafe_fn)]
-    unsafe fn drain_packets(&mut self) -> io::Result<()> {
-        loop {
-            let ret = ffi::avcodec_receive_packet(self.codec_ctx, self.packet);
-            if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
-                return Ok(());
-            }
-            check("avcodec_receive_packet", ret)?;
-
-            ffi::av_packet_rescale_ts(
-                self.packet,
-                (*self.codec_ctx).time_base,
-                (*self.stream).time_base,
-            );
-            (*self.packet).stream_index = (*self.stream).index;
-            check(
-                "av_interleaved_write_frame",
-                ffi::av_interleaved_write_frame(self.format_ctx, self.packet),
-            )?;
-            ffi::av_packet_unref(self.packet);
+    unsafe fn drain_packets_once(&mut self) -> io::Result<bool> {
+        let ret = ffi::avcodec_receive_packet(self.codec_ctx, self.packet);
+        if ret == ffi::AVERROR(ffi::EAGAIN) || ret == ffi::AVERROR_EOF {
+            return Ok(false);
         }
+        check("avcodec_receive_packet", ret)?;
+
+        ffi::av_packet_rescale_ts(
+            self.packet,
+            (*self.codec_ctx).time_base,
+            (*self.stream).time_base,
+        );
+        (*self.packet).stream_index = (*self.stream).index;
+        // eprintln!("drain_packets_once: av_interleaved_write_frame");
+        check(
+            "av_interleaved_write_frame",
+            ffi::av_interleaved_write_frame(self.format_ctx, self.packet),
+        )?;
+        // eprintln!("drain_packets_once: av_packet_unref");
+        ffi::av_packet_unref(self.packet);
+
+        if self.in_flight_frames > 0 {
+            self.in_flight_frames -= 1;
+        }
+        Ok(true)
+    }
+
+    #[allow(unsafe_op_in_unsafe_fn)]
+    unsafe fn drain_packets(&mut self) -> io::Result<()> {
+        while self.drain_packets_once()? {}
+        Ok(())
     }
 }
 
@@ -431,9 +424,6 @@ impl Drop for Encoder {
         unsafe {
             if !self.packet.is_null() {
                 ffi::av_packet_free(&mut self.packet);
-            }
-            for hw in self.hw_frames.drain(..) {
-                ffi::av_frame_free(&mut (hw as *mut _));
             }
             if !self.sw_frame.is_null() {
                 ffi::av_frame_free(&mut self.sw_frame);
@@ -505,7 +495,15 @@ impl FfmpegVaapiBackend {
     /// Create with configurable queue depth.
     pub fn try_new(config: &VideoConfig, queue_depth: usize) -> io::Result<Self> {
         let config_clone = config.clone();
-        let frame_size = config.output_width as usize * config.output_height as usize * 4;
+        let frame_size = match config.color_order {
+            ColorOrder::Nv12 => {
+                let y_size = config.output_width as usize * config.output_height as usize;
+                let uv_size = config.output_width as usize * config.output_height as usize / 2;
+                y_size + uv_size
+            }
+            ColorOrder::Yuv444p => config.output_width as usize * config.output_height as usize * 3,
+            _ => config.output_width as usize * config.output_height as usize * 4,
+        };
         let encoder = Encoder::try_new(&config_clone, "/dev/dri/renderD128")?;
 
         let (sender, receiver) = sync_channel(queue_depth);
@@ -513,13 +511,17 @@ impl FfmpegVaapiBackend {
 
         let worker = thread::spawn(move || {
             let mut encoder = encoder;
+            let mut frames_processed = 0;
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WorkerMessage::Frame(buf) => {
+                        frames_processed += 1;
                         encoder.write_frame(&buf);
-                        let _ = recycle_tx.send(buf); // recycle to pool
+                        let _ = recycle_tx.try_send(buf); // recycle to pool if space, otherwise drop
                     }
-                    WorkerMessage::Finish => break,
+                    WorkerMessage::Finish => {
+                        break;
+                    }
                 }
             }
             encoder.finish()
@@ -628,7 +630,7 @@ fn convert_rgba_to_nv12(
         let convert = match color_order {
             ColorOrder::Rgba => rgba_to_yuv_nv12,
             ColorOrder::Bgra => bgra_to_yuv_nv12,
-            ColorOrder::Nv12 => unreachable!(),
+            ColorOrder::Nv12 | ColorOrder::Yuv444p => unreachable!(),
         };
         convert(
             &mut image,

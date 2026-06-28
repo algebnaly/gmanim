@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::fmt::Display;
 use std::io;
-use std::sync::mpsc::{self, channel, Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, channel};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -40,6 +40,7 @@ pub enum ColorOrder {
     Bgra,
     Rgba,
     Nv12,
+    Yuv444p,
 }
 
 impl Display for ColorOrder {
@@ -50,6 +51,7 @@ impl Display for ColorOrder {
             }
             ColorOrder::Rgba => f.write_str("rgba"),
             ColorOrder::Nv12 => f.write_str("nv12"),
+            ColorOrder::Yuv444p => f.write_str("yuv444p"),
         }
     }
 }
@@ -156,6 +158,7 @@ impl VideoBackend {
 struct FfmpegPipeOutputOptionBuilder {
     high_quality: bool,
     encoder: FfmpegPipeEncoder,
+    color_order: ColorOrder,
 }
 
 impl FfmpegPipeOutputOptionBuilder {
@@ -206,7 +209,7 @@ impl FfmpegPipeOutputOptionBuilder {
         };
         // vaapi only support "vaapi" pix_fmt
         if !matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
-            if self.high_quality {
+            if matches!(self.color_order, ColorOrder::Yuv444p) {
                 quality_options.extend(["-pix_fmt", "yuv444p"]);
             } else {
                 quality_options.extend(["-pix_fmt", "yuv420p"]);
@@ -243,6 +246,7 @@ impl FfmpegPipeBackend {
         let encoder_option_builder = FfmpegPipeOutputOptionBuilder {
             high_quality: high_profile,
             encoder: encoder_config,
+            color_order: video_config.color_order,
         };
 
         encoder_option_builder.build_option(&mut args);
@@ -263,7 +267,12 @@ impl FfmpegPipeBackend {
             closed: false,
             frame_size: match video_config.color_order {
                 ColorOrder::Nv12 => {
-                    (video_config.output_width * video_config.output_height * 3 / 2) as usize
+                    let y_size = video_config.output_width * video_config.output_height;
+                    let uv_size = video_config.output_width * video_config.output_height / 2;
+                    (y_size + uv_size) as usize
+                }
+                ColorOrder::Yuv444p => {
+                    (video_config.output_width * video_config.output_height * 3) as usize
                 }
                 _ => (video_config.output_width * video_config.output_height * 4) as usize,
             },

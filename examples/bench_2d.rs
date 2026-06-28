@@ -1,9 +1,9 @@
 use gmanim_core::{
+    Color, Context, GMFloat, Scene, SceneConfig,
     animation::{Animation, Timeline},
     math_utils::constants::PI,
     mobjects::{Rectangle, Transform},
     video_backend::{ColorOrder, VideoBackend, VideoBackendType, VideoConfig},
-    Color, Context, GMFloat, Scene, SceneConfig,
 };
 
 struct RotateRectangles {
@@ -39,9 +39,7 @@ fn main() {
             height: 9.0,
             output_width: width,
             output_height: height,
-            scale_factor: height as GMFloat / 9.0,
-            msaa_samples: 8,
-            ssaa_factor: 2,
+            scale_factor: 1920.0 / 16.0,
         },
     };
 
@@ -94,9 +92,19 @@ fn main() {
     let start_time = std::time::Instant::now();
 
     let mut frames_rendered = 0;
-    while timeline.step_frame() {
+    let vk_ctx = pollster::block_on(gmanim_core::vulkan::context::VulkanContext::new()).unwrap();
+    let mut renderer = gmanim_core::vulkan::renderer::VulkanRenderer::new(
+        std::sync::Arc::new(vk_ctx),
+        gmanim_core::RendererConfig {
+            msaa_samples: 8,
+            ssaa_factor: 2,
+        },
+    );
+
+    while timeline.advance_frame() {
         frames_rendered += 1;
-        if let Some(nv12_bytes) = timeline.nv12_image_bytes() {
+        renderer.render_scene(&timeline.scene, &timeline.ctx.scene_config, None);
+        if let Some(nv12_bytes) = renderer.get_nv12_bytes() {
             let mut buf = video_backend.acquire_buffer();
             buf.as_mut_slice().copy_from_slice(nv12_bytes);
             video_backend.submit_frame(buf);

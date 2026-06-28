@@ -1,7 +1,7 @@
 use nalgebra::Point3;
 use std::f32::consts::PI;
 
-use crate::{math_utils::k_for_bezier_arc, Color, Context, GMFloat, Scene};
+use crate::{Color, Context, GMFloat, Scene, math_utils::k_for_bezier_arc};
 
 use super::{Draw, DrawConfig, Mobject, Transform};
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
@@ -353,7 +353,7 @@ impl PolyLine {
                 builder.line_to(point(p.x as f32, p.y as f32));
             }
         }
-        builder.end(false);
+        builder.end(self.draw_config.fill);
         let path = builder.build();
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
@@ -364,6 +364,17 @@ impl PolyLine {
             c.b as f32 / 255.0,
             c.a as f32 / 255.0,
         ];
+
+        if self.draw_config.fill {
+            let mut fill_tess = FillTessellator::new();
+            fill_tess
+                .tessellate_path(
+                    &path,
+                    &FillOptions::default(),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                )
+                .unwrap();
+        }
 
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();

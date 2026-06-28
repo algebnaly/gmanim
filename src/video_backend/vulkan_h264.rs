@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use ash::khr;
 use ash::vk;
+use ash::vk::Handle;
 use ash::vk::native::{
     StdVideoEncodeH264PictureInfo, StdVideoEncodeH264PictureInfoFlags,
     StdVideoEncodeH264ReferenceInfo, StdVideoEncodeH264ReferenceListsInfo,
@@ -20,7 +21,6 @@ use ash::vk::native::{
     StdVideoH264SliceType_STD_VIDEO_H264_SLICE_TYPE_P, StdVideoH264SpsFlags,
     StdVideoH264SpsVuiFlags,
 };
-use ash::vk::Handle;
 
 use crate::video_backend::VideoConfig;
 use crate::vulkan::context::VulkanContext;

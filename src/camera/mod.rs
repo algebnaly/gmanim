@@ -1,5 +1,5 @@
-use crate::math_utils::constants::PI;
 use crate::GMFloat;
+use crate::math_utils::constants::PI;
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3, Vector4};
 use usvg::tiny_skia_path::Scalar;
 
