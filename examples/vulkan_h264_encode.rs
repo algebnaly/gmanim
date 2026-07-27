@@ -6,7 +6,7 @@ use gmanim_core::{
     animation::{Animation, Timeline},
     math_utils::constants::PI,
     mobjects::{Rectangle, Transform},
-    video_backend::{ColorOrder, VideoConfig, vulkan_h264::VulkanH264Backend},
+    video_backend::{ColorOrder, VideoConfig, vulkan_h264::AsyncVulkanH264Backend},
 };
 
 struct OrbitRects {
@@ -88,7 +88,7 @@ fn main() -> io::Result<()> {
         bitrate: Some(20_000_000),
     };
     let vk_ctx = gmanim_core::vulkan::context::VulkanContext::new().unwrap();
-    let mut backend = VulkanH264Backend::try_new(vk_ctx.clone(), &video_config)?;
+    let mut backend = AsyncVulkanH264Backend::try_new(vk_ctx.clone(), &video_config)?;
 
     let start = std::time::Instant::now();
     let mut rendered = 0u32;

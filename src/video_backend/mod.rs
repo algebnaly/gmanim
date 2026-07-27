@@ -16,7 +16,7 @@ pub enum VideoBackendType {
     FfmpegPipe(FfmpegPipeBackend),
     Ffmpeg(FfmpegBackend),
     Vaapi(FfmpegVaapiBackend),
-    VulkanH264(vulkan_h264::VulkanH264Backend),
+    VulkanH264(vulkan_h264::AsyncVulkanH264Backend),
     BgraRAW(BgraRAWBackend),
     Gstreamer,
 }

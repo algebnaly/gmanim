@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::ffi::CStr;
 use std::io::{self, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use ash::khr;
 use ash::vk;
@@ -43,8 +45,8 @@ const VK_IMAGE_USAGE_VIDEO_ENCODE_DPB_BIT_KHR_RAW: u32 = 0x0000_8000;
 const VK_BUFFER_USAGE_VIDEO_ENCODE_DST_BIT_KHR_RAW: u32 = 0x0000_8000;
 const DEFAULT_BITSTREAM_BUFFER_SIZE: u64 = 4 * 1024 * 1024;
 const ENCODE_SLOT_COUNT: usize = 8;
-const H264_ENABLE_P_FRAMES: bool = true;
-const H264_GOP_SIZE: u32 = 60;
+const MUX_PACKET_QUEUE_DEPTH: usize = ENCODE_SLOT_COUNT * 2;
+const DEFAULT_H264_GOP_SIZE: u32 = 60;
 const H264_TARGET_BITRATE: u64 = 8_000_000;
 const H264_MAX_BITRATE: u64 = 12_000_000;
 const H264_MIN_QP: i32 = 18;
@@ -145,18 +147,111 @@ impl VulkanVideoFrame {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264RateControlPolicy {
+    Vbr,
+    Cbr,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VulkanH264EncoderConfig {
+    pub use_p_frames: bool,
+    pub gop_size: u32,
+    pub rate_control: H264RateControlPolicy,
+}
+
+impl Default for VulkanH264EncoderConfig {
+    fn default() -> Self {
+        Self {
+            use_p_frames: true,
+            gop_size: DEFAULT_H264_GOP_SIZE,
+            rate_control: H264RateControlPolicy::Vbr,
+        }
+    }
+}
+
+impl VulkanH264EncoderConfig {
+    fn validate(self) -> io::Result<Self> {
+        if self.gop_size == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Vulkan H.264 GOP size must be non-zero",
+            ));
+        }
+        Ok(self)
+    }
+
+    fn effective_gop_size(self) -> u32 {
+        if self.use_p_frames { self.gop_size } else { 1 }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct VulkanH264Stats {
+    pub frames_submitted: u32,
+    pub frames_completed: u32,
+    pub bitstream_bytes: u64,
+    pub completion_span: Duration,
+    pub command_record_submit_time: Duration,
+    pub packet_readback_time: Duration,
+    pub mux_enqueue_time: Duration,
+    pub mux_write_time: Duration,
+    pub slot_backpressure_waits: u32,
+    pub slot_backpressure_time: Duration,
+}
+
+impl VulkanH264Stats {
+    pub fn average_completion_interval(self) -> Duration {
+        self.completion_span
+            .checked_div(self.frames_completed.saturating_sub(1))
+            .unwrap_or_default()
+    }
+}
+
 pub struct VulkanH264Backend {
     config: VideoConfig,
+    encoder_config: VulkanH264EncoderConfig,
     ctx: Option<Arc<VulkanContext>>,
     capabilities: VulkanVideoCapabilities,
     session: Option<VideoSessionResources>,
     frame_index: u32,
-    muxer: Option<Child>,
-    muxer_stdin: Option<ChildStdin>,
+    muxer: Option<AsyncMp4Muxer>,
     pending_packets: BTreeMap<u32, Vec<u8>>,
     next_packet_frame_to_write: u32,
     wrote_header: bool,
     closed: bool,
+    stats: VulkanH264Stats,
+    first_completion: Option<Instant>,
+}
+
+pub struct AsyncVulkanH264Backend {
+    capabilities: VulkanVideoCapabilities,
+    command_sender: Option<mpsc::SyncSender<AsyncEncoderCommand>>,
+    terminal_receiver: mpsc::Receiver<AsyncEncoderTerminal>,
+    worker: Option<JoinHandle<()>>,
+    closed: bool,
+    stats: VulkanH264Stats,
+}
+
+enum AsyncEncoderCommand {
+    Frame(VulkanVideoFrame),
+    Finish,
+}
+
+struct AsyncEncoderTerminal {
+    result: io::Result<()>,
+    stats: VulkanH264Stats,
+}
+
+struct AsyncMp4Muxer {
+    packet_sender: Option<mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<JoinHandle<io::Result<Mp4MuxerStats>>>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Mp4MuxerStats {
+    write_time: Duration,
 }
 
 struct VideoSessionResources {
@@ -208,36 +303,62 @@ fn default_h264_rate_control_settings(
     bitrate: Option<u64>,
 ) -> H264RateControlSettings {
     let target = bitrate.unwrap_or(H264_TARGET_BITRATE);
+    let max_bitrate = if mode == vk::VideoEncodeRateControlModeFlagsKHR::CBR {
+        target
+    } else {
+        H264_MAX_BITRATE.max(target)
+    };
     H264RateControlSettings {
         mode,
         framerate,
         average_bitrate: target,
-        max_bitrate: H264_MAX_BITRATE.max(target),
+        max_bitrate,
         min_qp: H264_MIN_QP.clamp(0, 51),
         max_qp: H264_MAX_QP.clamp(H264_MIN_QP, 51),
     }
 }
 
+fn h264_rate_control_flags(
+    encoder_config: VulkanH264EncoderConfig,
+) -> vk::VideoEncodeH264RateControlFlagsKHR {
+    let mut flags = vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP;
+    if encoder_config.use_p_frames {
+        flags |= vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT;
+    }
+    flags
+}
+
 impl VulkanH264Backend {
     pub fn try_new(ctx: Arc<VulkanContext>, config: &VideoConfig) -> io::Result<Self> {
+        Self::try_new_with_encoder_config(ctx, config, VulkanH264EncoderConfig::default())
+    }
+
+    pub fn try_new_with_encoder_config(
+        ctx: Arc<VulkanContext>,
+        config: &VideoConfig,
+        encoder_config: VulkanH264EncoderConfig,
+    ) -> io::Result<Self> {
         validate_dimensions(config.output_width, config.output_height)?;
+        let encoder_config = encoder_config.validate()?;
         let capabilities = detect_capabilities(&ctx)?;
         capabilities.validate()?;
-        let session = Some(create_video_session(&ctx, config)?);
-        let (muxer, muxer_stdin) = spawn_mp4_muxer(config)?;
+        let session = Some(create_video_session(&ctx, config, encoder_config)?);
+        let muxer = AsyncMp4Muxer::try_new(config)?;
 
         Ok(Self {
             config: config.clone(),
+            encoder_config,
             ctx: Some(ctx),
             capabilities,
             session,
             frame_index: 0,
             muxer: Some(muxer),
-            muxer_stdin: Some(muxer_stdin),
             pending_packets: BTreeMap::new(),
             next_packet_frame_to_write: 0,
             wrote_header: false,
             closed: false,
+            stats: VulkanH264Stats::default(),
+            first_completion: None,
         })
     }
 
@@ -249,21 +370,35 @@ impl VulkanH264Backend {
     pub fn new_for_test(config: VideoConfig, capabilities: VulkanVideoCapabilities) -> Self {
         Self {
             config,
+            encoder_config: VulkanH264EncoderConfig::default(),
             ctx: None,
             capabilities,
             session: None,
             frame_index: 0,
             muxer: None,
-            muxer_stdin: None,
             pending_packets: BTreeMap::new(),
             next_packet_frame_to_write: 0,
             wrote_header: false,
             closed: false,
+            stats: VulkanH264Stats::default(),
+            first_completion: None,
         }
     }
 
     pub fn capabilities(&self) -> &VulkanVideoCapabilities {
         &self.capabilities
+    }
+
+    pub fn stats(&self) -> VulkanH264Stats {
+        self.stats
+    }
+
+    fn record_completed_packet(&mut self, bytes: usize) {
+        let now = Instant::now();
+        let first = *self.first_completion.get_or_insert(now);
+        self.stats.frames_completed += 1;
+        self.stats.bitstream_bytes += bytes as u64;
+        self.stats.completion_span = now.duration_since(first);
     }
 
     pub fn submit_vulkan_frame(&mut self, frame: VulkanVideoFrame) -> io::Result<()> {
@@ -290,8 +425,11 @@ impl VulkanH264Backend {
         }
         collect_completed_packets(self, false)?;
         let slot_index = acquire_encode_slot(self)?;
+        let submit_start = Instant::now();
         encode_one_frame(self, frame, slot_index)?;
+        self.stats.command_record_submit_time += submit_start.elapsed();
         self.frame_index += 1;
+        self.stats.frames_submitted += 1;
         Ok(())
     }
 
@@ -300,14 +438,9 @@ impl VulkanH264Backend {
             return Ok(());
         }
         collect_completed_packets(self, true)?;
-        self.muxer_stdin.take();
-        if let Some(mut child) = self.muxer.take() {
-            let status = child.wait()?;
-            if !status.success() {
-                return Err(io::Error::other(format!(
-                    "ffmpeg muxer exited with {status}"
-                )));
-            }
+        if let Some(mut muxer) = self.muxer.take() {
+            let muxer_stats = muxer.finish()?;
+            self.stats.mux_write_time = muxer_stats.write_time;
         }
         if let (Some(ctx), Some(mut session)) = (self.ctx.as_ref(), self.session.take()) {
             unsafe {
@@ -326,7 +459,202 @@ impl Drop for VulkanH264Backend {
     }
 }
 
-fn spawn_mp4_muxer(config: &VideoConfig) -> io::Result<(Child, ChildStdin)> {
+impl AsyncVulkanH264Backend {
+    pub fn try_new(ctx: Arc<VulkanContext>, config: &VideoConfig) -> io::Result<Self> {
+        Self::try_new_with_encoder_config(ctx, config, VulkanH264EncoderConfig::default())
+    }
+
+    pub fn try_new_with_encoder_config(
+        ctx: Arc<VulkanContext>,
+        config: &VideoConfig,
+        encoder_config: VulkanH264EncoderConfig,
+    ) -> io::Result<Self> {
+        let encoder_config = encoder_config.validate()?;
+        let config = config.clone();
+        let (command_sender, command_receiver) = mpsc::sync_channel(ENCODE_SLOT_COUNT);
+        let (initialization_sender, initialization_receiver) = mpsc::sync_channel(1);
+        let (terminal_sender, terminal_receiver) = mpsc::sync_channel(1);
+        let worker = thread::Builder::new()
+            .name("gmanim-vulkan-h264".to_owned())
+            .spawn(move || {
+                let mut backend = match VulkanH264Backend::try_new_with_encoder_config(
+                    ctx,
+                    &config,
+                    encoder_config,
+                ) {
+                    Ok(backend) => backend,
+                    Err(error) => {
+                        let _ = initialization_sender.send(Err(error));
+                        return;
+                    }
+                };
+                if initialization_sender
+                    .send(Ok(backend.capabilities().clone()))
+                    .is_err()
+                {
+                    return;
+                }
+
+                let encode_result = loop {
+                    match command_receiver.recv() {
+                        Ok(AsyncEncoderCommand::Frame(frame)) => {
+                            if let Err(error) = backend.submit_vulkan_frame(frame) {
+                                break Err(error);
+                            }
+                        }
+                        Ok(AsyncEncoderCommand::Finish) | Err(_) => break Ok(()),
+                    }
+                };
+                let finish_result = backend.finish();
+                let _ = terminal_sender.send(AsyncEncoderTerminal {
+                    result: encode_result.and(finish_result),
+                    stats: backend.stats(),
+                });
+            })
+            .map_err(io::Error::other)?;
+
+        let capabilities = match initialization_receiver.recv() {
+            Ok(Ok(capabilities)) => capabilities,
+            Ok(Err(error)) => {
+                let _ = worker.join();
+                return Err(error);
+            }
+            Err(error) => {
+                let _ = worker.join();
+                return Err(io::Error::other(format!(
+                    "Vulkan H.264 worker initialization failed: {error}"
+                )));
+            }
+        };
+
+        Ok(Self {
+            capabilities,
+            command_sender: Some(command_sender),
+            terminal_receiver,
+            worker: Some(worker),
+            closed: false,
+            stats: VulkanH264Stats::default(),
+        })
+    }
+
+    pub fn capabilities(&self) -> &VulkanVideoCapabilities {
+        &self.capabilities
+    }
+
+    pub fn stats(&self) -> VulkanH264Stats {
+        self.stats
+    }
+
+    pub fn submit_vulkan_frame(&mut self, frame: VulkanVideoFrame) -> io::Result<()> {
+        if self.closed {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "asynchronous Vulkan H.264 backend is already closed",
+            ));
+        }
+        self.command_sender
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Vulkan H.264 worker is unavailable"))?
+            .send(AsyncEncoderCommand::Frame(frame))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "Vulkan H.264 worker stopped"))
+    }
+
+    pub fn finish(&mut self) -> io::Result<()> {
+        if self.closed {
+            return Ok(());
+        }
+        if let Some(sender) = self.command_sender.take() {
+            let _ = sender.send(AsyncEncoderCommand::Finish);
+        }
+        if let Some(worker) = self.worker.take() {
+            worker
+                .join()
+                .map_err(|_| io::Error::other("Vulkan H.264 worker panicked"))?;
+        }
+        self.closed = true;
+        let terminal = self.terminal_receiver.recv().map_err(|error| {
+            io::Error::other(format!("Vulkan H.264 worker returned no result: {error}"))
+        })?;
+        self.stats = terminal.stats;
+        terminal.result
+    }
+}
+
+impl Drop for AsyncVulkanH264Backend {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+impl AsyncMp4Muxer {
+    fn try_new(config: &VideoConfig) -> io::Result<Self> {
+        let (mut child, mut stdin) = spawn_mp4_muxer_process(config)?;
+        let (packet_sender, packet_receiver) =
+            mpsc::sync_channel::<Vec<u8>>(MUX_PACKET_QUEUE_DEPTH);
+        let worker = thread::Builder::new()
+            .name("gmanim-ffmpeg-mux".to_owned())
+            .spawn(move || {
+                let mut stats = Mp4MuxerStats::default();
+                let write_result = (|| {
+                    while let Ok(packet) = packet_receiver.recv() {
+                        let write_start = Instant::now();
+                        stdin.write_all(&packet)?;
+                        stats.write_time += write_start.elapsed();
+                    }
+                    Ok(())
+                })();
+                drop(stdin);
+                let wait_result = child.wait().and_then(|status| {
+                    if status.success() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(format!(
+                            "ffmpeg muxer exited with {status}"
+                        )))
+                    }
+                });
+                write_result.and(wait_result)?;
+                Ok(stats)
+            })
+            .map_err(io::Error::other)?;
+        Ok(Self {
+            packet_sender: Some(packet_sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn submit(&self, packet: Vec<u8>) -> io::Result<Duration> {
+        let enqueue_start = Instant::now();
+        self.packet_sender
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "FFmpeg muxer is closed"))?
+            .send(packet)
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "FFmpeg muxer worker stopped")
+            })?;
+        Ok(enqueue_start.elapsed())
+    }
+
+    fn finish(&mut self) -> io::Result<Mp4MuxerStats> {
+        self.packet_sender.take();
+        self.worker
+            .take()
+            .map(|worker| {
+                worker
+                    .join()
+                    .map_err(|_| io::Error::other("FFmpeg muxer worker panicked"))?
+            })
+            .unwrap_or_else(|| Ok(Mp4MuxerStats::default()))
+    }
+}
+
+impl Drop for AsyncMp4Muxer {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+fn spawn_mp4_muxer_process(config: &VideoConfig) -> io::Result<(Child, ChildStdin)> {
     let mut child = Command::new("ffmpeg")
         .args([
             "-y",
@@ -432,7 +760,9 @@ fn query_h264_encode_profile_support(ctx: &VulkanContext) -> io::Result<bool> {
         .push_next(&mut encode_usage)
         .push_next(&mut h264_profile);
     let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
-    let mut video_caps = vk::VideoCapabilitiesKHR::default().push_next(&mut h264_caps);
+    let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
+    encode_caps.p_next = (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast();
+    let mut video_caps = vk::VideoCapabilitiesKHR::default().push_next(&mut encode_caps);
     let video_queue = khr::video_queue::Instance::new(&ctx.entry, &ctx.instance);
 
     let result = unsafe {
@@ -457,6 +787,7 @@ fn query_h264_encode_profile_support(ctx: &VulkanContext) -> io::Result<bool> {
 fn create_video_session(
     ctx: &Arc<VulkanContext>,
     config: &VideoConfig,
+    encoder_config: VulkanH264EncoderConfig,
 ) -> io::Result<VideoSessionResources> {
     let video_queue = khr::video_queue::Device::new(&ctx.instance, &ctx.device);
     let encode_queue = khr::video_encode_queue::Device::new(&ctx.instance, &ctx.device);
@@ -541,6 +872,12 @@ fn create_video_session(
         )));
     }
 
+    let rate_control = make_h264_rate_control_settings(
+        &encode_caps,
+        config.framerate,
+        config.bitrate,
+        encoder_config.rate_control,
+    )?;
     let mut resources = VideoSessionResources {
         video_queue,
         encode_queue,
@@ -561,17 +898,13 @@ fn create_video_session(
         dpb_memory: vk::DeviceMemory::null(),
         dpb_views: Vec::new(),
         slots: Vec::new(),
-        rate_control: make_h264_rate_control_settings(
-            &encode_caps,
-            config.framerate,
-            config.bitrate,
-        ),
+        rate_control,
     };
 
     let result = bind_video_session_memory(ctx, &mut resources)
         .and_then(|_| create_video_encode_resources(ctx, &mut resources, config, &profile))
         .and_then(|_| create_video_session_parameters(ctx, &mut resources, config))
-        .and_then(|_| configure_h264_rate_control(ctx, &mut resources));
+        .and_then(|_| configure_h264_rate_control(ctx, &mut resources, encoder_config));
     if let Err(err) = result {
         destroy_video_session_resources(ctx, &mut resources);
         return Err(err);
@@ -584,21 +917,25 @@ fn make_h264_rate_control_settings(
     encode_caps: &vk::VideoEncodeCapabilitiesKHR,
     framerate: u32,
     bitrate: Option<u64>,
-) -> Option<H264RateControlSettings> {
-    let mode = if encode_caps
-        .rate_control_modes
-        .contains(vk::VideoEncodeRateControlModeFlagsKHR::VBR)
-    {
-        vk::VideoEncodeRateControlModeFlagsKHR::VBR
-    } else if encode_caps
-        .rate_control_modes
-        .contains(vk::VideoEncodeRateControlModeFlagsKHR::CBR)
-    {
-        vk::VideoEncodeRateControlModeFlagsKHR::CBR
-    } else {
-        return None;
+    policy: H264RateControlPolicy,
+) -> io::Result<Option<H264RateControlSettings>> {
+    let mode = match policy {
+        H264RateControlPolicy::Disabled => return Ok(None),
+        H264RateControlPolicy::Vbr => vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+        H264RateControlPolicy::Cbr => vk::VideoEncodeRateControlModeFlagsKHR::CBR,
     };
-    Some(default_h264_rate_control_settings(mode, framerate, bitrate))
+    if !encode_caps.rate_control_modes.contains(mode) {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "requested Vulkan H.264 rate-control mode {policy:?} is unsupported; driver reports {:?}",
+                encode_caps.rate_control_modes
+            ),
+        ));
+    }
+    Ok(Some(default_h264_rate_control_settings(
+        mode, framerate, bitrate,
+    )))
 }
 
 fn choose_video_format(
@@ -986,6 +1323,7 @@ fn create_video_session_parameters(
 fn configure_h264_rate_control(
     ctx: &VulkanContext,
     resources: &mut VideoSessionResources,
+    encoder_config: VulkanH264EncoderConfig,
 ) -> io::Result<()> {
     let settings = match resources.rate_control {
         Some(settings) => settings,
@@ -996,11 +1334,6 @@ fn configure_h264_rate_control(
     }
 
     let slot = &resources.slots[0];
-    let bitrate = if settings.mode == vk::VideoEncodeRateControlModeFlagsKHR::CBR {
-        settings.max_bitrate
-    } else {
-        settings.average_bitrate
-    };
     let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
         .use_min_qp(true)
         .min_qp(
@@ -1019,17 +1352,15 @@ fn configure_h264_rate_control(
     let layer = vk::VideoEncodeRateControlLayerInfoKHR::default()
         .frame_rate_numerator(settings.framerate)
         .frame_rate_denominator(1)
-        .average_bitrate(bitrate)
+        .average_bitrate(settings.average_bitrate)
         .max_bitrate(settings.max_bitrate)
         .push_next(&mut h264_layer);
     let layers = [layer];
+    let gop_size = encoder_config.effective_gop_size();
     let mut h264_info = vk::VideoEncodeH264RateControlInfoKHR::default()
-        .flags(
-            vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP
-                | vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
-        )
-        .gop_frame_count(H264_GOP_SIZE)
-        .idr_period(H264_GOP_SIZE)
+        .flags(h264_rate_control_flags(encoder_config))
+        .gop_frame_count(gop_size)
+        .idr_period(gop_size)
         .consecutive_b_frame_count(0)
         .temporal_layer_count(1);
     let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default()
@@ -1148,8 +1479,8 @@ fn write_h264_headers(backend: &mut VulkanH264Backend) -> io::Result<()> {
         )));
     }
     data.truncate(len);
-    if let Some(stdin) = backend.muxer_stdin.as_mut() {
-        stdin.write_all(&data)?;
+    if let Some(muxer) = backend.muxer.as_ref() {
+        backend.stats.mux_enqueue_time += muxer.submit(data)?;
     }
     Ok(())
 }
@@ -1172,8 +1503,11 @@ fn encode_one_frame(
         .get_mut(slot_index)
         .ok_or_else(|| io::Error::other("invalid Vulkan Video encode slot"))?;
     let frame_num = backend.frame_index;
-    let gop_frame_num = frame_num % H264_GOP_SIZE;
-    let is_idr = !H264_ENABLE_P_FRAMES || gop_frame_num == 0 || resources.dpb_views.len() < 2;
+    let encoder_config = backend.encoder_config;
+    let gop_size = encoder_config.effective_gop_size();
+    let gop_frame_num = frame_num % gop_size;
+    let is_idr =
+        !encoder_config.use_p_frames || gop_frame_num == 0 || resources.dpb_views.len() < 2;
     let dpb_slot_index = if is_idr {
         0
     } else {
@@ -1181,12 +1515,13 @@ fn encode_one_frame(
     };
     let ref_slot_index = ((gop_frame_num.saturating_sub(1) as usize) & 1)
         .min(resources.dpb_views.len().saturating_sub(1));
-    let dpb_ref_info = make_h264_reference_info(gop_frame_num, is_idr);
+    let dpb_ref_info = make_h264_reference_info(gop_frame_num, is_idr, &resources.sps);
     let mut dpb_slot_h264 =
         vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&dpb_ref_info);
     let ref_ref_info = make_h264_reference_info(
         gop_frame_num.saturating_sub(1),
         gop_frame_num.saturating_sub(1) == 0,
+        &resources.sps,
     );
     let mut ref_slot_h264 =
         vk::VideoEncodeH264DpbSlotInfoKHR::default().std_reference_info(&ref_ref_info);
@@ -1236,8 +1571,6 @@ fn encode_one_frame(
         ctx.device
             .reset_command_pool(slot.command_pool, vk::CommandPoolResetFlags::empty())
             .map_err(io::Error::other)?;
-        ctx.device
-            .reset_query_pool(resources.query_pool, slot.query_index, 1);
         let begin_info = vk::CommandBufferBeginInfo {
             s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
             flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
@@ -1246,13 +1579,14 @@ fn encode_one_frame(
         ctx.device
             .begin_command_buffer(slot.command_buffer, &begin_info)
             .map_err(io::Error::other)?;
+        ctx.device.cmd_reset_query_pool(
+            slot.command_buffer,
+            resources.query_pool,
+            slot.query_index,
+            1,
+        );
 
         if let Some(settings) = resources.rate_control {
-            let bitrate = if settings.mode == vk::VideoEncodeRateControlModeFlagsKHR::CBR {
-                settings.max_bitrate
-            } else {
-                settings.average_bitrate
-            };
             let mut h264_layer = vk::VideoEncodeH264RateControlLayerInfoKHR::default()
                 .use_min_qp(true)
                 .min_qp(
@@ -1271,17 +1605,14 @@ fn encode_one_frame(
             let layer = vk::VideoEncodeRateControlLayerInfoKHR::default()
                 .frame_rate_numerator(settings.framerate)
                 .frame_rate_denominator(1)
-                .average_bitrate(bitrate)
+                .average_bitrate(settings.average_bitrate)
                 .max_bitrate(settings.max_bitrate)
                 .push_next(&mut h264_layer);
             let layers = [layer];
             let mut h264_info = vk::VideoEncodeH264RateControlInfoKHR::default()
-                .flags(
-                    vk::VideoEncodeH264RateControlFlagsKHR::REGULAR_GOP
-                        | vk::VideoEncodeH264RateControlFlagsKHR::REFERENCE_PATTERN_FLAT,
-                )
-                .gop_frame_count(H264_GOP_SIZE)
-                .idr_period(H264_GOP_SIZE)
+                .flags(h264_rate_control_flags(encoder_config))
+                .gop_frame_count(gop_size)
+                .idr_period(gop_size)
                 .consecutive_b_frame_count(0)
                 .temporal_layer_count(1);
             let mut rc_info = vk::VideoEncodeRateControlInfoKHR::default()
@@ -1310,51 +1641,49 @@ fn encode_one_frame(
             );
         }
 
-        let src_to_encode = vk::ImageMemoryBarrier {
-            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-            old_layout: frame.image_layout,
-            new_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            image: frame.image,
-            subresource_range: vk::ImageSubresourceRange {
+        let src_to_encode = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            .dst_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
+            .old_layout(frame.image_layout)
+            .new_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(frame.image)
+            .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            },
-            src_access_mask: vk::AccessFlags::SHADER_WRITE,
-            dst_access_mask: vk::AccessFlags::empty(),
-            ..Default::default()
-        };
-        let dpb_to_encode = vk::ImageMemoryBarrier {
-            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-            old_layout: vk::ImageLayout::UNDEFINED,
-            new_layout: vk::ImageLayout::from_raw(VK_IMAGE_LAYOUT_VIDEO_ENCODE_DPB_KHR_RAW),
-            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            image: resources.dpb_image,
-            subresource_range: vk::ImageSubresourceRange {
+            });
+        let dpb_to_encode = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .src_access_mask(vk::AccessFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            .dst_access_mask(
+                vk::AccessFlags2::VIDEO_ENCODE_READ_KHR | vk::AccessFlags2::VIDEO_ENCODE_WRITE_KHR,
+            )
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::from_raw(
+                VK_IMAGE_LAYOUT_VIDEO_ENCODE_DPB_KHR_RAW,
+            ))
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(resources.dpb_image)
+            .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: dpb_slot_index as u32,
                 layer_count: 1,
-            },
-            src_access_mask: vk::AccessFlags::empty(),
-            dst_access_mask: vk::AccessFlags::empty(),
-            ..Default::default()
-        };
-        ctx.device.cmd_pipeline_barrier(
-            slot.command_buffer,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            &[src_to_encode, dpb_to_encode],
-        );
+            });
+        let encode_barriers = [src_to_encode, dpb_to_encode];
+        let encode_dependency =
+            vk::DependencyInfo::default().image_memory_barriers(&encode_barriers);
+        ctx.device
+            .cmd_pipeline_barrier2(slot.command_buffer, &encode_dependency);
 
         setup_slot.slot_index = dpb_slot_index as i32;
         let bitstream_offset = resources.bitstream_slot_size * slot_index as u64;
@@ -1377,33 +1706,27 @@ fn encode_one_frame(
             .cmd_end_query(slot.command_buffer, resources.query_pool, slot.query_index);
         let end_coding = vk::VideoEndCodingInfoKHR::default();
         (resources.video_queue.fp().cmd_end_video_coding_khr)(slot.command_buffer, &end_coding);
-        let src_to_general = vk::ImageMemoryBarrier {
-            s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-            old_layout: vk::ImageLayout::VIDEO_ENCODE_SRC_KHR,
-            new_layout: vk::ImageLayout::GENERAL,
-            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-            image: frame.image,
-            subresource_range: vk::ImageSubresourceRange {
+        let src_to_general = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR)
+            .src_access_mask(vk::AccessFlags2::VIDEO_ENCODE_READ_KHR)
+            .dst_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_access_mask(vk::AccessFlags2::NONE)
+            .old_layout(vk::ImageLayout::VIDEO_ENCODE_SRC_KHR)
+            .new_layout(vk::ImageLayout::GENERAL)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(frame.image)
+            .subresource_range(vk::ImageSubresourceRange {
                 aspect_mask: vk::ImageAspectFlags::COLOR,
                 base_mip_level: 0,
                 level_count: 1,
                 base_array_layer: 0,
                 layer_count: 1,
-            },
-            src_access_mask: vk::AccessFlags::empty(),
-            dst_access_mask: vk::AccessFlags::SHADER_WRITE,
-            ..Default::default()
-        };
-        ctx.device.cmd_pipeline_barrier(
-            slot.command_buffer,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::PipelineStageFlags::COMPUTE_SHADER,
-            vk::DependencyFlags::empty(),
-            &[],
-            &[],
-            std::slice::from_ref(&src_to_general),
-        );
+            });
+        let release_dependency = vk::DependencyInfo::default()
+            .image_memory_barriers(std::slice::from_ref(&src_to_general));
+        ctx.device
+            .cmd_pipeline_barrier2(slot.command_buffer, &release_dependency);
         ctx.device
             .end_command_buffer(slot.command_buffer)
             .map_err(io::Error::other)?;
@@ -1481,8 +1804,9 @@ fn collect_completed_packets(backend: &mut VulkanH264Backend, wait_all: bool) ->
             let frame_index = resources.slots[slot_index].frame_index.ok_or_else(|| {
                 io::Error::other("completed Vulkan Video slot has no frame index")
             })?;
+            let readback_start = Instant::now();
             let packet = read_completed_slot_packet(ctx, resources, slot_index)?;
-            completed_packets.push((frame_index, packet));
+            completed_packets.push((frame_index, packet, readback_start.elapsed()));
             resources.slots[slot_index].busy = false;
             resources.slots[slot_index].frame_index = None;
             resources.slots[slot_index].frame_timeline = None;
@@ -1490,7 +1814,9 @@ fn collect_completed_packets(backend: &mut VulkanH264Backend, wait_all: bool) ->
     }
 
     if !completed_packets.is_empty() {
-        for (frame_index, packet) in completed_packets {
+        for (frame_index, packet, readback_time) in completed_packets {
+            backend.record_completed_packet(packet.len());
+            backend.stats.packet_readback_time += readback_time;
             backend.pending_packets.insert(frame_index, packet);
         }
         flush_ordered_packets(backend)?;
@@ -1509,7 +1835,7 @@ fn acquire_encode_slot(backend: &mut VulkanH264Backend) -> io::Result<usize> {
         .ctx
         .as_ref()
         .ok_or_else(|| io::Error::other("Vulkan context is not initialized"))?;
-    let (slot_index, frame_index, packet) = {
+    let (slot_index, frame_index, packet, wait_time, readback_time) = {
         let resources = backend
             .session
             .as_mut()
@@ -1520,21 +1846,29 @@ fn acquire_encode_slot(backend: &mut VulkanH264Backend) -> io::Result<usize> {
             .position(|slot| slot.busy)
             .ok_or_else(|| io::Error::other("Vulkan Video has no encode slots"))?;
         let fence = resources.slots[slot_index].fence;
+        let wait_start = Instant::now();
         unsafe {
             ctx.device
                 .wait_for_fences(std::slice::from_ref(&fence), true, u64::MAX)
                 .map_err(io::Error::other)?;
         }
+        let wait_time = wait_start.elapsed();
         let frame_index = resources.slots[slot_index]
             .frame_index
             .ok_or_else(|| io::Error::other("completed Vulkan Video slot has no frame index"))?;
+        let readback_start = Instant::now();
         let packet = read_completed_slot_packet(ctx, resources, slot_index)?;
+        let readback_time = readback_start.elapsed();
         resources.slots[slot_index].busy = false;
         resources.slots[slot_index].frame_index = None;
         resources.slots[slot_index].frame_timeline = None;
-        (slot_index, frame_index, packet)
+        (slot_index, frame_index, packet, wait_time, readback_time)
     };
 
+    backend.stats.slot_backpressure_waits += 1;
+    backend.stats.slot_backpressure_time += wait_time;
+    backend.stats.packet_readback_time += readback_time;
+    backend.record_completed_packet(packet.len());
     backend.pending_packets.insert(frame_index, packet);
     flush_ordered_packets(backend)?;
     Ok(slot_index)
@@ -1545,9 +1879,9 @@ fn flush_ordered_packets(backend: &mut VulkanH264Backend) -> io::Result<()> {
         &mut backend.pending_packets,
         &mut backend.next_packet_frame_to_write,
     );
-    if let Some(stdin) = backend.muxer_stdin.as_mut() {
+    if let Some(muxer) = backend.muxer.as_ref() {
         for packet in packets {
-            stdin.write_all(&packet)?;
+            backend.stats.mux_enqueue_time += muxer.submit(packet)?;
         }
     }
     Ok(())
@@ -1581,7 +1915,7 @@ fn read_completed_slot_packet(
                 resources.query_pool,
                 slot.query_index,
                 std::slice::from_mut(&mut result),
-                vk::QueryResultFlags::WAIT | vk::QueryResultFlags::WITH_STATUS_KHR,
+                vk::QueryResultFlags::WITH_STATUS_KHR,
             )
             .map_err(io::Error::other)?;
     }
@@ -1890,7 +2224,7 @@ impl H264FrameInfo {
             } else {
                 StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
             },
-            frame_num: gop_frame_num,
+            frame_num: h264_frame_num(gop_frame_num, sps),
             PicOrderCnt: ((gop_frame_num * 2) % max_pic_order_cnt_lsb) as i32,
             temporal_id: 0,
             reserved1: [0; 3],
@@ -1914,7 +2248,17 @@ impl H264FrameInfo {
     }
 }
 
-fn make_h264_reference_info(gop_frame_num: u32, is_idr: bool) -> StdVideoEncodeH264ReferenceInfo {
+fn h264_frame_num(gop_frame_num: u32, sps: &StdVideoH264SequenceParameterSet) -> u32 {
+    let max_frame_num = 1u32 << (sps.log2_max_frame_num_minus4 + 4);
+    gop_frame_num % max_frame_num
+}
+
+fn make_h264_reference_info(
+    gop_frame_num: u32,
+    is_idr: bool,
+    sps: &StdVideoH264SequenceParameterSet,
+) -> StdVideoEncodeH264ReferenceInfo {
+    let max_pic_order_cnt_lsb = 1u32 << (sps.log2_max_pic_order_cnt_lsb_minus4 + 4);
     StdVideoEncodeH264ReferenceInfo {
         flags: unsafe { std::mem::zeroed() },
         primary_pic_type: if is_idr {
@@ -1922,8 +2266,8 @@ fn make_h264_reference_info(gop_frame_num: u32, is_idr: bool) -> StdVideoEncodeH
         } else {
             StdVideoH264PictureType_STD_VIDEO_H264_PICTURE_TYPE_P
         },
-        FrameNum: gop_frame_num,
-        PicOrderCnt: ((gop_frame_num * 2) % 256) as i32,
+        FrameNum: h264_frame_num(gop_frame_num, sps),
+        PicOrderCnt: ((gop_frame_num * 2) % max_pic_order_cnt_lsb) as i32,
         long_term_pic_num: 0,
         long_term_frame_idx: 0,
         temporal_id: 0,
@@ -2036,5 +2380,51 @@ mod tests {
         assert!((0..=51).contains(&settings.min_qp));
         assert!((0..=51).contains(&settings.max_qp));
         assert!(settings.min_qp <= settings.max_qp);
+    }
+
+    #[test]
+    fn cbr_uses_the_requested_bitrate_for_average_and_peak() {
+        let settings = default_h264_rate_control_settings(
+            vk::VideoEncodeRateControlModeFlagsKHR::CBR,
+            60,
+            Some(9_000_000),
+        );
+
+        assert_eq!(settings.average_bitrate, 9_000_000);
+        assert_eq!(settings.max_bitrate, 9_000_000);
+    }
+
+    #[test]
+    fn requested_rate_control_mode_is_not_silently_substituted() {
+        let vbr_only_caps = vk::VideoEncodeCapabilitiesKHR {
+            rate_control_modes: vk::VideoEncodeRateControlModeFlagsKHR::VBR,
+            ..Default::default()
+        };
+
+        let settings =
+            make_h264_rate_control_settings(&vbr_only_caps, 60, None, H264RateControlPolicy::Vbr)
+                .unwrap()
+                .unwrap();
+        assert_eq!(settings.mode, vk::VideoEncodeRateControlModeFlagsKHR::VBR);
+
+        let err =
+            make_h264_rate_control_settings(&vbr_only_caps, 60, None, H264RateControlPolicy::Cbr)
+                .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn frame_and_reference_numbers_wrap_at_the_sps_limit() {
+        let sps = make_h264_sps(1920, 1080, None);
+        let pps = make_h264_pps();
+        assert_eq!(h264_frame_num(15, &sps), 15);
+        assert_eq!(h264_frame_num(16, &sps), 0);
+        assert_eq!(h264_frame_num(17, &sps), 1);
+
+        let frame = H264FrameInfo::new(17, &sps, &pps, false, 0);
+        let reference = make_h264_reference_info(17, false, &sps);
+        assert_eq!(frame._picture.frame_num, 1);
+        assert_eq!(reference.FrameNum, 1);
+        assert_eq!(frame._picture.PicOrderCnt, reference.PicOrderCnt);
     }
 }

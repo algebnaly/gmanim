@@ -130,6 +130,10 @@ fn main() {
     assert_eq!(steady_frame_stats.unwrap().mesh_2d_geometry_uploads, 0);
     assert_eq!(renderer.last_stats().mesh_2d_draw_calls, 1);
     assert_eq!(renderer.last_stats().mesh_2d_instances, 1000);
+    assert_eq!(renderer.last_stats().sdf_dispatches, 0);
+    assert_eq!(renderer.last_stats().raster_passes, 1);
+    assert_eq!(renderer.last_stats().downsample_dispatches, 1);
+    assert_eq!(renderer.last_stats().composite_dispatches, 0);
     drop(video_backend);
 
     println!("Total time: {:?}", start_time.elapsed());

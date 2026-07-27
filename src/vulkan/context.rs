@@ -18,6 +18,8 @@ pub struct VulkanContext {
     pub device: Arc<Device>,
     pub queue: vk::Queue,
     pub queue_family_index: u32,
+    pub timestamp_period_ns: f32,
+    pub timestamp_valid_bits: u32,
     pub video_encode_queue: Option<vk::Queue>,
     pub video_encode_queue_family_index: Option<u32>,
     pub allocator: Arc<Mutex<Allocator>>,
@@ -31,6 +33,8 @@ pub enum VulkanContextError {
     NoGraphicsComputeQueue,
     TimelineSemaphoreUnsupported,
     Synchronization2Unsupported,
+    DynamicRenderingUnsupported,
+    TimestampQueriesUnsupported,
     Allocator(String),
 }
 
@@ -48,6 +52,12 @@ impl fmt::Display for VulkanContextError {
             }
             Self::Synchronization2Unsupported => {
                 formatter.write_str("Vulkan synchronization2 is required but unsupported")
+            }
+            Self::DynamicRenderingUnsupported => {
+                formatter.write_str("Vulkan dynamic rendering is required but unsupported")
+            }
+            Self::TimestampQueriesUnsupported => {
+                formatter.write_str("GPU timestamp queries are required but unsupported")
             }
             Self::Allocator(error) => write!(formatter, "failed to create GPU allocator: {error}"),
         }
@@ -119,7 +129,7 @@ impl VulkanContext {
 
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-        let (queue_family_index, _) = queue_families
+        let (queue_family_index, queue_family) = queue_families
             .iter()
             .enumerate()
             .find(|(_, props)| {
@@ -129,6 +139,11 @@ impl VulkanContext {
             })
             .map(|(i, p)| (i as u32, p))
             .ok_or(VulkanContextError::NoGraphicsComputeQueue)?;
+        if queue_family.timestamp_valid_bits == 0 {
+            return Err(VulkanContextError::TimestampQueriesUnsupported);
+        }
+        let physical_device_properties =
+            unsafe { instance.get_physical_device_properties(physical_device) };
         let video_encode_queue_family_index = queue_families
             .iter()
             .enumerate()
@@ -183,9 +198,12 @@ impl VulkanContext {
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut supported_synchronization2_features =
             vk::PhysicalDeviceSynchronization2Features::default();
+        let mut supported_dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default();
         let mut physical_device_features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported_timeline_features)
-            .push_next(&mut supported_synchronization2_features);
+            .push_next(&mut supported_synchronization2_features)
+            .push_next(&mut supported_dynamic_rendering_features);
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_device_features);
         }
@@ -195,16 +213,22 @@ impl VulkanContext {
         if supported_synchronization2_features.synchronization2 != vk::TRUE {
             return Err(VulkanContextError::Synchronization2Unsupported);
         }
+        if supported_dynamic_rendering_features.dynamic_rendering != vk::TRUE {
+            return Err(VulkanContextError::DynamicRenderingUnsupported);
+        }
 
         let mut enabled_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
         let mut enabled_synchronization2_features =
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
+        let mut enabled_dynamic_rendering_features =
+            vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enabled_extension_ptrs)
             .push_next(&mut enabled_timeline_features)
-            .push_next(&mut enabled_synchronization2_features);
+            .push_next(&mut enabled_synchronization2_features)
+            .push_next(&mut enabled_dynamic_rendering_features);
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
 
@@ -229,6 +253,8 @@ impl VulkanContext {
             device: Arc::new(device),
             queue,
             queue_family_index,
+            timestamp_period_ns: physical_device_properties.limits.timestamp_period,
+            timestamp_valid_bits: queue_family.timestamp_valid_bits,
             video_encode_queue,
             video_encode_queue_family_index,
             allocator: Arc::new(Mutex::new(allocator)),

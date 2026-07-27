@@ -4,6 +4,7 @@ use crate::video_backend::vulkan_h264::VulkanVideoFrame;
 use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
 use ash::vk;
 use ash::vk::Handle;
+use ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW: u32 = 0x0000_4000;
 const VK_IMAGE_ASPECT_PLANE_0_BIT_RAW: u32 = 0x0000_0010;
 const VK_IMAGE_ASPECT_PLANE_1_BIT_RAW: u32 = 0x0000_0020;
 const RENDER_FRAME_COUNT: usize = 3;
+const GPU_TIMESTAMP_COUNT: u32 = 6;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment <= 1 {
@@ -298,8 +300,19 @@ impl VideoNv12Image {
         } else {
             vk::SharingMode::EXCLUSIVE
         };
+        let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default()
+            .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN);
+        let profile = vk::VideoProfileInfoKHR::default()
+            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
+            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
+            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
+            .push_next(&mut h264_profile);
+        let profiles = [profile];
+        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
         let image_info = vk::ImageCreateInfo {
             s_type: vk::StructureType::IMAGE_CREATE_INFO,
+            p_next: (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast(),
             flags: vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
             image_type: vk::ImageType::TYPE_2D,
             format,
@@ -341,8 +354,13 @@ impl VideoNv12Image {
                 .unwrap();
         }
 
-        let color_view =
-            Self::create_view(ctx, vk_image, format, vk::ImageAspectFlags::COLOR, usage);
+        let color_view = Self::create_view(
+            ctx,
+            vk_image,
+            format,
+            vk::ImageAspectFlags::COLOR,
+            vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW),
+        );
         let y_view = Self::create_view(
             ctx,
             vk_image,
@@ -542,6 +560,168 @@ pub struct RendererStats {
     pub mesh_2d_vertex_bytes_uploaded: u64,
     pub mesh_2d_index_bytes_uploaded: u64,
     pub mesh_2d_arena_rebuilds: u32,
+    pub sdf_dispatches: u32,
+    pub raster_passes: u32,
+    pub depth_attachment_raster_passes: u32,
+    pub downsample_dispatches: u32,
+    pub fused_video_downsample_dispatches: u32,
+    pub composite_dispatches: u32,
+    pub output_conversion_dispatches: u32,
+    pub rgba_readback_copies: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct GpuPassTimings {
+    pub frame_ms: f64,
+    pub geometry_upload_ms: f64,
+    pub sdf_ms: f64,
+    pub raster_ms: f64,
+    pub postprocess_ms: f64,
+    pub output_ms: f64,
+}
+
+impl GpuPassTimings {
+    fn from_timestamps(
+        timestamps: [u64; GPU_TIMESTAMP_COUNT as usize],
+        timestamp_period_ns: f32,
+        timestamp_valid_bits: u32,
+        plan: FrameExecutionPlan,
+        has_geometry_upload: bool,
+        has_postprocess: bool,
+        has_output: bool,
+    ) -> Self {
+        let elapsed_ms = |start: usize, end: usize| {
+            timestamp_delta(timestamps[start], timestamps[end], timestamp_valid_bits) as f64
+                * timestamp_period_ns as f64
+                / 1_000_000.0
+        };
+        Self {
+            frame_ms: elapsed_ms(0, 5),
+            geometry_upload_ms: has_geometry_upload
+                .then(|| elapsed_ms(0, 1))
+                .unwrap_or_default(),
+            sdf_ms: plan
+                .runs_sdf()
+                .then(|| elapsed_ms(1, 2))
+                .unwrap_or_default(),
+            raster_ms: plan
+                .runs_raster()
+                .then(|| elapsed_ms(2, 3))
+                .unwrap_or_default(),
+            postprocess_ms: has_postprocess
+                .then(|| elapsed_ms(3, 4))
+                .unwrap_or_default(),
+            output_ms: has_output.then(|| elapsed_ms(4, 5)).unwrap_or_default(),
+        }
+    }
+}
+
+fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
+    let mask = if valid_bits >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << valid_bits) - 1
+    };
+    end.wrapping_sub(start) & mask
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameExecutionPlan {
+    Empty,
+    SdfOnly,
+    RasterDirect,
+    RasterDownsample,
+    SdfRasterComposite,
+}
+
+impl FrameExecutionPlan {
+    fn build(has_sdf: bool, has_raster: bool, ssaa_factor: u32) -> Self {
+        match (has_sdf, has_raster, ssaa_factor) {
+            (false, false, _) => Self::Empty,
+            (true, false, _) => Self::SdfOnly,
+            (false, true, 1) => Self::RasterDirect,
+            (false, true, _) => Self::RasterDownsample,
+            (true, true, _) => Self::SdfRasterComposite,
+        }
+    }
+
+    fn runs_sdf(self) -> bool {
+        matches!(self, Self::SdfOnly | Self::SdfRasterComposite)
+    }
+
+    fn runs_raster(self) -> bool {
+        matches!(
+            self,
+            Self::RasterDirect | Self::RasterDownsample | Self::SdfRasterComposite
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TrackedImageState {
+    layout: vk::ImageLayout,
+    stage: vk::PipelineStageFlags2,
+    access: vk::AccessFlags2,
+}
+
+impl TrackedImageState {
+    const UNDEFINED: Self = Self {
+        layout: vk::ImageLayout::UNDEFINED,
+        stage: vk::PipelineStageFlags2::NONE,
+        access: vk::AccessFlags2::NONE,
+    };
+}
+
+unsafe fn transition_image(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    image: vk::Image,
+    aspect_mask: vk::ImageAspectFlags,
+    state: &mut TrackedImageState,
+    next: TrackedImageState,
+) {
+    let barrier = vk::ImageMemoryBarrier2::default()
+        .src_stage_mask(state.stage)
+        .src_access_mask(state.access)
+        .dst_stage_mask(next.stage)
+        .dst_access_mask(next.access)
+        .old_layout(state.layout)
+        .new_layout(next.layout)
+        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+        .image(image)
+        .subresource_range(vk::ImageSubresourceRange {
+            aspect_mask,
+            base_mip_level: 0,
+            level_count: 1,
+            base_array_layer: 0,
+            layer_count: 1,
+        });
+    let dependency =
+        vk::DependencyInfo::default().image_memory_barriers(std::slice::from_ref(&barrier));
+    unsafe {
+        device.cmd_pipeline_barrier2(command_buffer, &dependency);
+    }
+    *state = next;
+}
+
+unsafe fn write_gpu_timestamp(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    query_pool: vk::QueryPool,
+    query: u32,
+    enabled: bool,
+) {
+    if enabled {
+        unsafe {
+            device.cmd_write_timestamp2(
+                command_buffer,
+                vk::PipelineStageFlags2::ALL_COMMANDS,
+                query_pool,
+                query,
+            );
+        }
+    }
 }
 
 fn build_ordered_mesh_2d_batches(submissions: Vec<Mesh2DSubmission>) -> Vec<Mesh2DBatch> {
@@ -696,14 +876,30 @@ pub struct PrimitiveData3D {
     pub padding: [u32; 3],
 }
 
+struct RenderTargetSet {
+    texture: Image,
+    texture_state: TrackedImageState,
+    resolved_texture: Image,
+    resolved_texture_state: TrackedImageState,
+    compute_descriptor_set: vk::DescriptorSet,
+    composite_descriptor_set: vk::DescriptorSet,
+}
+
+impl RenderTargetSet {
+    fn destroy(&mut self, ctx: &VulkanContext) {
+        self.texture.destroy(ctx);
+        self.resolved_texture.destroy(ctx);
+    }
+}
+
 pub struct RenderCache {
     pub width: u32,
     pub height: u32,
-    pub texture: Image,
-    pub depth_texture: Image,
-    pub msaa_texture: Image,
-    pub msaa_depth_texture: Image,
-    pub resolved_texture: Image,
+    render_targets: [RenderTargetSet; RENDER_FRAME_COUNT],
+    pub msaa_texture: Option<Image>,
+    msaa_texture_state: TrackedImageState,
+    pub msaa_depth_texture: Option<Image>,
+    msaa_depth_texture_state: TrackedImageState,
     pub output_buffers: [Buffer; RENDER_FRAME_COUNT],
     pub nv12_output_buffers: [Buffer; RENDER_FRAME_COUNT],
     pub nv12_descriptor_sets: [vk::DescriptorSet; RENDER_FRAME_COUNT],
@@ -711,25 +907,23 @@ pub struct RenderCache {
     pub yuv444p_descriptor_sets: [vk::DescriptorSet; RENDER_FRAME_COUNT],
     pub video_nv12_slots: Vec<VideoNv12Slot>,
     pub current_frame: usize,
-    pub compute_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set_2d: vk::DescriptorSet,
-    pub composite_descriptor_set: vk::DescriptorSet,
     pub padded_bytes_per_row: u32,
-    pub framebuffer: vk::Framebuffer,
     pub rgba_preview_buffer: Vec<u8>,
 }
 
 impl RenderCache {
     pub fn destroy(&mut self, ctx: &VulkanContext) {
-        unsafe {
-            ctx.device.destroy_framebuffer(self.framebuffer, None);
+        for targets in &mut self.render_targets {
+            targets.destroy(ctx);
         }
-        self.texture.destroy(ctx);
-        self.depth_texture.destroy(ctx);
-        self.msaa_texture.destroy(ctx);
-        self.msaa_depth_texture.destroy(ctx);
-        self.resolved_texture.destroy(ctx);
+        if let Some(texture) = &mut self.msaa_texture {
+            texture.destroy(ctx);
+        }
+        if let Some(texture) = &mut self.msaa_depth_texture {
+            texture.destroy(ctx);
+        }
         for buf in &mut self.output_buffers {
             buf.destroy(ctx);
         }
@@ -749,6 +943,12 @@ pub struct FrameData {
     pub command_pool: vk::CommandPool,
     pub command_buffer: vk::CommandBuffer,
     pub fence: vk::Fence,
+    query_pool: vk::QueryPool,
+    timestamps_pending: bool,
+    profiled_plan: FrameExecutionPlan,
+    profiled_geometry_upload: bool,
+    profiled_postprocess: bool,
+    profiled_output: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -781,6 +981,13 @@ impl RenderOutputs {
         cpu_yuv444p: false,
     };
 
+    pub const CPU_RGBA_ONLY: Self = Self {
+        cpu_nv12: false,
+        vulkan_video: false,
+        cpu_rgba: true,
+        cpu_yuv444p: false,
+    };
+
     pub const CPU_READBACKS: Self = Self {
         cpu_nv12: true,
         vulkan_video: false,
@@ -806,13 +1013,14 @@ pub struct VulkanRenderer {
     compute_pipeline: vk::Pipeline,
     composite_pipeline_layout: vk::PipelineLayout,
     composite_pipeline: vk::Pipeline,
+    downsample_pipeline: vk::Pipeline,
     nv12_pipeline_layout: vk::PipelineLayout,
     nv12_pipeline: vk::Pipeline,
     video_nv12_pipeline_layout: vk::PipelineLayout,
     video_nv12_pipeline: vk::Pipeline,
+    video_nv12_downsample_pipeline: vk::Pipeline,
     yuv444p_pipeline: vk::Pipeline,
 
-    render_pass: vk::RenderPass,
     raster_pipeline_layout: vk::PipelineLayout,
     raster_pipeline: vk::Pipeline,
 
@@ -824,6 +1032,7 @@ pub struct VulkanRenderer {
 
     raster_pipeline_layout_2d: vk::PipelineLayout,
     raster_pipeline_2d: vk::Pipeline,
+    raster_pipeline_2d_depthless: vk::Pipeline,
     vertex_buffer_2d: Buffer,
     index_buffer_2d: Buffer,
     vertex_staging_buffer_2d: Buffer,
@@ -842,6 +1051,8 @@ pub struct VulkanRenderer {
     static_vertex_buffer_2d_used: u64,
     static_index_buffer_2d_used: u64,
     last_stats: RendererStats,
+    gpu_profiling: bool,
+    last_gpu_timings: Option<GpuPassTimings>,
 
     frame_data: [FrameData; RENDER_FRAME_COUNT],
 
@@ -860,8 +1071,11 @@ impl VulkanRenderer {
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
         let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
         let video_nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12_image.wgsl"));
+        let video_nv12_downsample_shader =
+            compile_wgsl_full(&ctx, include_str!("downsample_to_nv12_image.wgsl"));
         let yuv444p_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_yuv444p.wgsl"));
         let composite_shader = compile_wgsl_full(&ctx, include_str!("composite_shader.wgsl"));
+        let downsample_shader = compile_wgsl_full(&ctx, include_str!("downsample_shader.wgsl"));
 
         let composite_bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -929,7 +1143,7 @@ impl VulkanRenderer {
         let video_nv12_bindings = [
             vk::DescriptorSetLayoutBinding {
                 binding: 0,
-                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
@@ -1030,6 +1244,23 @@ impl VulkanRenderer {
                 )
                 .unwrap()[0]
         };
+        let video_nv12_downsample_stage = vk::PipelineShaderStageCreateInfo {
+            module: video_nv12_downsample_shader,
+            ..video_nv12_stage
+        };
+        let video_nv12_downsample_pipeline_info = vk::ComputePipelineCreateInfo {
+            stage: video_nv12_downsample_stage,
+            ..video_nv12_pipeline_info
+        };
+        let video_nv12_downsample_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&video_nv12_downsample_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let yuv444p_stage = vk::PipelineShaderStageCreateInfo {
             s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
@@ -1085,6 +1316,28 @@ impl VulkanRenderer {
                 .create_compute_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&composite_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let downsample_stage = vk::PipelineShaderStageCreateInfo {
+            s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+            stage: vk::ShaderStageFlags::COMPUTE,
+            module: downsample_shader,
+            p_name: main_name.as_ptr(),
+            ..Default::default()
+        };
+        let downsample_pipeline_info = vk::ComputePipelineCreateInfo {
+            s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+            stage: downsample_stage,
+            layout: composite_pipeline_layout,
+            ..Default::default()
+        };
+        let downsample_pipeline = unsafe {
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&downsample_pipeline_info),
                     None,
                 )
                 .unwrap()[0]
@@ -1182,82 +1435,6 @@ impl VulkanRenderer {
                     None,
                 )
                 .unwrap()[0]
-        };
-
-        let color_attachment = vk::AttachmentDescription {
-            format: vk::Format::R8G8B8A8_UNORM,
-            samples: sample_count,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::DONT_CARE,
-            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            ..Default::default()
-        };
-
-        let depth_attachment = vk::AttachmentDescription {
-            format: vk::Format::D32_SFLOAT,
-            samples: sample_count,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::DONT_CARE,
-            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            ..Default::default()
-        };
-
-        let resolve_attachment = vk::AttachmentDescription {
-            format: vk::Format::R8G8B8A8_UNORM,
-            samples: vk::SampleCountFlags::TYPE_1,
-            load_op: vk::AttachmentLoadOp::CLEAR,
-            store_op: vk::AttachmentStoreOp::STORE,
-            stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
-            stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            final_layout: vk::ImageLayout::GENERAL,
-            ..Default::default()
-        };
-
-        let color_attachment_ref = vk::AttachmentReference {
-            attachment: 0,
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        };
-
-        let depth_attachment_ref = vk::AttachmentReference {
-            attachment: 1,
-            layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-        };
-
-        let resolve_attachment_ref = vk::AttachmentReference {
-            attachment: 2,
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        };
-
-        let subpass = vk::SubpassDescription {
-            pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
-            color_attachment_count: 1,
-            p_color_attachments: &color_attachment_ref,
-            p_depth_stencil_attachment: &depth_attachment_ref,
-            p_resolve_attachments: &resolve_attachment_ref,
-            ..Default::default()
-        };
-
-        let attachments = [color_attachment, depth_attachment, resolve_attachment];
-        let render_pass_info = vk::RenderPassCreateInfo {
-            s_type: vk::StructureType::RENDER_PASS_CREATE_INFO,
-            attachment_count: attachments.len() as u32,
-            p_attachments: attachments.as_ptr(),
-            subpass_count: 1,
-            p_subpasses: &subpass,
-            ..Default::default()
-        };
-
-        let render_pass = unsafe {
-            ctx.device
-                .create_render_pass(&render_pass_info, None)
-                .unwrap()
         };
 
         let raster_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
@@ -1429,9 +1606,14 @@ impl VulkanRenderer {
                 ..Default::default()
             },
         ];
+        let raster_color_formats = [vk::Format::R8G8B8A8_UNORM];
+        let pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&raster_color_formats)
+            .depth_attachment_format(vk::Format::D32_SFLOAT);
 
         let raster_pipeline_info = vk::GraphicsPipelineCreateInfo {
             s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: (&pipeline_rendering_info as *const vk::PipelineRenderingCreateInfo).cast(),
             stage_count: shader_stages.len() as u32,
             p_stages: shader_stages.as_ptr(),
             p_vertex_input_state: &vertex_input_info,
@@ -1443,8 +1625,7 @@ impl VulkanRenderer {
             p_color_blend_state: &color_blending,
             p_dynamic_state: &dynamic_state,
             layout: raster_pipeline_layout,
-            render_pass,
-            subpass: 0,
+            render_pass: vk::RenderPass::null(),
             ..Default::default()
         };
 
@@ -1546,6 +1727,7 @@ impl VulkanRenderer {
 
         let raster_pipeline_info_2d = vk::GraphicsPipelineCreateInfo {
             s_type: vk::StructureType::GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: (&pipeline_rendering_info as *const vk::PipelineRenderingCreateInfo).cast(),
             stage_count: shader_stages_2d.len() as u32,
             p_stages: shader_stages_2d.as_ptr(),
             p_vertex_input_state: &vertex_input_info_2d,
@@ -1557,8 +1739,7 @@ impl VulkanRenderer {
             p_color_blend_state: &color_blending,
             p_dynamic_state: &dynamic_state,
             layout: raster_pipeline_layout_2d,
-            render_pass,
-            subpass: 0,
+            render_pass: vk::RenderPass::null(),
             ..Default::default()
         };
 
@@ -1571,11 +1752,31 @@ impl VulkanRenderer {
                 )
                 .unwrap()[0]
         };
+        let depthless_pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&raster_color_formats);
+        let raster_pipeline_info_2d_depthless = vk::GraphicsPipelineCreateInfo {
+            p_next: (&depthless_pipeline_rendering_info as *const vk::PipelineRenderingCreateInfo)
+                .cast(),
+            ..raster_pipeline_info_2d
+        };
+        let raster_pipeline_2d_depthless = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&raster_pipeline_info_2d_depthless),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let descriptor_pool_sizes = [
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::STORAGE_IMAGE,
                 descriptor_count: 80,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 20,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -1732,10 +1933,24 @@ impl VulkanRenderer {
                 ..Default::default()
             };
             let fence = unsafe { ctx.device.create_fence(&fence_info, None).unwrap() };
+            let query_pool_info = vk::QueryPoolCreateInfo::default()
+                .query_type(vk::QueryType::TIMESTAMP)
+                .query_count(GPU_TIMESTAMP_COUNT);
+            let query_pool = unsafe {
+                ctx.device
+                    .create_query_pool(&query_pool_info, None)
+                    .unwrap()
+            };
             FrameData {
                 command_pool,
                 command_buffer,
                 fence,
+                query_pool,
+                timestamps_pending: false,
+                profiled_plan: FrameExecutionPlan::Empty,
+                profiled_geometry_upload: false,
+                profiled_postprocess: false,
+                profiled_output: false,
             }
         });
 
@@ -1745,8 +1960,11 @@ impl VulkanRenderer {
             ctx.device.destroy_shader_module(raster_shader_2d, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
             ctx.device.destroy_shader_module(video_nv12_shader, None);
+            ctx.device
+                .destroy_shader_module(video_nv12_downsample_shader, None);
             ctx.device.destroy_shader_module(yuv444p_shader, None);
             ctx.device.destroy_shader_module(composite_shader, None);
+            ctx.device.destroy_shader_module(downsample_shader, None);
         }
 
         Self {
@@ -1762,12 +1980,13 @@ impl VulkanRenderer {
             compute_pipeline,
             composite_pipeline_layout,
             composite_pipeline,
+            downsample_pipeline,
             nv12_pipeline_layout,
             nv12_pipeline,
             video_nv12_pipeline_layout,
             video_nv12_pipeline,
+            video_nv12_downsample_pipeline,
             yuv444p_pipeline,
-            render_pass,
             raster_pipeline_layout,
             raster_pipeline,
             vertex_buffer,
@@ -1777,6 +1996,7 @@ impl VulkanRenderer {
             nv12_constants_buffer,
             raster_pipeline_layout_2d,
             raster_pipeline_2d,
+            raster_pipeline_2d_depthless,
             vertex_buffer_2d,
             index_buffer_2d,
             vertex_staging_buffer_2d,
@@ -1795,6 +2015,8 @@ impl VulkanRenderer {
             static_vertex_buffer_2d_used: 0,
             static_index_buffer_2d_used: 0,
             last_stats: RendererStats::default(),
+            gpu_profiling: false,
+            last_gpu_timings: None,
             frame_data,
             cache: std::sync::Mutex::new(None),
             msaa_samples: sample_count.as_raw(),
@@ -1804,6 +2026,17 @@ impl VulkanRenderer {
 
     pub fn last_stats(&self) -> RendererStats {
         self.last_stats
+    }
+
+    pub fn set_gpu_profiling(&mut self, enabled: bool) {
+        self.gpu_profiling = enabled;
+        if !enabled {
+            self.last_gpu_timings = None;
+        }
+    }
+
+    pub fn last_gpu_timings(&self) -> Option<GpuPassTimings> {
+        self.last_gpu_timings
     }
 
     pub fn render_scene(
@@ -2047,54 +2280,50 @@ impl VulkanRenderer {
                 }),
             );
 
-            let texture = Image::new(
-                &self.ctx,
-                width,
-                height,
-                vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::STORAGE
-                    | vk::ImageUsageFlags::SAMPLED
-                    | vk::ImageUsageFlags::TRANSFER_SRC,
-                vk::ImageAspectFlags::COLOR,
-                vk::SampleCountFlags::TYPE_1,
-            );
-            let msaa_texture = Image::new(
-                &self.ctx,
-                width * self.ssaa_factor,
-                height * self.ssaa_factor,
-                vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                vk::ImageAspectFlags::COLOR,
-                msaa_to_vk_sample_count(self.msaa_samples),
-            );
-            let msaa_depth_texture = Image::new(
-                &self.ctx,
-                width * self.ssaa_factor,
-                height * self.ssaa_factor,
-                vk::Format::D32_SFLOAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                vk::ImageAspectFlags::DEPTH,
-                msaa_to_vk_sample_count(self.msaa_samples),
-            );
-            let resolved_texture = Image::new(
-                &self.ctx,
-                width * self.ssaa_factor,
-                height * self.ssaa_factor,
-                vk::Format::R8G8B8A8_UNORM,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                vk::ImageAspectFlags::COLOR,
-                vk::SampleCountFlags::TYPE_1,
-            );
-            let depth_texture = Image::new(
-                &self.ctx,
-                width,
-                height,
-                vk::Format::D32_SFLOAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                vk::ImageAspectFlags::DEPTH,
-                vk::SampleCountFlags::TYPE_1,
-            );
-
+            let mut render_targets = std::array::from_fn(|_| {
+                let texture = Image::new(
+                    &self.ctx,
+                    width,
+                    height,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::ImageUsageFlags::STORAGE
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_SRC
+                        | vk::ImageUsageFlags::TRANSFER_DST
+                        | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let resolved_texture = Image::new(
+                    &self.ctx,
+                    width * self.ssaa_factor,
+                    height * self.ssaa_factor,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                RenderTargetSet {
+                    texture,
+                    texture_state: TrackedImageState::UNDEFINED,
+                    resolved_texture,
+                    resolved_texture_state: TrackedImageState::UNDEFINED,
+                    compute_descriptor_set: vk::DescriptorSet::null(),
+                    composite_descriptor_set: vk::DescriptorSet::null(),
+                }
+            });
+            let raster_sample_count = msaa_to_vk_sample_count(self.msaa_samples);
+            let msaa_texture = (raster_sample_count != vk::SampleCountFlags::TYPE_1).then(|| {
+                Image::new(
+                    &self.ctx,
+                    width * self.ssaa_factor,
+                    height * self.ssaa_factor,
+                    vk::Format::R8G8B8A8_UNORM,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                    vk::ImageAspectFlags::COLOR,
+                    raster_sample_count,
+                )
+            });
             let output_buffer_size = (padded_bytes_per_row * height) as u64;
             let output_buffers = [
                 Buffer::new(
@@ -2161,19 +2390,26 @@ impl VulkanRenderer {
                 ),
             ];
 
+            let compute_layouts = [self.compute_descriptor_set_layout; RENDER_FRAME_COUNT];
             let alloc_info = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
                 descriptor_pool: self.descriptor_pool,
-                descriptor_set_count: 1,
-                p_set_layouts: &self.compute_descriptor_set_layout,
+                descriptor_set_count: RENDER_FRAME_COUNT as u32,
+                p_set_layouts: compute_layouts.as_ptr(),
                 ..Default::default()
             };
-            let compute_descriptor_set = unsafe {
+            let compute_descriptor_sets = unsafe {
                 self.ctx
                     .device
                     .allocate_descriptor_sets(&alloc_info)
-                    .unwrap()[0]
+                    .unwrap()
             };
+            for (targets, descriptor_set) in render_targets
+                .iter_mut()
+                .zip(compute_descriptor_sets.into_iter())
+            {
+                targets.compute_descriptor_set = descriptor_set;
+            }
 
             let alloc_info_raster = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2203,19 +2439,26 @@ impl VulkanRenderer {
                     .unwrap()[0]
             };
 
+            let composite_layouts = [self.composite_descriptor_set_layout; RENDER_FRAME_COUNT];
             let alloc_info_composite = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
                 descriptor_pool: self.descriptor_pool,
-                descriptor_set_count: 1,
-                p_set_layouts: &self.composite_descriptor_set_layout,
+                descriptor_set_count: RENDER_FRAME_COUNT as u32,
+                p_set_layouts: composite_layouts.as_ptr(),
                 ..Default::default()
             };
-            let composite_descriptor_set = unsafe {
+            let composite_descriptor_sets = unsafe {
                 self.ctx
                     .device
                     .allocate_descriptor_sets(&alloc_info_composite)
-                    .unwrap()[0]
+                    .unwrap()
             };
+            for (targets, descriptor_set) in render_targets
+                .iter_mut()
+                .zip(composite_descriptor_sets.into_iter())
+            {
+                targets.composite_descriptor_set = descriptor_set;
+            }
 
             let nv12_layouts = [self.nv12_descriptor_set_layout; 3];
             let nv12_alloc_info = vk::DescriptorSetAllocateInfo {
@@ -2274,16 +2517,22 @@ impl VulkanRenderer {
                 slot.descriptor_set = descriptor_set;
             }
 
-            let image_info = vk::DescriptorImageInfo {
-                image_view: texture.view,
-                image_layout: vk::ImageLayout::GENERAL,
-                ..Default::default()
-            };
-            let image_info_resolved = vk::DescriptorImageInfo {
-                image_view: resolved_texture.view,
-                image_layout: vk::ImageLayout::GENERAL,
-                ..Default::default()
-            };
+            let image_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.texture.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_image_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_texture.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
             let camera_buffer_info = vk::DescriptorBufferInfo {
                 buffer: self.camera_buffer.vk_buffer,
                 offset: 0,
@@ -2307,33 +2556,6 @@ impl VulkanRenderer {
             let mut write_descriptor_sets = vec![
                 vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: compute_descriptor_set,
-                    dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: 1,
-                    p_image_info: &image_info,
-                    ..Default::default()
-                },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: compute_descriptor_set,
-                    dst_binding: 1,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                    descriptor_count: 1,
-                    p_buffer_info: &camera_buffer_info,
-                    ..Default::default()
-                },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: compute_descriptor_set,
-                    dst_binding: 2,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
-                    descriptor_count: 1,
-                    p_buffer_info: &buffer_3d_info,
-                    ..Default::default()
-                },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: raster_descriptor_set,
                     dst_binding: 1,
                     descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
@@ -2350,25 +2572,56 @@ impl VulkanRenderer {
                     p_buffer_info: &camera_buffer_2d_info,
                     ..Default::default()
                 },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: composite_descriptor_set,
-                    dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                    descriptor_count: 1,
-                    p_image_info: &image_info,
-                    ..Default::default()
-                },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: composite_descriptor_set,
-                    dst_binding: 1,
-                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                    descriptor_count: 1,
-                    p_image_info: &image_info_resolved,
-                    ..Default::default()
-                },
             ];
+            for (index, targets) in render_targets.iter().enumerate() {
+                write_descriptor_sets.extend([
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &image_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &camera_buffer_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 2,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &buffer_3d_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.composite_descriptor_set,
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &image_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.composite_descriptor_set,
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_image_infos[index],
+                        ..Default::default()
+                    },
+                ]);
+            }
 
             let nv12_constants_buffer_info = vk::DescriptorBufferInfo {
                 buffer: self.nv12_constants_buffer.vk_buffer,
@@ -2394,7 +2647,7 @@ impl VulkanRenderer {
                     dst_binding: 0,
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: 1,
-                    p_image_info: &image_info,
+                    p_image_info: &image_infos[i],
                     ..Default::default()
                 });
                 write_descriptor_sets.push(vk::WriteDescriptorSet {
@@ -2433,7 +2686,7 @@ impl VulkanRenderer {
                     dst_binding: 0,
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: 1,
-                    p_image_info: &image_info,
+                    p_image_info: &image_infos[i],
                     ..Default::default()
                 });
                 write_descriptor_sets.push(vk::WriteDescriptorSet {
@@ -2461,7 +2714,7 @@ impl VulkanRenderer {
             let mut video_nv12_uv_infos = Vec::new();
             for slot in &video_nv12_slots {
                 video_nv12_input_infos.push(vk::DescriptorImageInfo {
-                    image_view: texture.view,
+                    image_view: render_targets[0].texture.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 });
@@ -2481,7 +2734,7 @@ impl VulkanRenderer {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: video_nv12_slots[i].descriptor_set,
                     dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: 1,
                     p_image_info: &video_nv12_input_infos[i],
                     ..Default::default()
@@ -2512,36 +2765,14 @@ impl VulkanRenderer {
                     .update_descriptor_sets(&write_descriptor_sets, &[]);
             }
 
-            let attachments = [
-                msaa_texture.view,
-                msaa_depth_texture.view,
-                resolved_texture.view,
-            ];
-            let framebuffer_info = vk::FramebufferCreateInfo {
-                s_type: vk::StructureType::FRAMEBUFFER_CREATE_INFO,
-                render_pass: self.render_pass,
-                attachment_count: attachments.len() as u32,
-                p_attachments: attachments.as_ptr(),
-                width: width * self.ssaa_factor,
-                height: height * self.ssaa_factor,
-                layers: 1,
-                ..Default::default()
-            };
-            let framebuffer = unsafe {
-                self.ctx
-                    .device
-                    .create_framebuffer(&framebuffer_info, None)
-                    .unwrap()
-            };
-
             *cache_guard = Some(RenderCache {
                 width,
                 height,
-                texture,
-                depth_texture,
+                render_targets,
                 msaa_texture,
-                msaa_depth_texture,
-                resolved_texture,
+                msaa_texture_state: TrackedImageState::UNDEFINED,
+                msaa_depth_texture: None,
+                msaa_depth_texture_state: TrackedImageState::UNDEFINED,
                 output_buffers,
                 nv12_output_buffers,
                 nv12_descriptor_sets,
@@ -2549,12 +2780,9 @@ impl VulkanRenderer {
                 yuv444p_descriptor_sets,
                 video_nv12_slots,
                 current_frame: 0,
-                compute_descriptor_set,
                 raster_descriptor_set,
                 raster_descriptor_set_2d,
-                composite_descriptor_set,
                 padded_bytes_per_row,
-                framebuffer,
                 rgba_preview_buffer: vec![0; (width * height * 4) as usize],
             });
         }
@@ -2607,6 +2835,34 @@ impl VulkanRenderer {
             }
             Err(error) => panic!("2D frame preparation failed: {error:?}"),
         };
+        let frame_plan = FrameExecutionPlan::build(
+            !objects_3d.is_empty(),
+            !mesh_indices.is_empty() || !prepared_mesh_batches_2d.is_empty(),
+            self.ssaa_factor,
+        );
+        let fused_video_downsample = frame_plan == FrameExecutionPlan::RasterDownsample
+            && self.ssaa_factor == 2
+            && outputs.vulkan_video
+            && !outputs.cpu_nv12
+            && !outputs.cpu_yuv444p
+            && !outputs.cpu_rgba;
+        let runs_postprocess = matches!(
+            frame_plan,
+            FrameExecutionPlan::RasterDownsample | FrameExecutionPlan::SdfRasterComposite
+        ) && !fused_video_downsample;
+        let raster_uses_depth = !mesh_indices.is_empty();
+        if raster_uses_depth && cache.msaa_depth_texture.is_none() {
+            cache.msaa_depth_texture = Some(Image::new(
+                &self.ctx,
+                width * self.ssaa_factor,
+                height * self.ssaa_factor,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                msaa_to_vk_sample_count(self.msaa_samples),
+            ));
+            cache.msaa_depth_texture_state = TrackedImageState::UNDEFINED;
+        }
 
         self.last_stats = RendererStats {
             mesh_2d_draw_calls: prepared_mesh_batches_2d.len() as u32,
@@ -2621,9 +2877,21 @@ impl VulkanRenderer {
                 .map(|upload| std::mem::size_of_val(upload.geometry.indices()) as u64)
                 .sum(),
             mesh_2d_arena_rebuilds,
+            sdf_dispatches: frame_plan.runs_sdf() as u32,
+            raster_passes: frame_plan.runs_raster() as u32,
+            depth_attachment_raster_passes: raster_uses_depth as u32,
+            downsample_dispatches: (frame_plan == FrameExecutionPlan::RasterDownsample
+                && !fused_video_downsample) as u32,
+            fused_video_downsample_dispatches: fused_video_downsample as u32,
+            composite_dispatches: (frame_plan == FrameExecutionPlan::SdfRasterComposite) as u32,
+            output_conversion_dispatches: outputs.cpu_nv12 as u32
+                + outputs.cpu_yuv444p as u32
+                + outputs.vulkan_video as u32,
+            rgba_readback_copies: outputs.cpu_rgba as u32,
         };
 
-        let fd = &self.frame_data[frame_idx];
+        let gpu_profiling = self.gpu_profiling;
+        let fd = &mut self.frame_data[frame_idx];
         let vertex_buffer_offset = self.vertex_buffer_stride * frame_idx as u64;
         let index_buffer_offset = self.index_buffer_stride * frame_idx as u64;
         let camera_buffer_offset = self.camera_buffer_stride * frame_idx as u64;
@@ -2636,12 +2904,35 @@ impl VulkanRenderer {
         let compute_dynamic_offsets = [camera_buffer_offset as u32, primitive_buffer_offset as u32];
         let raster_dynamic_offsets = [camera_buffer_offset as u32];
         let raster_2d_dynamic_offsets = [camera_buffer_2d_offset as u32];
+        let targets = &mut cache.render_targets[frame_idx];
 
         unsafe {
             self.ctx
                 .device
                 .wait_for_fences(std::slice::from_ref(&fd.fence), true, std::u64::MAX)
                 .unwrap();
+            if fd.timestamps_pending {
+                let mut timestamps = [0u64; GPU_TIMESTAMP_COUNT as usize];
+                self.ctx
+                    .device
+                    .get_query_pool_results(
+                        fd.query_pool,
+                        0,
+                        &mut timestamps,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                    .unwrap();
+                self.last_gpu_timings = Some(GpuPassTimings::from_timestamps(
+                    timestamps,
+                    self.ctx.timestamp_period_ns,
+                    self.ctx.timestamp_valid_bits,
+                    fd.profiled_plan,
+                    fd.profiled_geometry_upload,
+                    fd.profiled_postprocess,
+                    fd.profiled_output,
+                ));
+                fd.timestamps_pending = false;
+            }
             self.ctx
                 .device
                 .reset_fences(std::slice::from_ref(&fd.fence))
@@ -2650,6 +2941,30 @@ impl VulkanRenderer {
                 .device
                 .reset_command_pool(fd.command_pool, vk::CommandPoolResetFlags::empty())
                 .unwrap();
+
+            if outputs.vulkan_video {
+                let input_info = vk::DescriptorImageInfo {
+                    image_view: if fused_video_downsample {
+                        targets.resolved_texture.view
+                    } else {
+                        targets.texture.view
+                    },
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                };
+                let input_write = vk::WriteDescriptorSet {
+                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                    dst_set: cache.video_nv12_slots[video_frame_idx].descriptor_set,
+                    dst_binding: 0,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &input_info,
+                    ..Default::default()
+                };
+                self.ctx
+                    .device
+                    .update_descriptor_sets(std::slice::from_ref(&input_write), &[]);
+            }
 
             self.camera_buffer
                 .write_bytes(camera_buffer_offset, bytemuck::bytes_of(camera_uniform));
@@ -2701,6 +3016,21 @@ impl VulkanRenderer {
                 .device
                 .begin_command_buffer(fd.command_buffer, &begin_info)
                 .unwrap();
+            if gpu_profiling {
+                self.ctx.device.cmd_reset_query_pool(
+                    fd.command_buffer,
+                    fd.query_pool,
+                    0,
+                    GPU_TIMESTAMP_COUNT,
+                );
+            }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                0,
+                gpu_profiling,
+            );
 
             if !geometry_uploads_2d.is_empty() {
                 let vertex_copies: Vec<_> = geometry_uploads_2d
@@ -2760,290 +3090,400 @@ impl VulkanRenderer {
                     .device
                     .cmd_pipeline_barrier2(fd.command_buffer, &geometry_dependency);
             }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                1,
+                gpu_profiling,
+            );
 
-            let barrier = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::UNDEFINED,
-                new_layout: vk::ImageLayout::GENERAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: cache.texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::empty(),
-                dst_access_mask: vk::AccessFlags::SHADER_WRITE,
-                ..Default::default()
+            let color_attachment_state = TrackedImageState {
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+                access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
+            };
+            let compute_write_state = TrackedImageState {
+                layout: vk::ImageLayout::GENERAL,
+                stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                access: vk::AccessFlags2::SHADER_WRITE,
+            };
+            let compute_read_state = TrackedImageState {
+                layout: vk::ImageLayout::GENERAL,
+                stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                access: vk::AccessFlags2::SHADER_READ,
             };
 
-            self.ctx.device.cmd_pipeline_barrier(
-                fd.command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&barrier),
-            );
-
-            self.ctx.device.cmd_bind_pipeline(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.compute_pipeline,
-            );
-            self.ctx.device.cmd_bind_descriptor_sets(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.compute_pipeline_layout,
-                0,
-                std::slice::from_ref(&cache.compute_descriptor_set),
-                &compute_dynamic_offsets,
-            );
-            let workgroup_x = (width + 15) / 16;
-            let workgroup_y = (height + 15) / 16;
-            self.ctx
-                .device
-                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
-
-            let clear_values = [
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
+            if frame_plan == FrameExecutionPlan::Empty {
+                let clear_state = TrackedImageState {
+                    layout: vk::ImageLayout::GENERAL,
+                    stage: vk::PipelineStageFlags2::CLEAR,
+                    access: vk::AccessFlags2::TRANSFER_WRITE,
+                };
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.texture_state,
+                    clear_state,
+                );
+                self.ctx.device.cmd_clear_color_image(
+                    fd.command_buffer,
+                    targets.texture.vk_image,
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue {
                         float32: [0.0, 0.0, 0.0, 0.0],
                     },
-                },
-                vk::ClearValue {
-                    depth_stencil: vk::ClearDepthStencilValue {
-                        depth: 1.0,
-                        stencil: 0,
-                    },
-                },
-                vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
-                    },
-                },
-            ];
-
-            let render_pass_begin_info = vk::RenderPassBeginInfo {
-                s_type: vk::StructureType::RENDER_PASS_BEGIN_INFO,
-                render_pass: self.render_pass,
-                framebuffer: cache.framebuffer,
-                render_area: vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D {
-                        width: width * self.ssaa_factor,
-                        height: height * self.ssaa_factor,
-                    },
-                },
-                clear_value_count: clear_values.len() as u32,
-                p_clear_values: clear_values.as_ptr(),
-                ..Default::default()
-            };
-
-            self.ctx.device.cmd_begin_render_pass(
-                fd.command_buffer,
-                &render_pass_begin_info,
-                vk::SubpassContents::INLINE,
-            );
-
-            let viewport = vk::Viewport {
-                x: 0.0,
-                y: 0.0,
-                width: (width * self.ssaa_factor) as f32,
-                height: (height * self.ssaa_factor) as f32,
-                min_depth: 0.0,
-                max_depth: 1.0,
-            };
-            self.ctx
-                .device
-                .cmd_set_viewport(fd.command_buffer, 0, std::slice::from_ref(&viewport));
-            let scissor = vk::Rect2D {
-                offset: vk::Offset2D { x: 0, y: 0 },
-                extent: vk::Extent2D {
-                    width: width * self.ssaa_factor,
-                    height: height * self.ssaa_factor,
-                },
-            };
-            self.ctx
-                .device
-                .cmd_set_scissor(fd.command_buffer, 0, std::slice::from_ref(&scissor));
-
-            if !mesh_indices.is_empty() {
-                self.ctx.device.cmd_bind_pipeline(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.raster_pipeline,
+                    &[vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }],
                 );
-                self.ctx.device.cmd_bind_descriptor_sets(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.raster_pipeline_layout,
-                    0,
-                    std::slice::from_ref(&cache.raster_descriptor_set),
-                    &raster_dynamic_offsets,
-                );
-                self.ctx.device.cmd_bind_vertex_buffers(
-                    fd.command_buffer,
-                    0,
-                    std::slice::from_ref(&self.vertex_buffer.vk_buffer),
-                    &[vertex_buffer_offset],
-                );
-                self.ctx.device.cmd_bind_index_buffer(
-                    fd.command_buffer,
-                    self.index_buffer.vk_buffer,
-                    index_buffer_offset,
-                    vk::IndexType::UINT32,
-                );
-                let indices_to_draw =
-                    (mesh_indices.len() as u32).min((self.index_buffer_stride / 4) as u32);
-                self.ctx
-                    .device
-                    .cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
             }
 
-            if !prepared_mesh_batches_2d.is_empty() {
+            if frame_plan.runs_sdf() {
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.texture_state,
+                    compute_write_state,
+                );
                 self.ctx.device.cmd_bind_pipeline(
                     fd.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.raster_pipeline_2d,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.compute_pipeline,
                 );
                 self.ctx.device.cmd_bind_descriptor_sets(
                     fd.command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.raster_pipeline_layout_2d,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.compute_pipeline_layout,
                     0,
-                    std::slice::from_ref(&cache.raster_descriptor_set_2d),
-                    &raster_2d_dynamic_offsets,
+                    std::slice::from_ref(&targets.compute_descriptor_set),
+                    &compute_dynamic_offsets,
                 );
-                let vertex_buffers = [
-                    self.vertex_buffer_2d.vk_buffer,
-                    self.instance_buffer_2d.vk_buffer,
-                ];
-                self.ctx.device.cmd_bind_vertex_buffers(
+                self.ctx.device.cmd_dispatch(
+                    fd.command_buffer,
+                    (width + 15) / 16,
+                    (height + 15) / 16,
+                    1,
+                );
+            }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                2,
+                gpu_profiling,
+            );
+
+            if frame_plan.runs_raster() {
+                let direct = frame_plan == FrameExecutionPlan::RasterDirect;
+                let (target_image, target_view, target_state) = if direct {
+                    (
+                        targets.texture.vk_image,
+                        targets.texture.view,
+                        &mut targets.texture_state,
+                    )
+                } else {
+                    (
+                        targets.resolved_texture.vk_image,
+                        targets.resolved_texture.view,
+                        &mut targets.resolved_texture_state,
+                    )
+                };
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    target_image,
+                    vk::ImageAspectFlags::COLOR,
+                    target_state,
+                    color_attachment_state,
+                );
+                if raster_uses_depth {
+                    let depth_texture = cache
+                        .msaa_depth_texture
+                        .as_ref()
+                        .expect("3D raster requires a depth attachment");
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        depth_texture.vk_image,
+                        vk::ImageAspectFlags::DEPTH,
+                        &mut cache.msaa_depth_texture_state,
+                        TrackedImageState {
+                            layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
+                            stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                            access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
+                                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                        },
+                    );
+                }
+
+                let mut color_attachment = vk::RenderingAttachmentInfo::default()
+                    .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                    .store_op(vk::AttachmentStoreOp::STORE)
+                    .clear_value(vk::ClearValue {
+                        color: vk::ClearColorValue {
+                            float32: [0.0, 0.0, 0.0, 0.0],
+                        },
+                    });
+                if let Some(msaa_texture) = &cache.msaa_texture {
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        msaa_texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut cache.msaa_texture_state,
+                        color_attachment_state,
+                    );
+                    color_attachment = color_attachment
+                        .image_view(msaa_texture.view)
+                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                        .resolve_image_view(target_view)
+                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                } else {
+                    color_attachment = color_attachment.image_view(target_view);
+                }
+                let depth_attachment = cache.msaa_depth_texture.as_ref().map(|texture| {
+                    vk::RenderingAttachmentInfo::default()
+                        .image_view(texture.view)
+                        .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .clear_value(vk::ClearValue {
+                            depth_stencil: vk::ClearDepthStencilValue {
+                                depth: 1.0,
+                                stencil: 0,
+                            },
+                        })
+                });
+                let color_attachments = [color_attachment];
+                let raster_extent = vk::Extent2D {
+                    width: width * self.ssaa_factor,
+                    height: height * self.ssaa_factor,
+                };
+                let mut rendering_info = vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: raster_extent,
+                    })
+                    .layer_count(1)
+                    .color_attachments(&color_attachments);
+                if raster_uses_depth {
+                    rendering_info = rendering_info.depth_attachment(
+                        depth_attachment
+                            .as_ref()
+                            .expect("3D raster requires a depth attachment"),
+                    );
+                }
+                self.ctx
+                    .device
+                    .cmd_begin_rendering(fd.command_buffer, &rendering_info);
+
+                self.ctx.device.cmd_set_viewport(
                     fd.command_buffer,
                     0,
-                    &vertex_buffers,
-                    &[0, instance_buffer_2d_offset],
+                    &[vk::Viewport {
+                        x: 0.0,
+                        y: 0.0,
+                        width: raster_extent.width as f32,
+                        height: raster_extent.height as f32,
+                        min_depth: 0.0,
+                        max_depth: 1.0,
+                    }],
                 );
-                self.ctx.device.cmd_bind_index_buffer(
+                self.ctx.device.cmd_set_scissor(
                     fd.command_buffer,
-                    self.index_buffer_2d.vk_buffer,
                     0,
-                    vk::IndexType::UINT32,
+                    &[vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: raster_extent,
+                    }],
                 );
-                for batch in &prepared_mesh_batches_2d {
+
+                if !mesh_indices.is_empty() {
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&cache.raster_descriptor_set),
+                        &raster_dynamic_offsets,
+                    );
+                    self.ctx.device.cmd_bind_vertex_buffers(
+                        fd.command_buffer,
+                        0,
+                        std::slice::from_ref(&self.vertex_buffer.vk_buffer),
+                        &[vertex_buffer_offset],
+                    );
+                    self.ctx.device.cmd_bind_index_buffer(
+                        fd.command_buffer,
+                        self.index_buffer.vk_buffer,
+                        index_buffer_offset,
+                        vk::IndexType::UINT32,
+                    );
+                    let indices_to_draw =
+                        (mesh_indices.len() as u32).min((self.index_buffer_stride / 4) as u32);
                     self.ctx.device.cmd_draw_indexed(
                         fd.command_buffer,
-                        batch.index_count,
-                        batch.instance_count,
-                        batch.first_index,
-                        batch.vertex_offset,
-                        batch.first_instance,
+                        indices_to_draw,
+                        1,
+                        0,
+                        0,
+                        0,
+                    );
+                }
+
+                if !prepared_mesh_batches_2d.is_empty() {
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        if raster_uses_depth {
+                            self.raster_pipeline_2d
+                        } else {
+                            self.raster_pipeline_2d_depthless
+                        },
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_layout_2d,
+                        0,
+                        std::slice::from_ref(&cache.raster_descriptor_set_2d),
+                        &raster_2d_dynamic_offsets,
+                    );
+                    let vertex_buffers = [
+                        self.vertex_buffer_2d.vk_buffer,
+                        self.instance_buffer_2d.vk_buffer,
+                    ];
+                    self.ctx.device.cmd_bind_vertex_buffers(
+                        fd.command_buffer,
+                        0,
+                        &vertex_buffers,
+                        &[0, instance_buffer_2d_offset],
+                    );
+                    self.ctx.device.cmd_bind_index_buffer(
+                        fd.command_buffer,
+                        self.index_buffer_2d.vk_buffer,
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+                    for batch in &prepared_mesh_batches_2d {
+                        self.ctx.device.cmd_draw_indexed(
+                            fd.command_buffer,
+                            batch.index_count,
+                            batch.instance_count,
+                            batch.first_index,
+                            batch.vertex_offset,
+                            batch.first_instance,
+                        );
+                    }
+                }
+                self.ctx.device.cmd_end_rendering(fd.command_buffer);
+            }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                3,
+                gpu_profiling,
+            );
+
+            if runs_postprocess {
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.resolved_texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.resolved_texture_state,
+                    compute_read_state,
+                );
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.texture_state,
+                    if frame_plan == FrameExecutionPlan::SdfRasterComposite {
+                        TrackedImageState {
+                            layout: vk::ImageLayout::GENERAL,
+                            stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+                            access: vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE,
+                        }
+                    } else {
+                        compute_write_state
+                    },
+                );
+                self.ctx.device.cmd_bind_pipeline(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    if frame_plan == FrameExecutionPlan::SdfRasterComposite {
+                        self.composite_pipeline
+                    } else {
+                        self.downsample_pipeline
+                    },
+                );
+                self.ctx.device.cmd_bind_descriptor_sets(
+                    fd.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.composite_pipeline_layout,
+                    0,
+                    std::slice::from_ref(&targets.composite_descriptor_set),
+                    &[],
+                );
+                self.ctx.device.cmd_dispatch(
+                    fd.command_buffer,
+                    (width + 15) / 16,
+                    (height + 15) / 16,
+                    1,
+                );
+                targets.texture_state = compute_write_state;
+            }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                4,
+                gpu_profiling,
+            );
+
+            let has_compute_output =
+                outputs.cpu_nv12 || outputs.cpu_yuv444p || outputs.vulkan_video;
+            if has_compute_output {
+                if fused_video_downsample {
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.resolved_texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.resolved_texture_state,
+                        compute_read_state,
+                    );
+                } else {
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.texture_state,
+                        compute_read_state,
                     );
                 }
             }
-
-            self.ctx.device.cmd_end_render_pass(fd.command_buffer);
-
-            let composite_barrier_1 = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::GENERAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: cache.resolved_texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ,
-                ..Default::default()
-            };
-            let composite_barrier_2 = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::GENERAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: cache.texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
-                ..Default::default()
-            };
-
-            self.ctx.device.cmd_pipeline_barrier(
-                fd.command_buffer,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
-                    | vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[composite_barrier_1, composite_barrier_2],
-            );
-
-            self.ctx.device.cmd_bind_pipeline(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.composite_pipeline,
-            );
-            self.ctx.device.cmd_bind_descriptor_sets(
-                fd.command_buffer,
-                vk::PipelineBindPoint::COMPUTE,
-                self.composite_pipeline_layout,
-                0,
-                std::slice::from_ref(&cache.composite_descriptor_set),
-                &[],
-            );
-            let workgroup_x = (width + 15) / 16;
-            let workgroup_y = (height + 15) / 16;
-            self.ctx
-                .device
-                .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
-
-            let postprocess_barrier = vk::ImageMemoryBarrier {
-                s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                old_layout: vk::ImageLayout::GENERAL,
-                new_layout: vk::ImageLayout::GENERAL,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                image: cache.texture.vk_image,
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                src_access_mask: vk::AccessFlags::SHADER_WRITE,
-                dst_access_mask: vk::AccessFlags::SHADER_READ,
-                ..Default::default()
-            };
-
-            self.ctx.device.cmd_pipeline_barrier(
-                fd.command_buffer,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::PipelineStageFlags::COMPUTE_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                std::slice::from_ref(&postprocess_barrier),
-            );
 
             if outputs.cpu_nv12 {
                 self.ctx.device.cmd_bind_pipeline(
@@ -3119,7 +3559,11 @@ impl VulkanRenderer {
                 self.ctx.device.cmd_bind_pipeline(
                     fd.command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
-                    self.video_nv12_pipeline,
+                    if fused_video_downsample {
+                        self.video_nv12_downsample_pipeline
+                    } else {
+                        self.video_nv12_pipeline
+                    },
                 );
                 self.ctx.device.cmd_bind_descriptor_sets(
                     fd.command_buffer,
@@ -3129,8 +3573,11 @@ impl VulkanRenderer {
                     std::slice::from_ref(&video_slot.descriptor_set),
                     &[],
                 );
-                let workgroup_x = (width + 15) / 16;
-                let workgroup_y = (height + 15) / 16;
+                let (workgroup_x, workgroup_y) = if fused_video_downsample {
+                    (((width / 2) + 15) / 16, ((height / 2) + 15) / 16)
+                } else {
+                    ((width + 15) / 16, (height + 15) / 16)
+                };
                 self.ctx
                     .device
                     .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
@@ -3138,33 +3585,17 @@ impl VulkanRenderer {
             }
 
             if outputs.cpu_rgba {
-                let image_barrier2 = vk::ImageMemoryBarrier {
-                    s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                    old_layout: vk::ImageLayout::GENERAL,
-                    new_layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: cache.texture.vk_image,
-                    subresource_range: vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    },
-                    src_access_mask: vk::AccessFlags::SHADER_READ,
-                    dst_access_mask: vk::AccessFlags::TRANSFER_READ,
-                    ..Default::default()
-                };
-
-                self.ctx.device.cmd_pipeline_barrier(
+                transition_image(
+                    &self.ctx.device,
                     fd.command_buffer,
-                    vk::PipelineStageFlags::COMPUTE_SHADER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    std::slice::from_ref(&image_barrier2),
+                    targets.texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.texture_state,
+                    TrackedImageState {
+                        layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        stage: vk::PipelineStageFlags2::COPY,
+                        access: vk::AccessFlags2::TRANSFER_READ,
+                    },
                 );
 
                 let buffer_row_length = cache.padded_bytes_per_row / 4;
@@ -3189,12 +3620,19 @@ impl VulkanRenderer {
 
                 self.ctx.device.cmd_copy_image_to_buffer(
                     fd.command_buffer,
-                    cache.texture.vk_image,
+                    targets.texture.vk_image,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     cache.output_buffers[frame_idx].vk_buffer,
                     std::slice::from_ref(&copy_region),
                 );
             }
+            write_gpu_timestamp(
+                &self.ctx.device,
+                fd.command_buffer,
+                fd.query_pool,
+                5,
+                gpu_profiling,
+            );
 
             self.ctx
                 .device
@@ -3232,6 +3670,16 @@ impl VulkanRenderer {
                 .device
                 .queue_submit2(self.ctx.queue, std::slice::from_ref(&submit_info), fd.fence)
                 .unwrap();
+            if gpu_profiling {
+                fd.timestamps_pending = true;
+                fd.profiled_plan = frame_plan;
+                fd.profiled_geometry_upload = !geometry_uploads_2d.is_empty();
+                fd.profiled_postprocess = runs_postprocess;
+                fd.profiled_output = outputs.cpu_nv12
+                    || outputs.cpu_yuv444p
+                    || outputs.vulkan_video
+                    || outputs.cpu_rgba;
+            }
             if outputs.vulkan_video {
                 let video_slot = &mut cache.video_nv12_slots[video_frame_idx];
                 video_slot.last_ready_value = Some(video_slot.next_ready_value);
@@ -3411,8 +3859,9 @@ mod tests {
     use nalgebra::Matrix4;
 
     use super::{
-        Instance2D, Mesh2DSubmission, MeshGeometry2D, PrepareMesh2DError,
-        build_ordered_mesh_2d_batches, prepare_mesh_2d_batches, video_timeline_values,
+        FrameExecutionPlan, Instance2D, Mesh2DSubmission, MeshGeometry2D, PrepareMesh2DError,
+        build_ordered_mesh_2d_batches, prepare_mesh_2d_batches, timestamp_delta,
+        video_timeline_values,
     };
     use crate::mobjects::mesh_2d::Vertex2D;
 
@@ -3448,6 +3897,40 @@ mod tests {
     #[should_panic(expected = "must be odd")]
     fn video_timeline_rejects_even_ready_values() {
         video_timeline_values(2);
+    }
+
+    #[test]
+    fn frame_execution_plan_eliminates_empty_passes() {
+        assert_eq!(
+            FrameExecutionPlan::build(false, false, 2),
+            FrameExecutionPlan::Empty
+        );
+        assert_eq!(
+            FrameExecutionPlan::build(true, false, 2),
+            FrameExecutionPlan::SdfOnly
+        );
+        assert_eq!(
+            FrameExecutionPlan::build(false, true, 1),
+            FrameExecutionPlan::RasterDirect
+        );
+        assert_eq!(
+            FrameExecutionPlan::build(false, true, 2),
+            FrameExecutionPlan::RasterDownsample
+        );
+        assert_eq!(
+            FrameExecutionPlan::build(true, true, 1),
+            FrameExecutionPlan::SdfRasterComposite
+        );
+        assert_eq!(
+            FrameExecutionPlan::build(true, true, 2),
+            FrameExecutionPlan::SdfRasterComposite
+        );
+    }
+
+    #[test]
+    fn timestamp_delta_handles_hardware_counter_wraparound() {
+        assert_eq!(timestamp_delta(10, 25, 64), 15);
+        assert_eq!(timestamp_delta(250, 5, 8), 11);
     }
 
     #[test]

@@ -86,7 +86,7 @@ fn map(p: vec3<f32>) -> MapResult {
     var best_color: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     let num_primitives = camera.num_primitives;
     
-    for (var i = 0u; i < 2u; i = i + 1u) {
+    for (var i = 0u; i < num_primitives; i = i + 1u) {
         let prim = primitives[i];
         var d: f32 = 99999.0;
         
@@ -272,4 +272,3 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let final_color = accumulated_color / f32(aa * aa);
     textureStore(output_tex, vec2<i32>(i32(x), i32(y)), final_color);
 }
-

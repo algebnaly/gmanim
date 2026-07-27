@@ -1,4 +1,4 @@
-@group(0) @binding(0) var input_img: texture_storage_2d<rgba8unorm, read>;
+@group(0) @binding(0) var input_img: texture_2d<f32>;
 @group(0) @binding(1) var y_plane: texture_storage_2d<r8unorm, write>;
 @group(0) @binding(2) var uv_plane: texture_storage_2d<rg8unorm, write>;
 
@@ -16,22 +16,21 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    let coord = vec2<i32>(i32(id.x), i32(id.y));
-    let rgb = textureLoad(input_img, coord).rgb;
+    let coord = vec2<i32>(id.xy);
+    let rgb = textureLoad(input_img, coord, 0).rgb;
     let yuv = rgb_to_yuv(rgb);
     textureStore(y_plane, coord, vec4<f32>(yuv.x, 0.0, 0.0, 1.0));
 
     if ((id.x & 1u) == 0u && (id.y & 1u) == 0u) {
         let x1 = min(id.x + 1u, size.x - 1u);
         let y1 = min(id.y + 1u, size.y - 1u);
-        let rgb00 = rgb;
-        let rgb10 = textureLoad(input_img, vec2<i32>(i32(x1), i32(id.y))).rgb;
-        let rgb01 = textureLoad(input_img, vec2<i32>(i32(id.x), i32(y1))).rgb;
-        let rgb11 = textureLoad(input_img, vec2<i32>(i32(x1), i32(y1))).rgb;
-        let uv = (rgb_to_yuv(rgb00).yz
+        let rgb10 = textureLoad(input_img, vec2<i32>(i32(x1), i32(id.y)), 0).rgb;
+        let rgb01 = textureLoad(input_img, vec2<i32>(i32(id.x), i32(y1)), 0).rgb;
+        let rgb11 = textureLoad(input_img, vec2<i32>(i32(x1), i32(y1)), 0).rgb;
+        let uv = (yuv.yz
             + rgb_to_yuv(rgb10).yz
             + rgb_to_yuv(rgb01).yz
             + rgb_to_yuv(rgb11).yz) * 0.25;
-        textureStore(uv_plane, vec2<i32>(i32(id.x / 2u), i32(id.y / 2u)), vec4<f32>(uv, 0.0, 1.0));
+        textureStore(uv_plane, vec2<i32>(id.xy / 2u), vec4<f32>(uv, 0.0, 1.0));
     }
 }
