@@ -87,13 +87,13 @@ fn main() -> io::Result<()> {
         color_order: ColorOrder::Nv12,
         bitrate: Some(20_000_000),
     };
-    let mut backend = pollster::block_on(VulkanH264Backend::try_new(&video_config))?;
+    let vk_ctx = gmanim_core::vulkan::context::VulkanContext::new().unwrap();
+    let mut backend = VulkanH264Backend::try_new(vk_ctx.clone(), &video_config)?;
 
     let start = std::time::Instant::now();
     let mut rendered = 0u32;
-    let vk_ctx = pollster::block_on(gmanim_core::vulkan::context::VulkanContext::new()).unwrap();
     let mut renderer = gmanim_core::vulkan::renderer::VulkanRenderer::new(
-        std::sync::Arc::new(vk_ctx),
+        vk_ctx,
         gmanim_core::RendererConfig {
             msaa_samples: 16,
             ssaa_factor: 1,

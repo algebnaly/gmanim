@@ -92,18 +92,30 @@ fn main() {
     let start_time = std::time::Instant::now();
 
     let mut frames_rendered = 0;
-    let vk_ctx = pollster::block_on(gmanim_core::vulkan::context::VulkanContext::new()).unwrap();
+    let vk_ctx = gmanim_core::vulkan::context::VulkanContext::new().unwrap();
     let mut renderer = gmanim_core::vulkan::renderer::VulkanRenderer::new(
-        std::sync::Arc::new(vk_ctx),
+        vk_ctx,
         gmanim_core::RendererConfig {
             msaa_samples: 8,
             ssaa_factor: 2,
         },
     );
 
+    let mut first_frame_stats = None;
+    let mut steady_frame_stats = None;
     while timeline.advance_frame() {
         frames_rendered += 1;
-        renderer.render_scene(&timeline.scene, &timeline.ctx.scene_config, None);
+        renderer.render_scene_with_outputs(
+            &timeline.scene,
+            &timeline.ctx.scene_config,
+            None,
+            gmanim_core::vulkan::renderer::RenderOutputs::CPU_NV12_ONLY,
+        );
+        let stats = renderer.last_stats();
+        first_frame_stats.get_or_insert(stats);
+        if frames_rendered == 2 {
+            steady_frame_stats = Some(stats);
+        }
         if let Some(nv12_bytes) = renderer.get_nv12_bytes() {
             let mut buf = video_backend.acquire_buffer();
             buf.as_mut_slice().copy_from_slice(nv12_bytes);
@@ -112,6 +124,12 @@ fn main() {
     }
 
     println!("Frames rendered: {}", frames_rendered);
+    println!("First frame renderer stats: {first_frame_stats:?}");
+    println!("Steady frame renderer stats: {steady_frame_stats:?}");
+    assert_eq!(first_frame_stats.unwrap().mesh_2d_geometry_uploads, 1);
+    assert_eq!(steady_frame_stats.unwrap().mesh_2d_geometry_uploads, 0);
+    assert_eq!(renderer.last_stats().mesh_2d_draw_calls, 1);
+    assert_eq!(renderer.last_stats().mesh_2d_instances, 1000);
     drop(video_backend);
 
     println!("Total time: {:?}", start_time.elapsed());

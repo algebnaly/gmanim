@@ -8,7 +8,11 @@ struct CameraUniform2D {
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
-    @location(1) color: vec4<f32>,
+    @location(1) model_0: vec4<f32>,
+    @location(2) model_1: vec4<f32>,
+    @location(3) model_2: vec4<f32>,
+    @location(4) model_3: vec4<f32>,
+    @location(5) color: vec4<f32>,
 }
 
 struct VertexOutput {
@@ -20,9 +24,16 @@ struct VertexOutput {
 fn vs_main(model: VertexInput) -> VertexOutput {
     let world_w = camera.width / camera.scale_factor;
     let world_h = camera.height / camera.scale_factor;
+    let model_matrix = mat4x4<f32>(
+        model.model_0,
+        model.model_1,
+        model.model_2,
+        model.model_3,
+    );
+    let world_position = model_matrix * vec4<f32>(model.position, 0.0, 1.0);
 
-    let x_ndc = model.position.x / (world_w / 2.0);
-    let y_ndc = model.position.y / (world_h / 2.0);
+    let x_ndc = world_position.x / (world_w / 2.0);
+    let y_ndc = world_position.y / (world_h / 2.0);
 
     var out: VertexOutput;
     out.color = model.color;

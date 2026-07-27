@@ -21,7 +21,6 @@ bytemuck = { version = "1.25.0", features = ["derive"] }
 ash = "0.38.0"
 gpu-allocator = { version = "0.28.0", features = ["vulkan"] }
 naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
-pollster = "0.4.0"
 lyon = "1.0.19"
 memoffset = "0.9.1"
 

@@ -114,19 +114,12 @@ impl SVGPath {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [
-            c.r as f32 / 255.0,
-            c.g as f32 / 255.0,
-            c.b as f32 / 255.0,
-            c.a as f32 / 255.0,
-        ];
-
         if self.draw_config.fill {
             let mut fill_tess = FillTessellator::new();
             let _ = fill_tess.tessellate_path(
                 &path,
                 &FillOptions::default(),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
             );
         }
 
@@ -135,13 +128,12 @@ impl SVGPath {
             let _ = stroke_tess.tessellate_path(
                 &path,
                 &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
             );
         }
 
-        self.mesh.vertices = geometry.vertices;
-        self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.base.model_matrix;
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, c);
     }
 
     pub fn flip_y_coordinate(&mut self) {

@@ -1,8 +1,10 @@
-use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D};
+use crate::mobjects::mesh_2d::{GeometryFingerprint, MeshGeometry2D, TriangleMesh2D, Vertex2D};
 use crate::mobjects::mesh_3d::{TriangleMesh3D, Vertex};
 use crate::video_backend::vulkan_h264::VulkanVideoFrame;
-use crate::vulkan::context::VulkanContext;
+use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
 use ash::vk;
+use ash::vk::Handle;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // The encoder keeps 8 frames in flight; one extra image prevents the renderer
@@ -12,6 +14,27 @@ const VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW: i32 = 1_000_156_003;
 const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW: u32 = 0x0000_4000;
 const VK_IMAGE_ASPECT_PLANE_0_BIT_RAW: u32 = 0x0000_0010;
 const VK_IMAGE_ASPECT_PLANE_1_BIT_RAW: u32 = 0x0000_0020;
+const RENDER_FRAME_COUNT: usize = 3;
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    if alignment <= 1 {
+        value
+    } else {
+        (value + alignment - 1) & !(alignment - 1)
+    }
+}
+
+fn video_timeline_values(next_ready_value: u64) -> (Option<u64>, u64, u64) {
+    assert!(
+        next_ready_value % 2 == 1,
+        "video ready timeline values must be odd"
+    );
+    (
+        (next_ready_value > 1).then_some(next_ready_value - 1),
+        next_ready_value,
+        next_ready_value + 1,
+    )
+}
 
 fn compile_wgsl_full(ctx: &VulkanContext, source: &str) -> vk::ShaderModule {
     let module = naga::front::wgsl::parse_str(source).unwrap();
@@ -386,6 +409,31 @@ impl VideoNv12Image {
     }
 }
 
+pub struct VideoNv12Slot {
+    pub image: VideoNv12Image,
+    pub descriptor_set: vk::DescriptorSet,
+    pub layout: vk::ImageLayout,
+    pub timeline: Arc<TimelineSemaphore>,
+    pub next_ready_value: u64,
+    pub last_ready_value: Option<u64>,
+    pub frame_available: bool,
+}
+
+impl VideoNv12Slot {
+    fn new(ctx: &Arc<VulkanContext>, width: u32, height: u32) -> Self {
+        Self {
+            image: VideoNv12Image::new(ctx, width, height),
+            descriptor_set: vk::DescriptorSet::null(),
+            layout: vk::ImageLayout::UNDEFINED,
+            timeline: TimelineSemaphore::new(ctx, 0)
+                .expect("failed to create video frame timeline semaphore"),
+            next_ready_value: 1,
+            last_ready_value: None,
+            frame_available: false,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Nv12Constants {
@@ -401,6 +449,214 @@ pub struct CameraUniform2D {
     pub height: f32,
     pub scale_factor: f32,
     pub _pad: f32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Instance2D {
+    pub model_0: [f32; 4],
+    pub model_1: [f32; 4],
+    pub model_2: [f32; 4],
+    pub model_3: [f32; 4],
+    pub color: [f32; 4],
+}
+
+impl Instance2D {
+    fn new(transform: nalgebra::Matrix4<crate::GMFloat>, color: [f32; 4]) -> Self {
+        Self {
+            model_0: [
+                transform[(0, 0)] as f32,
+                transform[(1, 0)] as f32,
+                transform[(2, 0)] as f32,
+                transform[(3, 0)] as f32,
+            ],
+            model_1: [
+                transform[(0, 1)] as f32,
+                transform[(1, 1)] as f32,
+                transform[(2, 1)] as f32,
+                transform[(3, 1)] as f32,
+            ],
+            model_2: [
+                transform[(0, 2)] as f32,
+                transform[(1, 2)] as f32,
+                transform[(2, 2)] as f32,
+                transform[(3, 2)] as f32,
+            ],
+            model_3: [
+                transform[(0, 3)] as f32,
+                transform[(1, 3)] as f32,
+                transform[(2, 3)] as f32,
+                transform[(3, 3)] as f32,
+            ],
+            color,
+        }
+    }
+}
+
+struct Mesh2DSubmission {
+    geometry: Arc<MeshGeometry2D>,
+    instance: Instance2D,
+}
+
+struct Mesh2DBatch {
+    geometry: Arc<MeshGeometry2D>,
+    instances: Vec<Instance2D>,
+}
+
+#[derive(Clone)]
+struct CachedMesh2D {
+    geometry: Arc<MeshGeometry2D>,
+    vertex_offset: u64,
+    index_offset: u64,
+    index_count: u32,
+}
+
+struct GeometryUpload2D {
+    geometry: Arc<MeshGeometry2D>,
+    staging_vertex_offset: u64,
+    staging_index_offset: u64,
+    device_vertex_offset: u64,
+    device_index_offset: u64,
+}
+
+struct PreparedMesh2DBatch {
+    first_index: u32,
+    vertex_offset: i32,
+    index_count: u32,
+    first_instance: u32,
+    instance_count: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrepareMesh2DError {
+    StaticArenaExhausted,
+    FrameStagingArenaExhausted,
+    FrameInstanceArenaExhausted,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RendererStats {
+    pub mesh_2d_draw_calls: u32,
+    pub mesh_2d_instances: u32,
+    pub mesh_2d_geometry_uploads: u32,
+    pub mesh_2d_vertex_bytes_uploaded: u64,
+    pub mesh_2d_index_bytes_uploaded: u64,
+    pub mesh_2d_arena_rebuilds: u32,
+}
+
+fn build_ordered_mesh_2d_batches(submissions: Vec<Mesh2DSubmission>) -> Vec<Mesh2DBatch> {
+    let mut batches: Vec<Mesh2DBatch> = Vec::new();
+    for submission in submissions {
+        if let Some(last) = batches.last_mut() {
+            if last.geometry.same_geometry(&submission.geometry) {
+                last.instances.push(submission.instance);
+                continue;
+            }
+        }
+        batches.push(Mesh2DBatch {
+            geometry: submission.geometry,
+            instances: vec![submission.instance],
+        });
+    }
+    batches
+}
+
+fn prepare_mesh_2d_batches(
+    mesh_cache: &mut HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
+    static_vertex_used: &mut u64,
+    static_index_used: &mut u64,
+    static_vertex_capacity: u64,
+    static_index_capacity: u64,
+    staging_vertex_capacity: u64,
+    staging_index_capacity: u64,
+    instance_capacity: u64,
+    batches: &[Mesh2DBatch],
+) -> Result<
+    (
+        Vec<PreparedMesh2DBatch>,
+        Vec<GeometryUpload2D>,
+        Vec<Instance2D>,
+    ),
+    PrepareMesh2DError,
+> {
+    let mut prepared = Vec::with_capacity(batches.len());
+    let mut uploads = Vec::new();
+    let mut instances = Vec::new();
+    let mut staging_vertex_used = 0u64;
+    let mut staging_index_used = 0u64;
+
+    for batch in batches {
+        if batch.geometry.indices().is_empty() || batch.instances.is_empty() {
+            continue;
+        }
+        let fingerprint = batch.geometry.fingerprint();
+        let cached = mesh_cache.get(&fingerprint).and_then(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.geometry.same_geometry(&batch.geometry))
+                .cloned()
+        });
+        let cached = match cached {
+            Some(cached) => cached,
+            None => {
+                let vertex_size = std::mem::size_of_val(batch.geometry.vertices()) as u64;
+                let index_size = std::mem::size_of_val(batch.geometry.indices()) as u64;
+                let device_vertex_offset = align_up(*static_vertex_used, 4);
+                let device_index_offset = align_up(*static_index_used, 4);
+                let staging_vertex_offset = align_up(staging_vertex_used, 4);
+                let staging_index_offset = align_up(staging_index_used, 4);
+
+                if device_vertex_offset + vertex_size > static_vertex_capacity
+                    || device_index_offset + index_size > static_index_capacity
+                {
+                    return Err(PrepareMesh2DError::StaticArenaExhausted);
+                }
+                if staging_vertex_offset + vertex_size > staging_vertex_capacity
+                    || staging_index_offset + index_size > staging_index_capacity
+                {
+                    return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
+                }
+
+                let cached = CachedMesh2D {
+                    geometry: batch.geometry.clone(),
+                    vertex_offset: device_vertex_offset,
+                    index_offset: device_index_offset,
+                    index_count: batch.geometry.indices().len() as u32,
+                };
+                mesh_cache
+                    .entry(fingerprint)
+                    .or_default()
+                    .push(cached.clone());
+                uploads.push(GeometryUpload2D {
+                    geometry: batch.geometry.clone(),
+                    staging_vertex_offset,
+                    staging_index_offset,
+                    device_vertex_offset,
+                    device_index_offset,
+                });
+                *static_vertex_used = device_vertex_offset + vertex_size;
+                *static_index_used = device_index_offset + index_size;
+                staging_vertex_used = staging_vertex_offset + vertex_size;
+                staging_index_used = staging_index_offset + index_size;
+                cached
+            }
+        };
+
+        let first_instance = instances.len() as u32;
+        instances.extend_from_slice(&batch.instances);
+        prepared.push(PreparedMesh2DBatch {
+            first_index: (cached.index_offset / std::mem::size_of::<u32>() as u64) as u32,
+            vertex_offset: (cached.vertex_offset / std::mem::size_of::<Vertex2D>() as u64) as i32,
+            index_count: cached.index_count,
+            first_instance,
+            instance_count: batch.instances.len() as u32,
+        });
+    }
+
+    if std::mem::size_of_val(instances.as_slice()) as u64 > instance_capacity {
+        return Err(PrepareMesh2DError::FrameInstanceArenaExhausted);
+    }
+    Ok((prepared, uploads, instances))
 }
 
 #[repr(C)]
@@ -448,14 +704,12 @@ pub struct RenderCache {
     pub msaa_texture: Image,
     pub msaa_depth_texture: Image,
     pub resolved_texture: Image,
-    pub output_buffers: [Buffer; 3],
-    pub nv12_output_buffers: [Buffer; 3],
-    pub nv12_descriptor_sets: [vk::DescriptorSet; 3],
-    pub yuv444p_output_buffers: [Buffer; 3],
-    pub yuv444p_descriptor_sets: [vk::DescriptorSet; 3],
-    pub video_nv12_images: Vec<VideoNv12Image>,
-    pub video_nv12_descriptor_sets: Vec<vk::DescriptorSet>,
-    pub video_nv12_layouts: Vec<vk::ImageLayout>,
+    pub output_buffers: [Buffer; RENDER_FRAME_COUNT],
+    pub nv12_output_buffers: [Buffer; RENDER_FRAME_COUNT],
+    pub nv12_descriptor_sets: [vk::DescriptorSet; RENDER_FRAME_COUNT],
+    pub yuv444p_output_buffers: [Buffer; RENDER_FRAME_COUNT],
+    pub yuv444p_descriptor_sets: [vk::DescriptorSet; RENDER_FRAME_COUNT],
+    pub video_nv12_slots: Vec<VideoNv12Slot>,
     pub current_frame: usize,
     pub compute_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set: vk::DescriptorSet,
@@ -485,8 +739,8 @@ impl RenderCache {
         for buf in &mut self.yuv444p_output_buffers {
             buf.destroy(ctx);
         }
-        for image in &mut self.video_nv12_images {
-            image.destroy(ctx);
+        for slot in &mut self.video_nv12_slots {
+            slot.image.destroy(ctx);
         }
     }
 }
@@ -518,6 +772,20 @@ impl RenderOutputs {
         vulkan_video: true,
         cpu_rgba: false,
         cpu_yuv444p: false,
+    };
+
+    pub const CPU_NV12_ONLY: Self = Self {
+        cpu_nv12: true,
+        vulkan_video: false,
+        cpu_rgba: false,
+        cpu_yuv444p: false,
+    };
+
+    pub const CPU_READBACKS: Self = Self {
+        cpu_nv12: true,
+        vulkan_video: false,
+        cpu_rgba: true,
+        cpu_yuv444p: true,
     };
 }
 
@@ -558,9 +826,24 @@ pub struct VulkanRenderer {
     raster_pipeline_2d: vk::Pipeline,
     vertex_buffer_2d: Buffer,
     index_buffer_2d: Buffer,
+    vertex_staging_buffer_2d: Buffer,
+    index_staging_buffer_2d: Buffer,
+    instance_buffer_2d: Buffer,
     camera_buffer_2d: Buffer,
+    vertex_buffer_stride: u64,
+    index_buffer_stride: u64,
+    camera_buffer_stride: u64,
+    primitive_buffer_stride: u64,
+    vertex_staging_buffer_2d_stride: u64,
+    index_staging_buffer_2d_stride: u64,
+    instance_buffer_2d_stride: u64,
+    camera_buffer_2d_stride: u64,
+    mesh_cache_2d: HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
+    static_vertex_buffer_2d_used: u64,
+    static_index_buffer_2d_used: u64,
+    last_stats: RendererStats,
 
-    frame_data: [FrameData; 3],
+    frame_data: [FrameData; RENDER_FRAME_COUNT],
 
     cache: std::sync::Mutex<Option<RenderCache>>,
 }
@@ -817,7 +1100,7 @@ impl VulkanRenderer {
             },
             vk::DescriptorSetLayoutBinding {
                 binding: 1,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE
                     | vk::ShaderStageFlags::VERTEX
@@ -826,7 +1109,7 @@ impl VulkanRenderer {
             },
             vk::DescriptorSetLayoutBinding {
                 binding: 2,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
@@ -847,7 +1130,7 @@ impl VulkanRenderer {
 
         let raster_bindings = [vk::DescriptorSetLayoutBinding {
             binding: 1,
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             ..Default::default()
@@ -991,7 +1274,7 @@ impl VulkanRenderer {
 
         let raster_descriptor_set_layout_bindings_2d = [vk::DescriptorSetLayoutBinding {
             binding: 0,
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
             descriptor_count: 1,
             stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
             p_immutable_samplers: std::ptr::null(),
@@ -1175,11 +1458,18 @@ impl VulkanRenderer {
                 .unwrap()[0]
         };
 
-        let vertex_binding_description_2d = vk::VertexInputBindingDescription {
-            binding: 0,
-            stride: std::mem::size_of::<Vertex2D>() as u32,
-            input_rate: vk::VertexInputRate::VERTEX,
-        };
+        let vertex_binding_descriptions_2d = [
+            vk::VertexInputBindingDescription {
+                binding: 0,
+                stride: std::mem::size_of::<Vertex2D>() as u32,
+                input_rate: vk::VertexInputRate::VERTEX,
+            },
+            vk::VertexInputBindingDescription {
+                binding: 1,
+                stride: std::mem::size_of::<Instance2D>() as u32,
+                input_rate: vk::VertexInputRate::INSTANCE,
+            },
+        ];
         let vertex_attribute_descriptions_2d = [
             vk::VertexInputAttributeDescription {
                 binding: 0,
@@ -1188,16 +1478,40 @@ impl VulkanRenderer {
                 offset: memoffset::offset_of!(Vertex2D, position) as u32,
             },
             vk::VertexInputAttributeDescription {
-                binding: 0,
+                binding: 1,
                 location: 1,
                 format: vk::Format::R32G32B32A32_SFLOAT,
-                offset: memoffset::offset_of!(Vertex2D, color) as u32,
+                offset: memoffset::offset_of!(Instance2D, model_0) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 1,
+                location: 2,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: memoffset::offset_of!(Instance2D, model_1) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 1,
+                location: 3,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: memoffset::offset_of!(Instance2D, model_2) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 1,
+                location: 4,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: memoffset::offset_of!(Instance2D, model_3) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 1,
+                location: 5,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: memoffset::offset_of!(Instance2D, color) as u32,
             },
         ];
         let vertex_input_info_2d = vk::PipelineVertexInputStateCreateInfo {
             s_type: vk::StructureType::PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            vertex_binding_description_count: 1,
-            p_vertex_binding_descriptions: &vertex_binding_description_2d,
+            vertex_binding_description_count: vertex_binding_descriptions_2d.len() as u32,
+            p_vertex_binding_descriptions: vertex_binding_descriptions_2d.as_ptr(),
             vertex_attribute_description_count: vertex_attribute_descriptions_2d.len() as u32,
             p_vertex_attribute_descriptions: vertex_attribute_descriptions_2d.as_ptr(),
             ..Default::default()
@@ -1271,6 +1585,14 @@ impl VulkanRenderer {
                 ty: vk::DescriptorType::STORAGE_BUFFER,
                 descriptor_count: 40,
             },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                descriptor_count: 20,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                descriptor_count: 20,
+            },
         ];
         let descriptor_pool_info = vk::DescriptorPoolCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
@@ -1286,27 +1608,55 @@ impl VulkanRenderer {
                 .unwrap()
         };
 
+        let limits = unsafe {
+            ctx.instance
+                .get_physical_device_properties(ctx.physical_device)
+                .limits
+        };
+        let uniform_alignment = limits.min_uniform_buffer_offset_alignment.max(1);
+        let storage_alignment = limits.min_storage_buffer_offset_alignment.max(1);
+        let vertex_buffer_stride = (std::mem::size_of::<Vertex>() * 1_000_000) as u64;
+        let index_buffer_stride = (std::mem::size_of::<u32>() * 3_000_000) as u64;
+        let camera_buffer_stride = align_up(
+            std::mem::size_of::<CameraUniform>() as u64,
+            uniform_alignment,
+        );
+        let primitive_buffer_stride = align_up(
+            (std::mem::size_of::<PrimitiveData3D>() * 10_000) as u64,
+            storage_alignment,
+        );
+        let static_vertex_buffer_2d_size = (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64;
+        let static_index_buffer_2d_size = (std::mem::size_of::<u32>() * 3_000_000) as u64;
+        let vertex_staging_buffer_2d_stride = static_vertex_buffer_2d_size;
+        let index_staging_buffer_2d_stride = static_index_buffer_2d_size;
+        let instance_buffer_2d_stride = (std::mem::size_of::<Instance2D>() * 100_000) as u64;
+        let camera_buffer_2d_stride = align_up(
+            std::mem::size_of::<CameraUniform2D>() as u64,
+            uniform_alignment,
+        );
+        let frame_count = RENDER_FRAME_COUNT as u64;
+
         let vertex_buffer = Buffer::new(
             &ctx,
-            (std::mem::size_of::<Vertex>() * 1_000_000) as u64,
+            vertex_buffer_stride * frame_count,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
         let index_buffer = Buffer::new(
             &ctx,
-            (std::mem::size_of::<u32>() * 3_000_000) as u64,
+            index_buffer_stride * frame_count,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
         let camera_buffer = Buffer::new(
             &ctx,
-            std::mem::size_of::<CameraUniform>() as u64,
+            camera_buffer_stride * frame_count,
             vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
         let buffer_3d = Buffer::new(
             &ctx,
-            (std::mem::size_of::<PrimitiveData3D>() * 10000) as u64,
+            primitive_buffer_stride * frame_count,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
@@ -1319,19 +1669,37 @@ impl VulkanRenderer {
 
         let vertex_buffer_2d = Buffer::new(
             &ctx,
-            (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64,
+            static_vertex_buffer_2d_size,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
+            gpu_allocator::MemoryLocation::GpuOnly,
         );
         let index_buffer_2d = Buffer::new(
             &ctx,
-            (std::mem::size_of::<u32>() * 3_000_000) as u64,
+            static_index_buffer_2d_size,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::GpuOnly,
+        );
+        let vertex_staging_buffer_2d = Buffer::new(
+            &ctx,
+            vertex_staging_buffer_2d_stride * frame_count,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let index_staging_buffer_2d = Buffer::new(
+            &ctx,
+            index_staging_buffer_2d_stride * frame_count,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let instance_buffer_2d = Buffer::new(
+            &ctx,
+            instance_buffer_2d_stride * frame_count,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
         let camera_buffer_2d = Buffer::new(
             &ctx,
-            std::mem::size_of::<CameraUniform2D>() as u64,
+            camera_buffer_2d_stride * frame_count,
             vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
@@ -1411,12 +1779,31 @@ impl VulkanRenderer {
             raster_pipeline_2d,
             vertex_buffer_2d,
             index_buffer_2d,
+            vertex_staging_buffer_2d,
+            index_staging_buffer_2d,
+            instance_buffer_2d,
             camera_buffer_2d,
+            vertex_buffer_stride,
+            index_buffer_stride,
+            camera_buffer_stride,
+            primitive_buffer_stride,
+            vertex_staging_buffer_2d_stride,
+            index_staging_buffer_2d_stride,
+            instance_buffer_2d_stride,
+            camera_buffer_2d_stride,
+            mesh_cache_2d: HashMap::new(),
+            static_vertex_buffer_2d_used: 0,
+            static_index_buffer_2d_used: 0,
+            last_stats: RendererStats::default(),
             frame_data,
             cache: std::sync::Mutex::new(None),
             msaa_samples: sample_count.as_raw(),
             ssaa_factor,
         }
+    }
+
+    pub fn last_stats(&self) -> RendererStats {
+        self.last_stats
     }
 
     pub fn render_scene(
@@ -1425,7 +1812,7 @@ impl VulkanRenderer {
         scene_config: &crate::SceneConfig,
         output: Option<&mut [u8]>,
     ) {
-        self.render_scene_with_outputs(scene, scene_config, output, RenderOutputs::ALL);
+        self.render_scene_with_outputs(scene, scene_config, output, RenderOutputs::CPU_READBACKS);
     }
 
     pub fn render_scene_with_outputs(
@@ -1471,15 +1858,13 @@ impl VulkanRenderer {
         let mut mesh_vertices = Vec::new();
         let mut mesh_indices = Vec::new();
 
-        let mut mesh_vertices_2d = Vec::new();
-        let mut mesh_indices_2d = Vec::new();
+        let mut mesh_submissions_2d = Vec::new();
 
         struct VulkanDataCollector<'a> {
             primitives_3d: &'a mut Vec<PrimitiveData3D>,
             mesh_vertices: &'a mut Vec<Vertex>,
             mesh_indices: &'a mut Vec<u32>,
-            mesh_vertices_2d: &'a mut Vec<Vertex2D>,
-            mesh_indices_2d: &'a mut Vec<u32>,
+            mesh_submissions_2d: &'a mut Vec<Mesh2DSubmission>,
         }
 
         impl<'a> crate::mobjects::RenderVisitor for VulkanDataCollector<'a> {
@@ -1488,23 +1873,10 @@ impl VulkanRenderer {
                 mesh: &crate::mobjects::mesh_2d::TriangleMesh2D,
                 transform: nalgebra::Matrix4<crate::GMFloat>,
             ) {
-                let base_index = self.mesh_vertices_2d.len() as u32;
-                let mesh_mat = transform * mesh.model_matrix;
-                for v in &mesh.vertices {
-                    let pos = nalgebra::Point3::new(
-                        v.position[0] as crate::GMFloat,
-                        v.position[1] as crate::GMFloat,
-                        0.0,
-                    );
-                    let t_pos = mesh_mat.transform_point(&pos);
-                    self.mesh_vertices_2d.push(Vertex2D {
-                        position: [t_pos.x as f32, t_pos.y as f32],
-                        color: v.color,
-                    });
-                }
-                for i in &mesh.indices {
-                    self.mesh_indices_2d.push(*i + base_index);
-                }
+                self.mesh_submissions_2d.push(Mesh2DSubmission {
+                    geometry: mesh.geometry(),
+                    instance: Instance2D::new(transform, mesh.color()),
+                });
             }
 
             fn push_mesh_3d(
@@ -1550,14 +1922,14 @@ impl VulkanRenderer {
             primitives_3d: &mut primitives_3d,
             mesh_vertices: &mut mesh_vertices,
             mesh_indices: &mut mesh_indices,
-            mesh_vertices_2d: &mut mesh_vertices_2d,
-            mesh_indices_2d: &mut mesh_indices_2d,
+            mesh_submissions_2d: &mut mesh_submissions_2d,
         };
 
         for m in &scene.mobjects {
             m.borrow()
                 .submit_to_renderer(&mut collector, nalgebra::Matrix4::identity());
         }
+        let mesh_batches_2d = build_ordered_mesh_2d_batches(mesh_submissions_2d);
 
         let camera_uniform_2d = CameraUniform2D {
             width: output_w,
@@ -1631,14 +2003,13 @@ impl VulkanRenderer {
             &primitives_3d,
             &mesh_vertices,
             &mesh_indices,
-            &mesh_vertices_2d,
-            &mesh_indices_2d,
+            &mesh_batches_2d,
             output,
             outputs,
         );
     }
 
-    pub fn render(
+    fn render(
         &mut self,
         width: u32,
         height: u32,
@@ -1647,51 +2018,10 @@ impl VulkanRenderer {
         objects_3d: &[PrimitiveData3D],
         mesh_vertices: &[Vertex],
         mesh_indices: &[u32],
-        mesh_vertices_2d: &[Vertex2D],
-        mesh_indices_2d: &[u32],
+        mesh_batches_2d: &[Mesh2DBatch],
         output: Option<&mut [u8]>,
         outputs: RenderOutputs,
     ) {
-        self.camera_buffer
-            .write_bytes(0, bytemuck::bytes_of(camera_uniform));
-
-        self.camera_buffer_2d
-            .write_bytes(0, bytemuck::bytes_of(camera_uniform_2d));
-        if !mesh_vertices_2d.is_empty() {
-            let bytes_v = bytemuck::cast_slice(mesh_vertices_2d);
-            let len = (self.vertex_buffer_2d.size as usize).min(bytes_v.len());
-            self.vertex_buffer_2d.write_bytes(0, &bytes_v[..len]);
-        }
-        if !mesh_indices_2d.is_empty() {
-            let bytes_i = bytemuck::cast_slice(mesh_indices_2d);
-            let len = (self.index_buffer_2d.size as usize).min(bytes_i.len());
-            self.index_buffer_2d.write_bytes(0, &bytes_i[..len]);
-        }
-
-        self.nv12_constants_buffer.write_bytes(
-            0,
-            bytemuck::bytes_of(&Nv12Constants {
-                width,
-                height,
-                _padding: [0; 2],
-            }),
-        );
-        if !objects_3d.is_empty() {
-            let bytes_3d = bytemuck::cast_slice(objects_3d);
-            let len = (self.buffer_3d.size as usize).min(bytes_3d.len());
-            self.buffer_3d.write_bytes(0, &bytes_3d[..len]);
-        }
-        if !mesh_vertices.is_empty() {
-            let bytes_v = bytemuck::cast_slice(mesh_vertices);
-            let len = (self.vertex_buffer.size as usize).min(bytes_v.len());
-            self.vertex_buffer.write_bytes(0, &bytes_v[..len]);
-        }
-        if !mesh_indices.is_empty() {
-            let bytes_i = bytemuck::cast_slice(mesh_indices);
-            let len = (self.index_buffer.size as usize).min(bytes_i.len());
-            self.index_buffer.write_bytes(0, &bytes_i[..len]);
-        }
-
         let align = 256;
         let unpadded_bytes_per_row = width * 4;
         let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
@@ -1708,6 +2038,14 @@ impl VulkanRenderer {
                 }
                 old_cache.destroy(&self.ctx);
             }
+            self.nv12_constants_buffer.write_bytes(
+                0,
+                bytemuck::bytes_of(&Nv12Constants {
+                    width,
+                    height,
+                    _padding: [0; 2],
+                }),
+            );
 
             let texture = Image::new(
                 &self.ctx,
@@ -1912,10 +2250,9 @@ impl VulkanRenderer {
             let yuv444p_descriptor_sets: [vk::DescriptorSet; 3] =
                 yuv444p_descriptor_sets_vec.try_into().unwrap();
 
-            let video_nv12_images = (0..VIDEO_NV12_IMAGE_COUNT)
-                .map(|_| VideoNv12Image::new(&self.ctx, width, height))
+            let mut video_nv12_slots = (0..VIDEO_NV12_IMAGE_COUNT)
+                .map(|_| VideoNv12Slot::new(&self.ctx, width, height))
                 .collect::<Vec<_>>();
-            let video_nv12_layouts = vec![vk::ImageLayout::UNDEFINED; VIDEO_NV12_IMAGE_COUNT];
             let video_nv12_set_layouts =
                 vec![self.video_nv12_descriptor_set_layout; VIDEO_NV12_IMAGE_COUNT];
             let video_nv12_alloc_info = vk::DescriptorSetAllocateInfo {
@@ -1931,6 +2268,11 @@ impl VulkanRenderer {
                     .allocate_descriptor_sets(&video_nv12_alloc_info)
                     .unwrap()
             };
+            for (slot, descriptor_set) in
+                video_nv12_slots.iter_mut().zip(video_nv12_descriptor_sets)
+            {
+                slot.descriptor_set = descriptor_set;
+            }
 
             let image_info = vk::DescriptorImageInfo {
                 image_view: texture.view,
@@ -1945,20 +2287,20 @@ impl VulkanRenderer {
             let camera_buffer_info = vk::DescriptorBufferInfo {
                 buffer: self.camera_buffer.vk_buffer,
                 offset: 0,
-                range: vk::WHOLE_SIZE,
+                range: self.camera_buffer_stride,
                 ..Default::default()
             };
             let buffer_3d_info = vk::DescriptorBufferInfo {
                 buffer: self.buffer_3d.vk_buffer,
                 offset: 0,
-                range: vk::WHOLE_SIZE,
+                range: self.primitive_buffer_stride,
                 ..Default::default()
             };
 
             let camera_buffer_2d_info = vk::DescriptorBufferInfo {
                 buffer: self.camera_buffer_2d.vk_buffer,
                 offset: 0,
-                range: vk::WHOLE_SIZE,
+                range: self.camera_buffer_2d_stride,
                 ..Default::default()
             };
 
@@ -1976,7 +2318,7 @@ impl VulkanRenderer {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: compute_descriptor_set,
                     dst_binding: 1,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                     descriptor_count: 1,
                     p_buffer_info: &camera_buffer_info,
                     ..Default::default()
@@ -1985,7 +2327,7 @@ impl VulkanRenderer {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: compute_descriptor_set,
                     dst_binding: 2,
-                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
                     descriptor_count: 1,
                     p_buffer_info: &buffer_3d_info,
                     ..Default::default()
@@ -1994,7 +2336,7 @@ impl VulkanRenderer {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: raster_descriptor_set,
                     dst_binding: 1,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                     descriptor_count: 1,
                     p_buffer_info: &camera_buffer_info,
                     ..Default::default()
@@ -2003,7 +2345,7 @@ impl VulkanRenderer {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: raster_descriptor_set_2d,
                     dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                     descriptor_count: 1,
                     p_buffer_info: &camera_buffer_2d_info,
                     ..Default::default()
@@ -2117,19 +2459,19 @@ impl VulkanRenderer {
             let mut video_nv12_input_infos = Vec::new();
             let mut video_nv12_y_infos = Vec::new();
             let mut video_nv12_uv_infos = Vec::new();
-            for image in &video_nv12_images {
+            for slot in &video_nv12_slots {
                 video_nv12_input_infos.push(vk::DescriptorImageInfo {
                     image_view: texture.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 });
                 video_nv12_y_infos.push(vk::DescriptorImageInfo {
-                    image_view: image.y_view,
+                    image_view: slot.image.y_view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 });
                 video_nv12_uv_infos.push(vk::DescriptorImageInfo {
-                    image_view: image.uv_view,
+                    image_view: slot.image.uv_view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 });
@@ -2137,7 +2479,7 @@ impl VulkanRenderer {
             for i in 0..VIDEO_NV12_IMAGE_COUNT {
                 write_descriptor_sets.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_set: video_nv12_slots[i].descriptor_set,
                     dst_binding: 0,
                     descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
                     descriptor_count: 1,
@@ -2146,7 +2488,7 @@ impl VulkanRenderer {
                 });
                 write_descriptor_sets.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_set: video_nv12_slots[i].descriptor_set,
                     dst_binding: 1,
                     descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
                     descriptor_count: 1,
@@ -2155,7 +2497,7 @@ impl VulkanRenderer {
                 });
                 write_descriptor_sets.push(vk::WriteDescriptorSet {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: video_nv12_descriptor_sets[i],
+                    dst_set: video_nv12_slots[i].descriptor_set,
                     dst_binding: 2,
                     descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
                     descriptor_count: 1,
@@ -2205,9 +2547,7 @@ impl VulkanRenderer {
                 nv12_descriptor_sets,
                 yuv444p_output_buffers,
                 yuv444p_descriptor_sets,
-                video_nv12_images,
-                video_nv12_descriptor_sets,
-                video_nv12_layouts,
+                video_nv12_slots,
                 current_frame: 0,
                 compute_descriptor_set,
                 raster_descriptor_set,
@@ -2219,10 +2559,83 @@ impl VulkanRenderer {
             });
         }
 
-        let mut cache = cache_guard.as_mut().unwrap();
+        let cache = cache_guard.as_mut().unwrap();
         let frame_idx = cache.current_frame % 3;
-        let video_frame_idx = cache.current_frame % cache.video_nv12_images.len();
+        let video_frame_idx = cache.current_frame % cache.video_nv12_slots.len();
+        if outputs.vulkan_video && cache.current_frame > 0 {
+            let previous_video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_slots.len();
+            assert!(
+                !cache.video_nv12_slots[previous_video_frame_idx].frame_available,
+                "the previous Vulkan video frame must be acquired before rendering another frame"
+            );
+        }
+
+        let mut mesh_2d_arena_rebuilds = 0;
+        let prepared_2d = prepare_mesh_2d_batches(
+            &mut self.mesh_cache_2d,
+            &mut self.static_vertex_buffer_2d_used,
+            &mut self.static_index_buffer_2d_used,
+            self.vertex_buffer_2d.size,
+            self.index_buffer_2d.size,
+            self.vertex_staging_buffer_2d_stride,
+            self.index_staging_buffer_2d_stride,
+            self.instance_buffer_2d_stride,
+            mesh_batches_2d,
+        );
+        let (prepared_mesh_batches_2d, geometry_uploads_2d, instances_2d) = match prepared_2d {
+            Ok(prepared) => prepared,
+            Err(PrepareMesh2DError::StaticArenaExhausted) => {
+                unsafe {
+                    self.ctx.device.device_wait_idle().unwrap();
+                }
+                self.mesh_cache_2d.clear();
+                self.static_vertex_buffer_2d_used = 0;
+                self.static_index_buffer_2d_used = 0;
+                mesh_2d_arena_rebuilds = 1;
+                prepare_mesh_2d_batches(
+                    &mut self.mesh_cache_2d,
+                    &mut self.static_vertex_buffer_2d_used,
+                    &mut self.static_index_buffer_2d_used,
+                    self.vertex_buffer_2d.size,
+                    self.index_buffer_2d.size,
+                    self.vertex_staging_buffer_2d_stride,
+                    self.index_staging_buffer_2d_stride,
+                    self.instance_buffer_2d_stride,
+                    mesh_batches_2d,
+                )
+                .expect("active 2D scene exceeds a frame or persistent geometry arena")
+            }
+            Err(error) => panic!("2D frame preparation failed: {error:?}"),
+        };
+
+        self.last_stats = RendererStats {
+            mesh_2d_draw_calls: prepared_mesh_batches_2d.len() as u32,
+            mesh_2d_instances: instances_2d.len() as u32,
+            mesh_2d_geometry_uploads: geometry_uploads_2d.len() as u32,
+            mesh_2d_vertex_bytes_uploaded: geometry_uploads_2d
+                .iter()
+                .map(|upload| std::mem::size_of_val(upload.geometry.vertices()) as u64)
+                .sum(),
+            mesh_2d_index_bytes_uploaded: geometry_uploads_2d
+                .iter()
+                .map(|upload| std::mem::size_of_val(upload.geometry.indices()) as u64)
+                .sum(),
+            mesh_2d_arena_rebuilds,
+        };
+
         let fd = &self.frame_data[frame_idx];
+        let vertex_buffer_offset = self.vertex_buffer_stride * frame_idx as u64;
+        let index_buffer_offset = self.index_buffer_stride * frame_idx as u64;
+        let camera_buffer_offset = self.camera_buffer_stride * frame_idx as u64;
+        let primitive_buffer_offset = self.primitive_buffer_stride * frame_idx as u64;
+        let vertex_staging_buffer_2d_offset =
+            self.vertex_staging_buffer_2d_stride * frame_idx as u64;
+        let index_staging_buffer_2d_offset = self.index_staging_buffer_2d_stride * frame_idx as u64;
+        let instance_buffer_2d_offset = self.instance_buffer_2d_stride * frame_idx as u64;
+        let camera_buffer_2d_offset = self.camera_buffer_2d_stride * frame_idx as u64;
+        let compute_dynamic_offsets = [camera_buffer_offset as u32, primitive_buffer_offset as u32];
+        let raster_dynamic_offsets = [camera_buffer_offset as u32];
+        let raster_2d_dynamic_offsets = [camera_buffer_2d_offset as u32];
 
         unsafe {
             self.ctx
@@ -2238,6 +2651,47 @@ impl VulkanRenderer {
                 .reset_command_pool(fd.command_pool, vk::CommandPoolResetFlags::empty())
                 .unwrap();
 
+            self.camera_buffer
+                .write_bytes(camera_buffer_offset, bytemuck::bytes_of(camera_uniform));
+            self.camera_buffer_2d.write_bytes(
+                camera_buffer_2d_offset,
+                bytemuck::bytes_of(camera_uniform_2d),
+            );
+            if !objects_3d.is_empty() {
+                let bytes = bytemuck::cast_slice(objects_3d);
+                let len = (self.primitive_buffer_stride as usize).min(bytes.len());
+                self.buffer_3d
+                    .write_bytes(primitive_buffer_offset, &bytes[..len]);
+            }
+            if !mesh_vertices.is_empty() {
+                let bytes = bytemuck::cast_slice(mesh_vertices);
+                let len = (self.vertex_buffer_stride as usize).min(bytes.len());
+                self.vertex_buffer
+                    .write_bytes(vertex_buffer_offset, &bytes[..len]);
+            }
+            if !mesh_indices.is_empty() {
+                let bytes = bytemuck::cast_slice(mesh_indices);
+                let len = (self.index_buffer_stride as usize).min(bytes.len());
+                self.index_buffer
+                    .write_bytes(index_buffer_offset, &bytes[..len]);
+            }
+            for upload in &geometry_uploads_2d {
+                self.vertex_staging_buffer_2d.write_bytes(
+                    vertex_staging_buffer_2d_offset + upload.staging_vertex_offset,
+                    bytemuck::cast_slice(upload.geometry.vertices()),
+                );
+                self.index_staging_buffer_2d.write_bytes(
+                    index_staging_buffer_2d_offset + upload.staging_index_offset,
+                    bytemuck::cast_slice(upload.geometry.indices()),
+                );
+            }
+            if !instances_2d.is_empty() {
+                self.instance_buffer_2d.write_bytes(
+                    instance_buffer_2d_offset,
+                    bytemuck::cast_slice(&instances_2d),
+                );
+            }
+
             let begin_info = vk::CommandBufferBeginInfo {
                 s_type: vk::StructureType::COMMAND_BUFFER_BEGIN_INFO,
                 flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
@@ -2247,6 +2701,65 @@ impl VulkanRenderer {
                 .device
                 .begin_command_buffer(fd.command_buffer, &begin_info)
                 .unwrap();
+
+            if !geometry_uploads_2d.is_empty() {
+                let vertex_copies: Vec<_> = geometry_uploads_2d
+                    .iter()
+                    .map(|upload| vk::BufferCopy {
+                        src_offset: vertex_staging_buffer_2d_offset + upload.staging_vertex_offset,
+                        dst_offset: upload.device_vertex_offset,
+                        size: std::mem::size_of_val(upload.geometry.vertices()) as u64,
+                    })
+                    .collect();
+                let index_copies: Vec<_> = geometry_uploads_2d
+                    .iter()
+                    .map(|upload| vk::BufferCopy {
+                        src_offset: index_staging_buffer_2d_offset + upload.staging_index_offset,
+                        dst_offset: upload.device_index_offset,
+                        size: std::mem::size_of_val(upload.geometry.indices()) as u64,
+                    })
+                    .collect();
+                self.ctx.device.cmd_copy_buffer(
+                    fd.command_buffer,
+                    self.vertex_staging_buffer_2d.vk_buffer,
+                    self.vertex_buffer_2d.vk_buffer,
+                    &vertex_copies,
+                );
+                self.ctx.device.cmd_copy_buffer(
+                    fd.command_buffer,
+                    self.index_staging_buffer_2d.vk_buffer,
+                    self.index_buffer_2d.vk_buffer,
+                    &index_copies,
+                );
+
+                let geometry_barriers = [
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::VERTEX_ATTRIBUTE_INPUT)
+                        .dst_access_mask(vk::AccessFlags2::VERTEX_ATTRIBUTE_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(self.vertex_buffer_2d.vk_buffer)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE),
+                    vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                        .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                        .dst_access_mask(vk::AccessFlags2::INDEX_READ)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .buffer(self.index_buffer_2d.vk_buffer)
+                        .offset(0)
+                        .size(vk::WHOLE_SIZE),
+                ];
+                let geometry_dependency =
+                    vk::DependencyInfo::default().buffer_memory_barriers(&geometry_barriers);
+                self.ctx
+                    .device
+                    .cmd_pipeline_barrier2(fd.command_buffer, &geometry_dependency);
+            }
 
             let barrier = vk::ImageMemoryBarrier {
                 s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
@@ -2288,7 +2801,7 @@ impl VulkanRenderer {
                 self.compute_pipeline_layout,
                 0,
                 std::slice::from_ref(&cache.compute_descriptor_set),
-                &[],
+                &compute_dynamic_offsets,
             );
             let workgroup_x = (width + 15) / 16;
             let workgroup_y = (height + 15) / 16;
@@ -2371,28 +2884,28 @@ impl VulkanRenderer {
                     self.raster_pipeline_layout,
                     0,
                     std::slice::from_ref(&cache.raster_descriptor_set),
-                    &[],
+                    &raster_dynamic_offsets,
                 );
                 self.ctx.device.cmd_bind_vertex_buffers(
                     fd.command_buffer,
                     0,
                     std::slice::from_ref(&self.vertex_buffer.vk_buffer),
-                    &[0],
+                    &[vertex_buffer_offset],
                 );
                 self.ctx.device.cmd_bind_index_buffer(
                     fd.command_buffer,
                     self.index_buffer.vk_buffer,
-                    0,
+                    index_buffer_offset,
                     vk::IndexType::UINT32,
                 );
                 let indices_to_draw =
-                    (mesh_indices.len() as u32).min((self.index_buffer.size / 4) as u32);
+                    (mesh_indices.len() as u32).min((self.index_buffer_stride / 4) as u32);
                 self.ctx
                     .device
                     .cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
             }
 
-            if !mesh_indices_2d.is_empty() {
+            if !prepared_mesh_batches_2d.is_empty() {
                 self.ctx.device.cmd_bind_pipeline(
                     fd.command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
@@ -2404,13 +2917,17 @@ impl VulkanRenderer {
                     self.raster_pipeline_layout_2d,
                     0,
                     std::slice::from_ref(&cache.raster_descriptor_set_2d),
-                    &[],
+                    &raster_2d_dynamic_offsets,
                 );
+                let vertex_buffers = [
+                    self.vertex_buffer_2d.vk_buffer,
+                    self.instance_buffer_2d.vk_buffer,
+                ];
                 self.ctx.device.cmd_bind_vertex_buffers(
                     fd.command_buffer,
                     0,
-                    std::slice::from_ref(&self.vertex_buffer_2d.vk_buffer),
-                    &[0],
+                    &vertex_buffers,
+                    &[0, instance_buffer_2d_offset],
                 );
                 self.ctx.device.cmd_bind_index_buffer(
                     fd.command_buffer,
@@ -2418,11 +2935,16 @@ impl VulkanRenderer {
                     0,
                     vk::IndexType::UINT32,
                 );
-                let indices_to_draw =
-                    (mesh_indices_2d.len() as u32).min((self.index_buffer_2d.size / 4) as u32);
-                self.ctx
-                    .device
-                    .cmd_draw_indexed(fd.command_buffer, indices_to_draw, 1, 0, 0, 0);
+                for batch in &prepared_mesh_batches_2d {
+                    self.ctx.device.cmd_draw_indexed(
+                        fd.command_buffer,
+                        batch.index_count,
+                        batch.instance_count,
+                        batch.first_index,
+                        batch.vertex_offset,
+                        batch.first_instance,
+                    );
+                }
             }
 
             self.ctx.device.cmd_end_render_pass(fd.command_buffer);
@@ -2566,14 +3088,14 @@ impl VulkanRenderer {
             }
 
             if outputs.vulkan_video {
-                let video_nv12_image = &cache.video_nv12_images[video_frame_idx];
+                let video_slot = &cache.video_nv12_slots[video_frame_idx];
                 let video_nv12_barrier = vk::ImageMemoryBarrier {
                     s_type: vk::StructureType::IMAGE_MEMORY_BARRIER,
-                    old_layout: cache.video_nv12_layouts[video_frame_idx],
+                    old_layout: video_slot.layout,
                     new_layout: vk::ImageLayout::GENERAL,
                     src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                     dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                    image: video_nv12_image.vk_image,
+                    image: video_slot.image.vk_image,
                     subresource_range: vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
                         base_mip_level: 0,
@@ -2604,7 +3126,7 @@ impl VulkanRenderer {
                     vk::PipelineBindPoint::COMPUTE,
                     self.video_nv12_pipeline_layout,
                     0,
-                    std::slice::from_ref(&cache.video_nv12_descriptor_sets[video_frame_idx]),
+                    std::slice::from_ref(&video_slot.descriptor_set),
                     &[],
                 );
                 let workgroup_x = (width + 15) / 16;
@@ -2612,7 +3134,7 @@ impl VulkanRenderer {
                 self.ctx
                     .device
                     .cmd_dispatch(fd.command_buffer, workgroup_x, workgroup_y, 1);
-                cache.video_nv12_layouts[video_frame_idx] = vk::ImageLayout::GENERAL;
+                cache.video_nv12_slots[video_frame_idx].layout = vk::ImageLayout::GENERAL;
             }
 
             if outputs.cpu_rgba {
@@ -2679,16 +3201,43 @@ impl VulkanRenderer {
                 .end_command_buffer(fd.command_buffer)
                 .unwrap();
 
-            let submit_info = vk::SubmitInfo {
-                s_type: vk::StructureType::SUBMIT_INFO,
-                command_buffer_count: 1,
-                p_command_buffers: &fd.command_buffer,
-                ..Default::default()
-            };
+            let mut wait_infos = Vec::with_capacity(1);
+            let mut signal_infos = Vec::with_capacity(1);
+            if outputs.vulkan_video {
+                let video_slot = &cache.video_nv12_slots[video_frame_idx];
+                let (wait_value, ready_value, _) =
+                    video_timeline_values(video_slot.next_ready_value);
+                if let Some(wait_value) = wait_value {
+                    wait_infos.push(
+                        vk::SemaphoreSubmitInfo::default()
+                            .semaphore(video_slot.timeline.handle())
+                            .value(wait_value)
+                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                    );
+                }
+                signal_infos.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(video_slot.timeline.handle())
+                        .value(ready_value)
+                        .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                );
+            }
+            let command_buffer_info =
+                vk::CommandBufferSubmitInfo::default().command_buffer(fd.command_buffer);
+            let submit_info = vk::SubmitInfo2::default()
+                .wait_semaphore_infos(&wait_infos)
+                .command_buffer_infos(std::slice::from_ref(&command_buffer_info))
+                .signal_semaphore_infos(&signal_infos);
             self.ctx
                 .device
-                .queue_submit(self.ctx.queue, std::slice::from_ref(&submit_info), fd.fence)
+                .queue_submit2(self.ctx.queue, std::slice::from_ref(&submit_info), fd.fence)
                 .unwrap();
+            if outputs.vulkan_video {
+                let video_slot = &mut cache.video_nv12_slots[video_frame_idx];
+                video_slot.last_ready_value = Some(video_slot.next_ready_value);
+                video_slot.next_ready_value += 2;
+                video_slot.frame_available = true;
+            }
         }
 
         if let Some(out_buf) = output {
@@ -2781,31 +3330,31 @@ impl VulkanRenderer {
     }
 
     pub fn get_vulkan_video_frame(&self) -> Option<VulkanVideoFrame> {
-        let guard = self.cache.lock().unwrap();
-        if let Some(cache) = guard.as_ref() {
-            if cache.current_frame == 0 || cache.video_nv12_images.is_empty() {
+        let mut guard = self.cache.lock().unwrap();
+        if let Some(cache) = guard.as_mut() {
+            if cache.current_frame == 0 || cache.video_nv12_slots.is_empty() {
                 return None;
             }
-            let read_frame_idx = (cache.current_frame - 1) % 3;
-            let video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_images.len();
-            let read_fd = &self.frame_data[read_frame_idx];
-
-            unsafe {
-                self.ctx
-                    .device
-                    .wait_for_fences(std::slice::from_ref(&read_fd.fence), true, std::u64::MAX)
-                    .unwrap();
+            let video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_slots.len();
+            let slot = &mut cache.video_nv12_slots[video_frame_idx];
+            if !slot.frame_available {
+                return None;
             }
-
-            let image = &cache.video_nv12_images[video_frame_idx];
-            return Some(VulkanVideoFrame {
-                image: image.vk_image,
-                image_view: image.color_view,
-                image_layout: cache.video_nv12_layouts[video_frame_idx],
-                format: image.format,
-                width: image.width,
-                height: image.height,
-            });
+            let ready_value = slot.last_ready_value?;
+            let (_, _, release_value) = video_timeline_values(ready_value);
+            slot.frame_available = false;
+            return Some(VulkanVideoFrame::new(
+                slot.image.vk_image,
+                slot.image.color_view,
+                slot.layout,
+                slot.image.format,
+                slot.image.width,
+                slot.image.height,
+                self.ctx.device.handle(),
+                slot.timeline.clone(),
+                ready_value,
+                release_value,
+            ));
         }
         None
     }
@@ -2851,5 +3400,165 @@ impl VulkanRenderer {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use nalgebra::Matrix4;
+
+    use super::{
+        Instance2D, Mesh2DSubmission, MeshGeometry2D, PrepareMesh2DError,
+        build_ordered_mesh_2d_batches, prepare_mesh_2d_batches, video_timeline_values,
+    };
+    use crate::mobjects::mesh_2d::Vertex2D;
+
+    fn triangle(offset: f32) -> Arc<MeshGeometry2D> {
+        Arc::new(MeshGeometry2D::new(
+            vec![
+                Vertex2D {
+                    position: [offset, 0.0],
+                },
+                Vertex2D {
+                    position: [offset + 1.0, 0.0],
+                },
+                Vertex2D {
+                    position: [offset, 1.0],
+                },
+            ],
+            vec![0, 1, 2],
+        ))
+    }
+
+    fn instance(color: [f32; 4]) -> Instance2D {
+        Instance2D::new(Matrix4::identity(), color)
+    }
+
+    #[test]
+    fn video_timeline_values_alternate_ready_and_release() {
+        assert_eq!(video_timeline_values(1), (None, 1, 2));
+        assert_eq!(video_timeline_values(3), (Some(2), 3, 4));
+        assert_eq!(video_timeline_values(9), (Some(8), 9, 10));
+    }
+
+    #[test]
+    #[should_panic(expected = "must be odd")]
+    fn video_timeline_rejects_even_ready_values() {
+        video_timeline_values(2);
+    }
+
+    #[test]
+    fn ordered_batching_only_merges_consecutive_equal_geometry() {
+        let first = triangle(0.0);
+        let equal_to_first = triangle(0.0);
+        let second = triangle(2.0);
+        let batches = build_ordered_mesh_2d_batches(vec![
+            Mesh2DSubmission {
+                geometry: first.clone(),
+                instance: instance([1.0, 0.0, 0.0, 1.0]),
+            },
+            Mesh2DSubmission {
+                geometry: equal_to_first,
+                instance: instance([0.0, 1.0, 0.0, 1.0]),
+            },
+            Mesh2DSubmission {
+                geometry: second,
+                instance: instance([0.0, 0.0, 1.0, 1.0]),
+            },
+            Mesh2DSubmission {
+                geometry: first,
+                instance: instance([1.0, 1.0, 1.0, 1.0]),
+            },
+        ]);
+
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].instances.len(), 2);
+        assert_eq!(batches[1].instances.len(), 1);
+        assert_eq!(batches[2].instances.len(), 1);
+    }
+
+    #[test]
+    fn persistent_geometry_is_only_uploaded_on_cache_miss() {
+        let geometry = triangle(0.0);
+        let batches = build_ordered_mesh_2d_batches(vec![
+            Mesh2DSubmission {
+                geometry: geometry.clone(),
+                instance: instance([1.0; 4]),
+            },
+            Mesh2DSubmission {
+                geometry,
+                instance: instance([0.5; 4]),
+            },
+        ]);
+        let mut cache = HashMap::new();
+        let mut vertex_used = 0;
+        let mut index_used = 0;
+
+        let (first_draws, first_uploads, first_instances) = prepare_mesh_2d_batches(
+            &mut cache,
+            &mut vertex_used,
+            &mut index_used,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            &batches,
+        )
+        .unwrap();
+        let vertex_used_after_first = vertex_used;
+        let index_used_after_first = index_used;
+        let (second_draws, second_uploads, second_instances) = prepare_mesh_2d_batches(
+            &mut cache,
+            &mut vertex_used,
+            &mut index_used,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            &batches,
+        )
+        .unwrap();
+
+        assert_eq!(first_draws.len(), 1);
+        assert_eq!(first_instances.len(), 2);
+        assert_eq!(first_uploads.len(), 1);
+        assert_eq!(second_draws.len(), 1);
+        assert_eq!(second_instances.len(), 2);
+        assert!(second_uploads.is_empty());
+        assert_eq!(vertex_used, vertex_used_after_first);
+        assert_eq!(index_used, index_used_after_first);
+    }
+
+    #[test]
+    fn persistent_arena_exhaustion_is_reported_for_generation_rebuild() {
+        let batches = build_ordered_mesh_2d_batches(vec![Mesh2DSubmission {
+            geometry: triangle(0.0),
+            instance: instance([1.0; 4]),
+        }]);
+        let mut cache = HashMap::new();
+        let mut vertex_used = 0;
+        let mut index_used = 0;
+
+        let result = prepare_mesh_2d_batches(
+            &mut cache,
+            &mut vertex_used,
+            &mut index_used,
+            1,
+            1,
+            4096,
+            4096,
+            4096,
+            &batches,
+        );
+
+        assert!(matches!(
+            result,
+            Err(PrepareMesh2DError::StaticArenaExhausted)
+        ));
     }
 }

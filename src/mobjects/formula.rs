@@ -71,7 +71,7 @@ fn test_formula_to_mobject() {
             mesh: &crate::mobjects::mesh_2d::TriangleMesh2D,
             _transform: nalgebra::Matrix4<crate::GMFloat>,
         ) {
-            self.vertex_count += mesh.vertices.len();
+            self.vertex_count += mesh.vertices().len();
         }
         fn push_mesh_3d(
             &mut self,

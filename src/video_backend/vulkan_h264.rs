@@ -23,7 +23,7 @@ use ash::vk::native::{
 };
 
 use crate::video_backend::VideoConfig;
-use crate::vulkan::context::VulkanContext;
+use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
 
 pub const VK_KHR_VIDEO_QUEUE_EXTENSION_NAME: &str = "VK_KHR_video_queue";
 pub const VK_KHR_VIDEO_ENCODE_QUEUE_EXTENSION_NAME: &str = "VK_KHR_video_encode_queue";
@@ -97,14 +97,52 @@ impl VulkanVideoCapabilities {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
 pub struct VulkanVideoFrame {
-    pub image: vk::Image,
-    pub image_view: vk::ImageView,
-    pub image_layout: vk::ImageLayout,
-    pub format: vk::Format,
-    pub width: u32,
-    pub height: u32,
+    image: vk::Image,
+    image_view: vk::ImageView,
+    image_layout: vk::ImageLayout,
+    format: vk::Format,
+    width: u32,
+    height: u32,
+    device: vk::Device,
+    synchronization: Option<VideoFrameSynchronization>,
+}
+
+struct VideoFrameSynchronization {
+    timeline: Arc<TimelineSemaphore>,
+    ready_value: u64,
+    release_value: u64,
+}
+
+impl VulkanVideoFrame {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        image: vk::Image,
+        image_view: vk::ImageView,
+        image_layout: vk::ImageLayout,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+        device: vk::Device,
+        timeline: Arc<TimelineSemaphore>,
+        ready_value: u64,
+        release_value: u64,
+    ) -> Self {
+        Self {
+            image,
+            image_view,
+            image_layout,
+            format,
+            width,
+            height,
+            device,
+            synchronization: Some(VideoFrameSynchronization {
+                timeline,
+                ready_value,
+                release_value,
+            }),
+        }
+    }
 }
 
 pub struct VulkanH264Backend {
@@ -150,6 +188,7 @@ struct EncodeSlot {
     fence: vk::Fence,
     query_index: u32,
     frame_index: Option<u32>,
+    frame_timeline: Option<Arc<TimelineSemaphore>>,
     busy: bool,
 }
 
@@ -180,12 +219,8 @@ fn default_h264_rate_control_settings(
 }
 
 impl VulkanH264Backend {
-    pub async fn try_new(config: &VideoConfig) -> io::Result<Self> {
+    pub fn try_new(ctx: Arc<VulkanContext>, config: &VideoConfig) -> io::Result<Self> {
         validate_dimensions(config.output_width, config.output_height)?;
-        let ctx = VulkanContext::new()
-            .await
-            .ok_or_else(|| io::Error::other("failed to create Vulkan context"))?;
-        let ctx = Arc::new(ctx);
         let capabilities = detect_capabilities(&ctx)?;
         capabilities.validate()?;
         let session = Some(create_video_session(&ctx, config)?);
@@ -206,10 +241,8 @@ impl VulkanH264Backend {
         })
     }
 
-    pub async fn new(config: &VideoConfig) -> Self {
-        Self::try_new(config)
-            .await
-            .expect("failed to create Vulkan H.264 backend")
+    pub fn new(ctx: Arc<VulkanContext>, config: &VideoConfig) -> Self {
+        Self::try_new(ctx, config).expect("failed to create Vulkan H.264 backend")
     }
 
     #[cfg(test)]
@@ -240,13 +273,17 @@ impl VulkanH264Backend {
                 "Vulkan H.264 backend is already closed",
             ));
         }
-        validate_frame(&self.config, frame)?;
         if self.session.is_none() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "Vulkan Video H.264 bitstream encoding is not initialized",
             ));
         }
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Vulkan context is not initialized"))?;
+        validate_frame(&self.config, &frame, ctx)?;
         if !self.wrote_header {
             write_h264_headers(self)?;
             self.wrote_header = true;
@@ -900,6 +937,7 @@ fn create_video_encode_resources(
             fence,
             query_index,
             frame_index: None,
+            frame_timeline: None,
             busy: false,
         });
     }
@@ -1118,7 +1156,7 @@ fn write_h264_headers(backend: &mut VulkanH264Backend) -> io::Result<()> {
 
 fn encode_one_frame(
     backend: &mut VulkanH264Backend,
-    frame: VulkanVideoFrame,
+    mut frame: VulkanVideoFrame,
     slot_index: usize,
 ) -> io::Result<()> {
     let ctx = backend
@@ -1369,20 +1407,37 @@ fn encode_one_frame(
         ctx.device
             .end_command_buffer(slot.command_buffer)
             .map_err(io::Error::other)?;
-        let submit_info = vk::SubmitInfo {
-            s_type: vk::StructureType::SUBMIT_INFO,
-            command_buffer_count: 1,
-            p_command_buffers: &slot.command_buffer,
-            ..Default::default()
-        };
+        let synchronization = frame
+            .synchronization
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Vulkan video frame has no synchronization lease"))?;
+        let wait_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(synchronization.timeline.handle())
+            .value(synchronization.ready_value)
+            .stage_mask(vk::PipelineStageFlags2::VIDEO_ENCODE_KHR);
+        let signal_info = vk::SemaphoreSubmitInfo::default()
+            .semaphore(synchronization.timeline.handle())
+            .value(synchronization.release_value)
+            .stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS);
+        let command_buffer_info =
+            vk::CommandBufferSubmitInfo::default().command_buffer(slot.command_buffer);
+        let submit_info = vk::SubmitInfo2::default()
+            .wait_semaphore_infos(std::slice::from_ref(&wait_info))
+            .command_buffer_infos(std::slice::from_ref(&command_buffer_info))
+            .signal_semaphore_infos(std::slice::from_ref(&signal_info));
         let queue = ctx.video_encode_queue.unwrap_or(ctx.queue);
         ctx.device
-            .queue_submit(queue, std::slice::from_ref(&submit_info), slot.fence)
+            .queue_submit2(queue, std::slice::from_ref(&submit_info), slot.fence)
             .map_err(io::Error::other)?;
     }
 
+    let synchronization = frame
+        .synchronization
+        .take()
+        .ok_or_else(|| io::Error::other("Vulkan video frame synchronization was lost"))?;
     slot.busy = true;
     slot.frame_index = Some(frame_num);
+    slot.frame_timeline = Some(synchronization.timeline);
     Ok(())
 }
 
@@ -1430,6 +1485,7 @@ fn collect_completed_packets(backend: &mut VulkanH264Backend, wait_all: bool) ->
             completed_packets.push((frame_index, packet));
             resources.slots[slot_index].busy = false;
             resources.slots[slot_index].frame_index = None;
+            resources.slots[slot_index].frame_timeline = None;
         }
     }
 
@@ -1475,6 +1531,7 @@ fn acquire_encode_slot(backend: &mut VulkanH264Backend) -> io::Result<usize> {
         let packet = read_completed_slot_packet(ctx, resources, slot_index)?;
         resources.slots[slot_index].busy = false;
         resources.slots[slot_index].frame_index = None;
+        resources.slots[slot_index].frame_timeline = None;
         (slot_index, frame_index, packet)
     };
 
@@ -1627,7 +1684,23 @@ fn find_memory_type_index(
     ))
 }
 
-fn validate_frame(config: &VideoConfig, frame: VulkanVideoFrame) -> io::Result<()> {
+fn validate_frame(
+    config: &VideoConfig,
+    frame: &VulkanVideoFrame,
+    context: &VulkanContext,
+) -> io::Result<()> {
+    if frame.device != context.device.handle() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Vulkan video frame belongs to a different device",
+        ));
+    }
+    if frame.synchronization.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Vulkan video frame has no synchronization lease",
+        ));
+    }
     validate_dimensions(frame.width, frame.height)?;
     if frame.width != config.output_width || frame.height != config.output_height {
         return Err(io::Error::new(
@@ -1919,6 +1992,8 @@ mod tests {
             format: vk::Format::from_raw(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW),
             width: 1920,
             height: 1080,
+            device: vk::Device::null(),
+            synchronization: None,
         };
 
         let err = backend.submit_vulkan_frame(frame).unwrap_err();

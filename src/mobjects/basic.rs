@@ -48,20 +48,13 @@ impl Rectangle {
         let path = builder.build();
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
-        let color = [
-            self.color.r as f32 / 255.0,
-            self.color.g as f32 / 255.0,
-            self.color.b as f32 / 255.0,
-            self.color.a as f32 / 255.0,
-        ];
-
         if self.draw_config.fill {
             let mut fill_tess = FillTessellator::new();
             fill_tess
                 .tessellate_path(
                     &path,
                     &FillOptions::default(),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
@@ -72,14 +65,13 @@ impl Rectangle {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
 
-        self.mesh.vertices = geometry.vertices;
-        self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.base.model_matrix;
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, self.color);
     }
 }
 
@@ -143,27 +135,19 @@ impl SimpleLine {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [
-            c.r as f32 / 255.0,
-            c.g as f32 / 255.0,
-            c.b as f32 / 255.0,
-            c.a as f32 / 255.0,
-        ];
-
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
             stroke_tess
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
 
-        self.mesh.vertices = geometry.vertices;
-        self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.base.model_matrix;
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, c);
     }
 }
 
@@ -289,27 +273,19 @@ impl Arc {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [
-            c.r as f32 / 255.0,
-            c.g as f32 / 255.0,
-            c.b as f32 / 255.0,
-            c.a as f32 / 255.0,
-        ];
-
         if self.draw_config.stoke_width > 0.0 {
             let mut stroke_tess = StrokeTessellator::new();
             stroke_tess
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
 
-        self.mesh.vertices = geometry.vertices;
-        self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.base.model_matrix;
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, c);
     }
 }
 
@@ -358,20 +334,13 @@ impl PolyLine {
 
         let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
         let c = self.draw_config.color;
-        let color = [
-            c.r as f32 / 255.0,
-            c.g as f32 / 255.0,
-            c.b as f32 / 255.0,
-            c.a as f32 / 255.0,
-        ];
-
         if self.draw_config.fill {
             let mut fill_tess = FillTessellator::new();
             fill_tess
                 .tessellate_path(
                     &path,
                     &FillOptions::default(),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
@@ -382,14 +351,13 @@ impl PolyLine {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder { color }),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
         }
 
-        self.mesh.vertices = geometry.vertices;
-        self.mesh.indices = geometry.indices;
-        self.mesh.model_matrix = self.base.model_matrix;
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, c);
     }
 }
 

@@ -29,15 +29,15 @@ struct InterceptorVisitor<'a> {
 impl<'a> RenderVisitor for InterceptorVisitor<'a> {
     fn push_mesh_2d(&mut self, mesh: &TriangleMesh2D, transform: Matrix4<crate::GMFloat>) {
         let mut mesh3d = TriangleMesh3D::new(Vec::new(), Vec::new());
-        mesh3d.model_matrix = mesh.model_matrix;
-        for v in &mesh.vertices {
+        let color = mesh.color();
+        for v in mesh.vertices() {
             mesh3d.vertices.push(Vertex {
                 position: [v.position[0], v.position[1], 0.0],
                 normal: [0.0, 0.0, 1.0],
-                color: v.color,
+                color,
             });
         }
-        mesh3d.indices = mesh.indices.clone();
+        mesh3d.indices = mesh.indices().to_vec();
 
         self.real_visitor
             .push_mesh_3d(&mesh3d, self.wrapper_matrix * transform);

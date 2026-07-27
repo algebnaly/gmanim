@@ -77,21 +77,23 @@ fn main() -> std::io::Result<()> {
         color_order: ColorOrder::Nv12,
         bitrate: None,
     };
-    let mut video_backend = pollster::block_on(VulkanH264Backend::try_new(&video_config))?;
+    let vk_ctx = gmanim_core::vulkan::context::VulkanContext::new().unwrap();
+    let mut video_backend = VulkanH264Backend::try_new(vk_ctx.clone(), &video_config)?;
 
     println!("Starting Vulkan H.264 render loop...");
     let start_time = std::time::Instant::now();
 
     let mut frames_rendered = 0;
-    let vk_ctx = pollster::block_on(gmanim_core::vulkan::context::VulkanContext::new()).unwrap();
     let mut renderer = gmanim_core::vulkan::renderer::VulkanRenderer::new(
-        std::sync::Arc::new(vk_ctx),
+        vk_ctx,
         gmanim_core::RendererConfig {
             msaa_samples: 8,
             ssaa_factor: 2,
         },
     );
 
+    let mut first_frame_stats = None;
+    let mut steady_frame_stats = None;
     while timeline.advance_frame() {
         frames_rendered += 1;
         renderer.render_scene_with_outputs(
@@ -100,6 +102,11 @@ fn main() -> std::io::Result<()> {
             None,
             gmanim_core::vulkan::renderer::RenderOutputs::VULKAN_VIDEO_ONLY,
         );
+        let stats = renderer.last_stats();
+        first_frame_stats.get_or_insert(stats);
+        if frames_rendered == 2 {
+            steady_frame_stats = Some(stats);
+        }
         let frame = renderer
             .get_vulkan_video_frame()
             .ok_or_else(|| std::io::Error::other("missing Vulkan video frame"))?;
@@ -108,6 +115,12 @@ fn main() -> std::io::Result<()> {
     video_backend.finish()?;
 
     println!("Frames rendered: {}", frames_rendered);
+    println!("First frame renderer stats: {first_frame_stats:?}");
+    println!("Steady frame renderer stats: {steady_frame_stats:?}");
+    assert_eq!(first_frame_stats.unwrap().mesh_2d_geometry_uploads, 1);
+    assert_eq!(steady_frame_stats.unwrap().mesh_2d_geometry_uploads, 0);
+    assert_eq!(renderer.last_stats().mesh_2d_draw_calls, 1);
+    assert_eq!(renderer.last_stats().mesh_2d_instances, 1000);
     println!("Total time: {:?}", start_time.elapsed());
     Ok(())
 }
