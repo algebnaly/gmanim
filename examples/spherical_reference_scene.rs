@@ -53,6 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(stats.mesh_3d_transparent_draw_calls, 2);
     assert_eq!(stats.surface_lighting_dispatches, 1);
     assert_eq!(stats.surface_resolve_dispatches, 1);
+    assert_eq!(stats.surface_composite_dispatches, 1);
     assert_eq!(stats.tone_map_dispatches, 1);
     assert_eq!(stats.bloom_dispatches, 3);
 

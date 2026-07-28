@@ -49,6 +49,8 @@ fn main() {
     assert_eq!(stats.sdf_dispatches, 0);
     assert_eq!(stats.raster_passes, 0);
     assert_eq!(stats.surface_resolve_dispatches, 0);
+    assert_eq!(stats.surface_lighting_dispatches, 0);
+    assert_eq!(stats.surface_composite_dispatches, 0);
     assert_eq!(non_black, 0);
 
     let mut sdf = Scene::default();
@@ -66,6 +68,8 @@ fn main() {
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 0);
     assert_eq!(stats.surface_resolve_dispatches, 1);
+    assert_eq!(stats.surface_lighting_dispatches, 1);
+    assert_eq!(stats.surface_composite_dispatches, 1);
     assert!(non_black > 100);
 
     let mut raster = Scene::default();
@@ -84,6 +88,8 @@ fn main() {
     assert_eq!(stats.raster_passes, 1);
     assert_eq!(stats.downsample_dispatches, 0);
     assert_eq!(stats.surface_resolve_dispatches, 0);
+    assert_eq!(stats.surface_lighting_dispatches, 0);
+    assert_eq!(stats.surface_composite_dispatches, 0);
     assert!(non_black > 100);
 
     let mut mixed = sdf;
@@ -101,6 +107,8 @@ fn main() {
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 1);
     assert_eq!(stats.surface_resolve_dispatches, 1);
+    assert_eq!(stats.surface_lighting_dispatches, 1);
+    assert_eq!(stats.surface_composite_dispatches, 1);
     assert!(non_black > 100);
     let sdf_sample =
         ((config.output_height / 2 + 12) * config.output_width + config.output_width / 2) as usize;

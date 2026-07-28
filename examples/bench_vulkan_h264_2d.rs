@@ -239,6 +239,7 @@ fn main() -> std::io::Result<()> {
     assert_eq!(renderer.last_stats().downsample_dispatches, 0);
     assert_eq!(renderer.last_stats().fused_video_downsample_dispatches, 1);
     assert_eq!(renderer.last_stats().surface_resolve_dispatches, 0);
+    assert_eq!(renderer.last_stats().surface_composite_dispatches, 0);
     println!("Total time: {:?}", start_time.elapsed());
     Ok(())
 }

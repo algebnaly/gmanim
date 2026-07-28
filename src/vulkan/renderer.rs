@@ -17,6 +17,7 @@ const VK_IMAGE_ASPECT_PLANE_0_BIT_RAW: u32 = 0x0000_0010;
 const VK_IMAGE_ASPECT_PLANE_1_BIT_RAW: u32 = 0x0000_0020;
 const RENDER_FRAME_COUNT: usize = 3;
 const GPU_TIMESTAMP_COUNT: u32 = 6;
+const MAX_SURFACE_MATERIALS: usize = 10_000;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment <= 1 {
@@ -783,6 +784,7 @@ pub struct RendererStats {
     pub downsample_dispatches: u32,
     pub fused_video_downsample_dispatches: u32,
     pub surface_resolve_dispatches: u32,
+    pub surface_composite_dispatches: u32,
     pub output_conversion_dispatches: u32,
     pub rgba_readback_copies: u32,
 }
@@ -1235,6 +1237,16 @@ struct RenderTargetSet {
     raster_albedo_state: TrackedImageState,
     raster_material_id: Image,
     raster_material_id_state: TrackedImageState,
+    resolved_primary_normal_depth: Image,
+    resolved_primary_normal_depth_state: TrackedImageState,
+    resolved_primary_albedo_coverage: Image,
+    resolved_primary_albedo_coverage_state: TrackedImageState,
+    resolved_secondary_normal_depth: Image,
+    resolved_secondary_normal_depth_state: TrackedImageState,
+    resolved_secondary_albedo_coverage: Image,
+    resolved_secondary_albedo_coverage_state: TrackedImageState,
+    resolved_material_ids: Image,
+    resolved_material_ids_state: TrackedImageState,
     surface_hdr: Image,
     surface_hdr_state: TrackedImageState,
     overlay_hdr: Image,
@@ -1251,6 +1263,7 @@ struct RenderTargetSet {
     bloom_pong_state: TrackedImageState,
     bloom_contains_data: bool,
     compute_descriptor_set: vk::DescriptorSet,
+    surface_resolve_descriptor_set: vk::DescriptorSet,
     surface_lighting_descriptor_set: vk::DescriptorSet,
     surface_composite_descriptor_set: vk::DescriptorSet,
     raster_descriptor_set: vk::DescriptorSet,
@@ -1267,6 +1280,11 @@ impl RenderTargetSet {
         self.raster_normal_depth.destroy(ctx);
         self.raster_albedo.destroy(ctx);
         self.raster_material_id.destroy(ctx);
+        self.resolved_primary_normal_depth.destroy(ctx);
+        self.resolved_primary_albedo_coverage.destroy(ctx);
+        self.resolved_secondary_normal_depth.destroy(ctx);
+        self.resolved_secondary_albedo_coverage.destroy(ctx);
+        self.resolved_material_ids.destroy(ctx);
         self.surface_hdr.destroy(ctx);
         self.overlay_hdr.destroy(ctx);
         self.resolved_texture.destroy(ctx);
@@ -1274,6 +1292,128 @@ impl RenderTargetSet {
         self.transparent_back_depth.destroy(ctx);
         self.bloom_ping.destroy(ctx);
         self.bloom_pong.destroy(ctx);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceComputePipelines {
+    resolve: vk::Pipeline,
+    resolve_layout: vk::PipelineLayout,
+    lighting: vk::Pipeline,
+    lighting_layout: vk::PipelineLayout,
+}
+
+fn transition_resolved_surface(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    targets: &mut RenderTargetSet,
+    destination: TrackedImageState,
+) {
+    for (image, state) in [
+        (
+            targets.resolved_primary_normal_depth.vk_image,
+            &mut targets.resolved_primary_normal_depth_state,
+        ),
+        (
+            targets.resolved_primary_albedo_coverage.vk_image,
+            &mut targets.resolved_primary_albedo_coverage_state,
+        ),
+        (
+            targets.resolved_secondary_normal_depth.vk_image,
+            &mut targets.resolved_secondary_normal_depth_state,
+        ),
+        (
+            targets.resolved_secondary_albedo_coverage.vk_image,
+            &mut targets.resolved_secondary_albedo_coverage_state,
+        ),
+        (
+            targets.resolved_material_ids.vk_image,
+            &mut targets.resolved_material_ids_state,
+        ),
+    ] {
+        unsafe {
+            transition_image(
+                device,
+                command_buffer,
+                image,
+                vk::ImageAspectFlags::COLOR,
+                state,
+                destination,
+            );
+        }
+    }
+}
+
+fn record_surface_compute(
+    device: &ash::Device,
+    command_buffer: vk::CommandBuffer,
+    targets: &mut RenderTargetSet,
+    pipelines: SurfaceComputePipelines,
+    dynamic_offsets: &[u32],
+    extent: vk::Extent2D,
+) {
+    let compute_write_state = TrackedImageState {
+        layout: vk::ImageLayout::GENERAL,
+        stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
+        access: vk::AccessFlags2::SHADER_WRITE,
+    };
+    let compute_read_state = TrackedImageState {
+        access: vk::AccessFlags2::SHADER_READ,
+        ..compute_write_state
+    };
+
+    transition_resolved_surface(device, command_buffer, targets, compute_write_state);
+    unsafe {
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipelines.resolve,
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipelines.resolve_layout,
+            0,
+            std::slice::from_ref(&targets.surface_resolve_descriptor_set),
+            dynamic_offsets,
+        );
+        device.cmd_dispatch(
+            command_buffer,
+            (extent.width + 15) / 16,
+            (extent.height + 15) / 16,
+            1,
+        );
+    }
+
+    transition_resolved_surface(device, command_buffer, targets, compute_read_state);
+    unsafe {
+        transition_image(
+            device,
+            command_buffer,
+            targets.surface_hdr.vk_image,
+            vk::ImageAspectFlags::COLOR,
+            &mut targets.surface_hdr_state,
+            compute_write_state,
+        );
+        device.cmd_bind_pipeline(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipelines.lighting,
+        );
+        device.cmd_bind_descriptor_sets(
+            command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            pipelines.lighting_layout,
+            0,
+            std::slice::from_ref(&targets.surface_lighting_descriptor_set),
+            dynamic_offsets,
+        );
+        device.cmd_dispatch(
+            command_buffer,
+            (extent.width + 15) / 16,
+            (extent.height + 15) / 16,
+            1,
+        );
     }
 }
 
@@ -1305,6 +1445,7 @@ impl RenderCache {
         for targets in &self.render_targets {
             descriptor_sets.extend([
                 targets.compute_descriptor_set,
+                targets.surface_resolve_descriptor_set,
                 targets.surface_lighting_descriptor_set,
                 targets.surface_composite_descriptor_set,
                 targets.raster_descriptor_set,
@@ -1412,6 +1553,7 @@ pub struct VulkanRenderer {
 
     descriptor_pool: vk::DescriptorPool,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
+    surface_resolve_descriptor_set_layout: vk::DescriptorSetLayout,
     surface_lighting_descriptor_set_layout: vk::DescriptorSetLayout,
     surface_composite_descriptor_set_layout: vk::DescriptorSetLayout,
     raster_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -1423,10 +1565,12 @@ pub struct VulkanRenderer {
 
     compute_pipeline_layout: vk::PipelineLayout,
     compute_pipeline: vk::Pipeline,
+    surface_resolve_pipeline_layout: vk::PipelineLayout,
+    surface_resolve_pipeline: vk::Pipeline,
     surface_lighting_pipeline_layout: vk::PipelineLayout,
     surface_lighting_pipeline: vk::Pipeline,
     surface_composite_pipeline_layout: vk::PipelineLayout,
-    surface_resolve_pipeline: vk::Pipeline,
+    surface_copy_pipeline: vk::Pipeline,
     surface_overlay_pipeline: vk::Pipeline,
     composite_pipeline_layout: vk::PipelineLayout,
     downsample_pipeline: vk::Pipeline,
@@ -1493,6 +1637,7 @@ impl VulkanRenderer {
         let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
         let (environment_map, environment_sampler) = create_studio_environment(&ctx);
 
+        let surface_interface = include_str!("surface_interface.wgsl");
         let surface_lighting = include_str!("surface_lighting.wgsl");
         let compute_shader_source = include_str!("shader.wgsl");
         let raster_shader_source =
@@ -1500,13 +1645,12 @@ impl VulkanRenderer {
         let raster_sample_count = sample_count.as_raw();
         let surface_gbuffer_bindings = if raster_sample_count == 1 {
             r#"
-@group(0) @binding(0) var output_tex: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(1) var sdf_normal_coverage_tex: texture_2d<f32>;
-@group(0) @binding(2) var sdf_depth_tex: texture_2d<f32>;
-@group(0) @binding(3) var sdf_material_id_tex: texture_2d<u32>;
-@group(0) @binding(4) var raster_normal_depth_tex: texture_2d<f32>;
-@group(0) @binding(5) var raster_albedo_tex: texture_2d<f32>;
-@group(0) @binding(6) var raster_material_id_tex: texture_2d<u32>;
+@group(0) @binding(5) var sdf_normal_coverage_tex: texture_2d<f32>;
+@group(0) @binding(6) var sdf_depth_tex: texture_2d<f32>;
+@group(0) @binding(7) var sdf_material_id_tex: texture_2d<u32>;
+@group(0) @binding(8) var raster_normal_depth_tex: texture_2d<f32>;
+@group(0) @binding(9) var raster_albedo_tex: texture_2d<f32>;
+@group(0) @binding(10) var raster_material_id_tex: texture_2d<u32>;
 const GBUFFER_SAMPLE_COUNT = 1u;
 fn load_raster_normal_depth(pixel: vec2<i32>, sample: u32) -> vec4<f32> {
     return textureLoad(raster_normal_depth_tex, pixel, 0);
@@ -1522,13 +1666,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {
         } else {
             format!(
                 r#"
-@group(0) @binding(0) var output_tex: texture_storage_2d<rgba16float, write>;
-@group(0) @binding(1) var sdf_normal_coverage_tex: texture_2d<f32>;
-@group(0) @binding(2) var sdf_depth_tex: texture_2d<f32>;
-@group(0) @binding(3) var sdf_material_id_tex: texture_2d<u32>;
-@group(0) @binding(4) var raster_normal_depth_tex: texture_multisampled_2d<f32>;
-@group(0) @binding(5) var raster_albedo_tex: texture_multisampled_2d<f32>;
-@group(0) @binding(6) var raster_material_id_tex: texture_multisampled_2d<u32>;
+@group(0) @binding(5) var sdf_normal_coverage_tex: texture_2d<f32>;
+@group(0) @binding(6) var sdf_depth_tex: texture_2d<f32>;
+@group(0) @binding(7) var sdf_material_id_tex: texture_2d<u32>;
+@group(0) @binding(8) var raster_normal_depth_tex: texture_multisampled_2d<f32>;
+@group(0) @binding(9) var raster_albedo_tex: texture_multisampled_2d<f32>;
+@group(0) @binding(10) var raster_material_id_tex: texture_multisampled_2d<u32>;
 const GBUFFER_SAMPLE_COUNT = {raster_sample_count}u;
 fn load_raster_normal_depth(pixel: vec2<i32>, sample: u32) -> vec4<f32> {{
     return textureLoad(raster_normal_depth_tex, pixel, i32(sample));
@@ -1543,12 +1686,18 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             )
         };
         let surface_resolve_shader_source = format!(
-            "{surface_gbuffer_bindings}\n{surface_lighting}\n{}",
+            "{surface_gbuffer_bindings}\n{surface_interface}\n{}",
             include_str!("surface_resolve_shader.wgsl")
+        );
+        let surface_lighting_shader_source = format!(
+            "{surface_interface}\n{}\n{}",
+            include_str!("surface_lighting_shader.wgsl"),
+            surface_lighting,
         );
         let compute_shader = compile_wgsl_full(&ctx, compute_shader_source);
         let raster_shader = compile_wgsl_full(&ctx, &raster_shader_source);
         let surface_resolve_shader = compile_wgsl_full(&ctx, &surface_resolve_shader_source);
+        let surface_lighting_shader = compile_wgsl_full(&ctx, &surface_lighting_shader_source);
         let surface_composite_shader =
             compile_wgsl_full(&ctx, include_str!("surface_composite_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
@@ -1927,84 +2076,48 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .create_descriptor_set_layout(&compute_layout_info, None)
                 .unwrap()
         };
+        let compute_binding = |binding, descriptor_type| vk::DescriptorSetLayoutBinding {
+            binding,
+            descriptor_type,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            ..Default::default()
+        };
+        let surface_resolve_bindings = [
+            compute_binding(0, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(1, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(2, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(3, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(4, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(5, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(6, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(7, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(8, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(9, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(10, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(11, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC),
+            compute_binding(12, vk::DescriptorType::STORAGE_BUFFER_DYNAMIC),
+        ];
+        let surface_resolve_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .bindings(&surface_resolve_bindings),
+                    None,
+                )
+                .unwrap()
+        };
         let surface_lighting_bindings = [
-            vk::DescriptorSetLayoutBinding {
-                binding: 0,
-                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 1,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 2,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 3,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 4,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 5,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 6,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 7,
-                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 8,
-                descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 9,
-                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
-            vk::DescriptorSetLayoutBinding {
-                binding: 10,
-                descriptor_type: vk::DescriptorType::SAMPLER,
-                descriptor_count: 1,
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                ..Default::default()
-            },
+            compute_binding(0, vk::DescriptorType::STORAGE_IMAGE),
+            compute_binding(1, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(2, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(3, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(4, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(5, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(6, vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC),
+            compute_binding(7, vk::DescriptorType::STORAGE_BUFFER_DYNAMIC),
+            compute_binding(8, vk::DescriptorType::SAMPLED_IMAGE),
+            compute_binding(9, vk::DescriptorType::SAMPLER),
         ];
         let surface_lighting_descriptor_set_layout = unsafe {
             ctx.device
@@ -2147,6 +2260,35 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 )
                 .unwrap()[0]
         };
+        let surface_resolve_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(std::slice::from_ref(&surface_resolve_descriptor_set_layout)),
+                    None,
+                )
+                .unwrap()
+        };
+        let create_compute_pipeline = |shader: vk::ShaderModule, layout: vk::PipelineLayout| unsafe {
+            let entry_point = std::ffi::CString::new("main").unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::COMPUTE)
+                .module(shader)
+                .name(&entry_point);
+            ctx.device
+                .create_compute_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(
+                        &vk::ComputePipelineCreateInfo::default()
+                            .stage(stage)
+                            .layout(layout),
+                    ),
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let surface_resolve_pipeline =
+            create_compute_pipeline(surface_resolve_shader, surface_resolve_pipeline_layout);
         let surface_lighting_pipeline_layout = unsafe {
             ctx.device
                 .create_pipeline_layout(
@@ -2157,24 +2299,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 )
                 .unwrap()
         };
-        let surface_lighting_pipeline = unsafe {
-            let entry_point = std::ffi::CString::new("main").unwrap();
-            let stage = vk::PipelineShaderStageCreateInfo::default()
-                .stage(vk::ShaderStageFlags::COMPUTE)
-                .module(surface_resolve_shader)
-                .name(&entry_point);
-            ctx.device
-                .create_compute_pipelines(
-                    vk::PipelineCache::null(),
-                    std::slice::from_ref(
-                        &vk::ComputePipelineCreateInfo::default()
-                            .stage(stage)
-                            .layout(surface_lighting_pipeline_layout),
-                    ),
-                    None,
-                )
-                .unwrap()[0]
-        };
+        let surface_lighting_pipeline =
+            create_compute_pipeline(surface_lighting_shader, surface_lighting_pipeline_layout);
         let surface_composite_pipeline_layout = unsafe {
             ctx.device
                 .create_pipeline_layout(
@@ -2205,7 +2331,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     .unwrap()[0]
             }
         };
-        let surface_resolve_pipeline = create_surface_composite_pipeline("resolve_surface");
+        let surface_copy_pipeline = create_surface_composite_pipeline("copy_surface");
         let surface_overlay_pipeline = create_surface_composite_pipeline("composite_overlay");
 
         let raster_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
@@ -2730,7 +2856,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             uniform_alignment,
         );
         let material_buffer_3d_stride = align_up(
-            (std::mem::size_of::<MaterialData3D>() * 10_000) as u64,
+            (std::mem::size_of::<MaterialData3D>() * MAX_SURFACE_MATERIALS) as u64,
             storage_alignment,
         );
         let primitive_buffer_stride = align_up(
@@ -2877,6 +3003,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             ctx.device
                 .destroy_shader_module(surface_resolve_shader, None);
             ctx.device
+                .destroy_shader_module(surface_lighting_shader, None);
+            ctx.device
                 .destroy_shader_module(surface_composite_shader, None);
             ctx.device.destroy_shader_module(raster_shader_2d, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
@@ -2894,6 +3022,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             environment_sampler,
             descriptor_pool,
             compute_descriptor_set_layout,
+            surface_resolve_descriptor_set_layout,
             surface_lighting_descriptor_set_layout,
             surface_composite_descriptor_set_layout,
             raster_descriptor_set_layout,
@@ -2904,10 +3033,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             video_nv12_descriptor_set_layout,
             compute_pipeline_layout,
             compute_pipeline,
+            surface_resolve_pipeline_layout,
+            surface_resolve_pipeline,
             surface_lighting_pipeline_layout,
             surface_lighting_pipeline,
             surface_composite_pipeline_layout,
-            surface_resolve_pipeline,
+            surface_copy_pipeline,
             surface_overlay_pipeline,
             composite_pipeline_layout,
             downsample_pipeline,
@@ -3383,6 +3514,26 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     vk::ImageAspectFlags::COLOR,
                     raster_sample_count,
                 );
+                let resolved_surface_image = |format| {
+                    Image::new(
+                        &self.ctx,
+                        width * self.ssaa_factor,
+                        height * self.ssaa_factor,
+                        format,
+                        vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                        vk::ImageAspectFlags::COLOR,
+                        vk::SampleCountFlags::TYPE_1,
+                    )
+                };
+                let resolved_primary_normal_depth =
+                    resolved_surface_image(vk::Format::R16G16B16A16_SFLOAT);
+                let resolved_primary_albedo_coverage =
+                    resolved_surface_image(vk::Format::R16G16B16A16_SFLOAT);
+                let resolved_secondary_normal_depth =
+                    resolved_surface_image(vk::Format::R16G16B16A16_SFLOAT);
+                let resolved_secondary_albedo_coverage =
+                    resolved_surface_image(vk::Format::R16G16B16A16_SFLOAT);
+                let resolved_material_ids = resolved_surface_image(vk::Format::R32_UINT);
                 let surface_hdr = Image::new(
                     &self.ctx,
                     width * self.ssaa_factor,
@@ -3480,6 +3631,16 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     raster_albedo_state: TrackedImageState::UNDEFINED,
                     raster_material_id,
                     raster_material_id_state: TrackedImageState::UNDEFINED,
+                    resolved_primary_normal_depth,
+                    resolved_primary_normal_depth_state: TrackedImageState::UNDEFINED,
+                    resolved_primary_albedo_coverage,
+                    resolved_primary_albedo_coverage_state: TrackedImageState::UNDEFINED,
+                    resolved_secondary_normal_depth,
+                    resolved_secondary_normal_depth_state: TrackedImageState::UNDEFINED,
+                    resolved_secondary_albedo_coverage,
+                    resolved_secondary_albedo_coverage_state: TrackedImageState::UNDEFINED,
+                    resolved_material_ids,
+                    resolved_material_ids_state: TrackedImageState::UNDEFINED,
                     surface_hdr,
                     surface_hdr_state: TrackedImageState::UNDEFINED,
                     overlay_hdr,
@@ -3496,6 +3657,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     bloom_pong_state: TrackedImageState::UNDEFINED,
                     bloom_contains_data: false,
                     compute_descriptor_set: vk::DescriptorSet::null(),
+                    surface_resolve_descriptor_set: vk::DescriptorSet::null(),
                     surface_lighting_descriptor_set: vk::DescriptorSet::null(),
                     surface_composite_descriptor_set: vk::DescriptorSet::null(),
                     raster_descriptor_set: vk::DescriptorSet::null(),
@@ -3599,6 +3761,24 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .zip(compute_descriptor_sets.into_iter())
             {
                 targets.compute_descriptor_set = descriptor_set;
+            }
+            let surface_resolve_layouts =
+                [self.surface_resolve_descriptor_set_layout; RENDER_FRAME_COUNT];
+            let surface_resolve_descriptor_sets = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.descriptor_pool)
+                            .set_layouts(&surface_resolve_layouts),
+                    )
+                    .unwrap()
+            };
+            for (targets, descriptor_set) in render_targets
+                .iter_mut()
+                .zip(surface_resolve_descriptor_sets)
+            {
+                targets.surface_resolve_descriptor_set = descriptor_set;
             }
             let surface_lighting_layouts =
                 [self.surface_lighting_descriptor_set_layout; RENDER_FRAME_COUNT];
@@ -3790,6 +3970,46 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .iter()
                 .map(|targets| vk::DescriptorImageInfo {
                     image_view: targets.sdf_material_id.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_primary_normal_depth_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_primary_normal_depth.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_primary_albedo_coverage_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_primary_albedo_coverage.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_secondary_normal_depth_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_secondary_normal_depth.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_secondary_albedo_coverage_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_secondary_albedo_coverage.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let resolved_material_ids_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.resolved_material_ids.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 })
@@ -4038,6 +4258,123 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     },
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_primary_normal_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_primary_albedo_coverage_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 2,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_secondary_normal_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 3,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_secondary_albedo_coverage_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 4,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_material_ids_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 5,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &sdf_normal_coverage_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 6,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &sdf_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 7,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &sdf_material_id_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 8,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &raster_normal_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 9,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &raster_albedo_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 10,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &raster_material_id_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 11,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &camera_buffer_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.surface_resolve_descriptor_set,
+                        dst_binding: 12,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &material_buffer_3d_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.surface_lighting_descriptor_set,
                         dst_binding: 0,
                         descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
@@ -4051,7 +4388,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         dst_binding: 1,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
-                        p_image_info: &sdf_normal_coverage_infos[index],
+                        p_image_info: &resolved_primary_normal_depth_infos[index],
                         ..Default::default()
                     },
                     vk::WriteDescriptorSet {
@@ -4060,7 +4397,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         dst_binding: 2,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
-                        p_image_info: &sdf_depth_infos[index],
+                        p_image_info: &resolved_primary_albedo_coverage_infos[index],
                         ..Default::default()
                     },
                     vk::WriteDescriptorSet {
@@ -4069,7 +4406,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         dst_binding: 3,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
-                        p_image_info: &sdf_material_id_infos[index],
+                        p_image_info: &resolved_secondary_normal_depth_infos[index],
                         ..Default::default()
                     },
                     vk::WriteDescriptorSet {
@@ -4078,7 +4415,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         dst_binding: 4,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
-                        p_image_info: &raster_normal_depth_infos[index],
+                        p_image_info: &resolved_secondary_albedo_coverage_infos[index],
                         ..Default::default()
                     },
                     vk::WriteDescriptorSet {
@@ -4087,22 +4424,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         dst_binding: 5,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
-                        p_image_info: &raster_albedo_infos[index],
+                        p_image_info: &resolved_material_ids_infos[index],
                         ..Default::default()
                     },
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.surface_lighting_descriptor_set,
                         dst_binding: 6,
-                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                        descriptor_count: 1,
-                        p_image_info: &raster_material_id_infos[index],
-                        ..Default::default()
-                    },
-                    vk::WriteDescriptorSet {
-                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                        dst_set: targets.surface_lighting_descriptor_set,
-                        dst_binding: 7,
                         descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
                         descriptor_count: 1,
                         p_buffer_info: &camera_buffer_info,
@@ -4111,7 +4439,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.surface_lighting_descriptor_set,
-                        dst_binding: 8,
+                        dst_binding: 7,
                         descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
                         descriptor_count: 1,
                         p_buffer_info: &material_buffer_3d_info,
@@ -4120,7 +4448,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.surface_lighting_descriptor_set,
-                        dst_binding: 9,
+                        dst_binding: 8,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
                         p_image_info: &environment_image_info,
@@ -4129,7 +4457,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.surface_lighting_descriptor_set,
-                        dst_binding: 10,
+                        dst_binding: 9,
                         descriptor_type: vk::DescriptorType::SAMPLER,
                         descriptor_count: 1,
                         p_image_info: &environment_sampler_info,
@@ -4528,6 +4856,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 && !fused_video_downsample) as u32,
             fused_video_downsample_dispatches: fused_video_downsample as u32,
             surface_resolve_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
+            surface_composite_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
             output_conversion_dispatches: outputs.cpu_nv12 as u32
                 + outputs.cpu_yuv444p as u32
                 + outputs.vulkan_video as u32,
@@ -4547,7 +4876,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let instance_buffer_2d_offset = self.instance_buffer_2d_stride * frame_idx as u64;
         let camera_buffer_2d_offset = self.camera_buffer_2d_stride * frame_idx as u64;
         let compute_dynamic_offsets = [camera_buffer_offset as u32, primitive_buffer_offset as u32];
-        let surface_lighting_dynamic_offsets = [
+        let surface_dynamic_offsets = [
             camera_buffer_offset as u32,
             material_buffer_3d_offset as u32,
         ];
@@ -4625,16 +4954,15 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 bytemuck::bytes_of(camera_uniform_2d),
             );
             if !surface_materials.is_empty() {
+                assert!(
+                    surface_materials.len() <= MAX_SURFACE_MATERIALS,
+                    "3D material count exceeds {MAX_SURFACE_MATERIALS}"
+                );
                 let materials: Vec<MaterialData3D> = surface_materials
                     .iter()
                     .copied()
                     .map(MaterialData3D::from)
                     .collect();
-                assert!(
-                    std::mem::size_of_val(materials.as_slice())
-                        <= self.material_buffer_3d_stride as usize,
-                    "3D material count exceeds the per-frame material buffer capacity"
-                );
                 self.material_buffer_3d
                     .write_bytes(material_buffer_3d_offset, bytemuck::cast_slice(&materials));
             }
@@ -5088,32 +5416,18 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         );
                     }
                 }
-                transition_image(
+                record_surface_compute(
                     &self.ctx.device,
                     fd.command_buffer,
-                    targets.surface_hdr.vk_image,
-                    vk::ImageAspectFlags::COLOR,
-                    &mut targets.surface_hdr_state,
-                    compute_write_state,
-                );
-                self.ctx.device.cmd_bind_pipeline(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.surface_lighting_pipeline,
-                );
-                self.ctx.device.cmd_bind_descriptor_sets(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.surface_lighting_pipeline_layout,
-                    0,
-                    std::slice::from_ref(&targets.surface_lighting_descriptor_set),
-                    &surface_lighting_dynamic_offsets,
-                );
-                self.ctx.device.cmd_dispatch(
-                    fd.command_buffer,
-                    (raster_extent.width + 15) / 16,
-                    (raster_extent.height + 15) / 16,
-                    1,
+                    targets,
+                    SurfaceComputePipelines {
+                        resolve: self.surface_resolve_pipeline,
+                        resolve_layout: self.surface_resolve_pipeline_layout,
+                        lighting: self.surface_lighting_pipeline,
+                        lighting_layout: self.surface_lighting_pipeline_layout,
+                    },
+                    &surface_dynamic_offsets,
+                    raster_extent,
                 );
 
                 if has_surface_overlay {
@@ -5441,32 +5755,21 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         compute_read_state,
                     );
                 }
-                transition_image(
+                record_surface_compute(
                     &self.ctx.device,
                     fd.command_buffer,
-                    targets.surface_hdr.vk_image,
-                    vk::ImageAspectFlags::COLOR,
-                    &mut targets.surface_hdr_state,
-                    compute_write_state,
-                );
-                self.ctx.device.cmd_bind_pipeline(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.surface_lighting_pipeline,
-                );
-                self.ctx.device.cmd_bind_descriptor_sets(
-                    fd.command_buffer,
-                    vk::PipelineBindPoint::COMPUTE,
-                    self.surface_lighting_pipeline_layout,
-                    0,
-                    std::slice::from_ref(&targets.surface_lighting_descriptor_set),
-                    &surface_lighting_dynamic_offsets,
-                );
-                self.ctx.device.cmd_dispatch(
-                    fd.command_buffer,
-                    (width * self.ssaa_factor + 15) / 16,
-                    (height * self.ssaa_factor + 15) / 16,
-                    1,
+                    targets,
+                    SurfaceComputePipelines {
+                        resolve: self.surface_resolve_pipeline,
+                        resolve_layout: self.surface_resolve_pipeline_layout,
+                        lighting: self.surface_lighting_pipeline,
+                        lighting_layout: self.surface_lighting_pipeline_layout,
+                    },
+                    &surface_dynamic_offsets,
+                    vk::Extent2D {
+                        width: width * self.ssaa_factor,
+                        height: height * self.ssaa_factor,
+                    },
                 );
                 if has_transparent_meshes {
                     transition_image(
@@ -5983,7 +6286,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     if has_surface_overlay {
                         self.surface_overlay_pipeline
                     } else {
-                        self.surface_resolve_pipeline
+                        self.surface_copy_pipeline
                     },
                 );
                 self.ctx.device.cmd_bind_descriptor_sets(

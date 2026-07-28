@@ -9,7 +9,7 @@ fn scaled_load(texture: texture_2d<f32>, position: vec2<u32>, output_size: vec2<
 }
 
 @compute @workgroup_size(16, 16, 1)
-fn resolve_surface(@builtin(global_invocation_id) global_id: vec3<u32>) {
+fn copy_surface(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let output_size = textureDimensions(output_hdr);
     if any(global_id.xy >= output_size) {
         return;
