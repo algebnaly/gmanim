@@ -216,6 +216,66 @@ fn fs_back_depth(in: VertexOutput) -> @location(0) f32 {
     return max(dot(in.frag_pos - camera.pos, camera_forward), 0.0);
 }
 
+struct GBufferOutput {
+    @location(0) normal_depth: vec4<f32>,
+    @location(1) albedo: vec4<f32>,
+    @location(2) material_index: u32,
+}
+
+@fragment
+fn fs_gbuffer(in: VertexOutput, @builtin(front_facing) is_front: bool) -> GBufferOutput {
+    if camera.num_primitives > 0u {
+        let depth_dimensions = textureDimensions(sdf_depth);
+        let depth_position = min(
+            vec2<u32>(in.clip_position.xy) / max(camera.raster_scale, 1u),
+            depth_dimensions - vec2<u32>(1),
+        );
+        let sdf_linear_depth = textureLoad(sdf_depth, vec2<i32>(depth_position), 0).r;
+        let mesh_linear_depth = dot(in.frag_pos - camera.pos, normalize(camera.look_at));
+        if sdf_linear_depth + 1e-4 < mesh_linear_depth {
+            discard;
+        }
+    }
+
+    let material = materials[in.material_index];
+    let geometric_normal = normalize(in.normal);
+    let normal = select(-geometric_normal, geometric_normal, is_front);
+    var albedo = in.color.rgb * material.base_color.rgb;
+
+    let patch_masks = spherical_patch(in.surface_coord, material);
+    albedo = mix(
+        albedo,
+        material.patch_color.rgb,
+        patch_masks.fill * material.patch_color.a,
+    );
+    let grid_mask = spherical_grid(in.surface_coord, material);
+    let face_intensity = select(material.grid_backface.x, 1.0, is_front);
+    let grid_mix = clamp(grid_mask * material.grid_color.a * face_intensity, 0.0, 1.0);
+    albedo = mix(albedo, material.grid_color.rgb, grid_mix);
+    albedo = mix(
+        albedo,
+        material.patch_edge_color.rgb,
+        patch_masks.edge * material.patch_edge_color.a,
+    );
+
+    let alpha = max(
+        in.color.a * material.base_color.a,
+        max(
+            grid_mask * material.grid_color.a * face_intensity,
+            max(
+                patch_masks.fill * material.patch_color.a,
+                patch_masks.edge * material.patch_edge_color.a,
+            ),
+        ),
+    );
+    let linear_depth = dot(in.frag_pos - camera.pos, normalize(camera.look_at));
+    return GBufferOutput(
+        vec4<f32>(normal, linear_depth),
+        vec4<f32>(albedo, alpha),
+        in.material_index,
+    );
+}
+
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     if camera.num_primitives > 0u {

@@ -1,4 +1,4 @@
-@group(0) @binding(0) var output_tex: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(0) var normal_coverage_tex: texture_storage_2d<rgba16float, write>;
 
 struct CameraUniform {
     pos: vec3<f32>,
@@ -41,26 +41,8 @@ struct PrimitiveData3D {
 }
 @group(0) @binding(2) var<storage, read> primitives: array<PrimitiveData3D>;
 
-struct MaterialData3D {
-    base_color: vec4<f32>,
-    emissive: vec4<f32>,
-    grid_color: vec4<f32>,
-    surface: vec4<f32>,
-    grid: vec4<f32>,
-    grid_backface: vec4<f32>,
-    transmission: vec4<f32>,
-    absorption: vec4<f32>,
-    patch_corner_0: vec4<f32>,
-    patch_corner_1: vec4<f32>,
-    patch_corner_2: vec4<f32>,
-    patch_color: vec4<f32>,
-    patch_edge_color: vec4<f32>,
-    patch_params: vec4<f32>,
-}
-@group(0) @binding(3) var<storage, read> materials: array<MaterialData3D>;
-@group(0) @binding(4) var environment_map: texture_2d<f32>;
-@group(0) @binding(5) var environment_sampler: sampler;
-@group(0) @binding(6) var depth_tex: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var material_id_tex: texture_storage_2d<r32uint, write>;
+@group(0) @binding(4) var depth_tex: texture_storage_2d<r32float, write>;
 
 struct MapResult {
     dist: f32,
@@ -187,23 +169,11 @@ fn calc_normal(p: vec3<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
-fn aces_tone_map(color: vec3<f32>) -> vec3<f32> {
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    return clamp(
-        (color * (a * color + vec3<f32>(b)))
-            / (color * (c * color + vec3<f32>(d)) + vec3<f32>(e)),
-        vec3<f32>(0.0),
-        vec3<f32>(1.0),
-    );
-}
-
 struct RayResult {
-    color: vec4<f32>,
+    normal: vec3<f32>,
+    material_index: u32,
     linear_depth: f32,
+    hit: u32,
 }
 
 fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
@@ -230,37 +200,18 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     }
     
     if (!hit) {
-        return RayResult(vec4<f32>(0.0), 1e20);
+        return RayResult(vec3<f32>(0.0), 0u, 1e20, 0u);
     }
 
     let p = ro + rd * t;
     let normal = calc_normal(p);
-    let material = materials[material_index];
-    let albedo = material.base_color.rgb;
-    let roughness = clamp(material.surface.x, 0.04, 1.0);
-    let metallic = clamp(material.surface.y, 0.0, 1.0);
-    let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
-    let f0 = mix(vec3<f32>(reflectance_f0), albedo, metallic);
-    let view_direction = normalize(camera.pos - p);
-    let lighting = shade_surface(
-        p,
-        normal,
-        view_direction,
-        albedo,
-        roughness,
-        metallic,
-        f0,
-        material.emissive.rgb * material.emissive.a,
-    );
-
-    let alpha = material.base_color.a;
     let linear_depth = dot(p - camera.pos, normalize(camera.look_at));
-    return RayResult(vec4<f32>(aces_tone_map(lighting.color) * alpha, alpha), linear_depth);
+    return RayResult(normal, material_index, linear_depth, 1u);
 }
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let dim = textureDimensions(output_tex);
+    let dim = textureDimensions(normal_coverage_tex);
     let x = global_id.x;
     let y = global_id.y;
     if (x >= dim.x || y >= dim.y) {
@@ -270,7 +221,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (camera.has_clip == 1u) {
         if (f32(x) < camera.clip_x || f32(x) >= camera.clip_x + camera.clip_w ||
             f32(y) < camera.clip_y || f32(y) >= camera.clip_y + camera.clip_h) {
-            textureStore(output_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+            textureStore(normal_coverage_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(0.0));
+            textureStore(material_id_tex, vec2<i32>(i32(x), i32(y)), vec4<u32>(0u));
             textureStore(depth_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(1e20));
             return;
         }
@@ -286,8 +238,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let ro = camera.pos;
 
     let aa = max(camera.aa_level, 1u);
-    var accumulated_color = vec4<f32>(0.0);
+    var hit_count = 0u;
     var nearest_depth = 1e20;
+    var nearest_material = 0u;
+    var nearest_normal = vec3<f32>(0.0);
 
     for (var i = 0u; i < aa; i = i + 1u) {
         for (var j = 0u; j < aa; j = j + 1u) {
@@ -313,12 +267,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
             
             let sample_result = render_ray(ro_sample, rd_sample);
-            accumulated_color += sample_result.color;
-            nearest_depth = min(nearest_depth, sample_result.linear_depth);
+            if (sample_result.hit != 0u) {
+                hit_count += 1u;
+                if (sample_result.linear_depth < nearest_depth) {
+                    nearest_depth = sample_result.linear_depth;
+                    nearest_material = sample_result.material_index;
+                    nearest_normal = sample_result.normal;
+                }
+            }
         }
     }
 
-    let final_color = accumulated_color / f32(aa * aa);
-    textureStore(output_tex, vec2<i32>(i32(x), i32(y)), final_color);
+    let sample_count = aa * aa;
+    let coverage = f32(hit_count) / f32(sample_count);
+    textureStore(
+        normal_coverage_tex,
+        vec2<i32>(i32(x), i32(y)),
+        vec4<f32>(nearest_normal, coverage),
+    );
+    textureStore(
+        material_id_tex,
+        vec2<i32>(i32(x), i32(y)),
+        vec4<u32>(nearest_material, 0u, 0u, 0u),
+    );
     textureStore(depth_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(nearest_depth));
 }

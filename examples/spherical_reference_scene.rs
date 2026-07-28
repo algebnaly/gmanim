@@ -51,6 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats = renderer.last_stats();
     assert_eq!(stats.mesh_3d_opaque_draw_calls, 4);
     assert_eq!(stats.mesh_3d_transparent_draw_calls, 2);
+    assert_eq!(stats.raster_lighting_dispatches, 1);
+    assert_eq!(stats.surface_merge_dispatches, 1);
     assert_eq!(stats.tone_map_dispatches, 1);
     assert_eq!(stats.bloom_dispatches, 3);
 
