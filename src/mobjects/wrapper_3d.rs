@@ -1,6 +1,6 @@
 use crate::mobjects::{
-    Mobject, MobjectBase, RenderVisitor, mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D,
-    mesh_3d::Vertex,
+    Geometry3DRef, Mobject, MobjectBase, RenderVisitor, Surface3DSubmission,
+    mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D, mesh_3d::Vertex,
 };
 use nalgebra::Matrix4;
 
@@ -35,26 +35,24 @@ impl<'a> RenderVisitor for InterceptorVisitor<'a> {
                 position: [v.position[0], v.position[1], 0.0],
                 normal: [0.0, 0.0, 1.0],
                 color,
+                surface_coord: [0.0, 0.0, 1.0],
             });
         }
         mesh3d.indices = mesh.indices().to_vec();
 
-        self.real_visitor
-            .push_mesh_3d(&mesh3d, self.wrapper_matrix * transform);
+        self.real_visitor.push_surface_3d(Surface3DSubmission {
+            geometry: Geometry3DRef::Mesh(&mesh3d),
+            material: mesh3d.material,
+            transform: self.wrapper_matrix * transform,
+        });
     }
 
-    fn push_mesh_3d(&mut self, mesh: &TriangleMesh3D, transform: Matrix4<crate::GMFloat>) {
-        self.real_visitor
-            .push_mesh_3d(mesh, self.wrapper_matrix * transform);
-    }
-
-    fn push_object_3d(
-        &mut self,
-        obj: &dyn crate::mobjects::object_3d::Object3D,
-        transform: Matrix4<crate::GMFloat>,
-    ) {
-        self.real_visitor
-            .push_object_3d(obj, self.wrapper_matrix * transform);
+    fn push_surface_3d(&mut self, surface: Surface3DSubmission<'_>) {
+        self.real_visitor.push_surface_3d(Surface3DSubmission {
+            geometry: surface.geometry,
+            material: surface.material,
+            transform: self.wrapper_matrix * surface.transform,
+        });
     }
 }
 

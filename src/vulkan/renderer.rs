@@ -1,5 +1,5 @@
 use crate::mobjects::mesh_2d::{GeometryFingerprint, MeshGeometry2D, TriangleMesh2D, Vertex2D};
-use crate::mobjects::mesh_3d::{TriangleMesh3D, Vertex};
+use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial, TriangleMesh3D, Vertex};
 use crate::video_backend::vulkan_h264::VulkanVideoFrame;
 use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
 use ash::vk;
@@ -181,6 +181,7 @@ pub struct Image {
     pub format: vk::Format,
     pub width: u32,
     pub height: u32,
+    pub mip_levels: u32,
 }
 
 impl Image {
@@ -193,6 +194,19 @@ impl Image {
         aspect_mask: vk::ImageAspectFlags,
         samples: vk::SampleCountFlags,
     ) -> Self {
+        Self::new_with_mip_levels(ctx, width, height, format, usage, aspect_mask, samples, 1)
+    }
+
+    pub fn new_with_mip_levels(
+        ctx: &VulkanContext,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        usage: vk::ImageUsageFlags,
+        aspect_mask: vk::ImageAspectFlags,
+        samples: vk::SampleCountFlags,
+        mip_levels: u32,
+    ) -> Self {
         let image_info = vk::ImageCreateInfo {
             s_type: vk::StructureType::IMAGE_CREATE_INFO,
             image_type: vk::ImageType::TYPE_2D,
@@ -202,7 +216,7 @@ impl Image {
                 height,
                 depth: 1,
             },
-            mip_levels: 1,
+            mip_levels,
             array_layers: 1,
             samples,
             tiling: vk::ImageTiling::OPTIMAL,
@@ -242,7 +256,7 @@ impl Image {
             subresource_range: vk::ImageSubresourceRange {
                 aspect_mask,
                 base_mip_level: 0,
-                level_count: 1,
+                level_count: mip_levels,
                 base_array_layer: 0,
                 layer_count: 1,
             },
@@ -258,6 +272,7 @@ impl Image {
             format,
             width,
             height,
+            mip_levels,
         }
     }
 
@@ -270,6 +285,203 @@ impl Image {
             ctx.allocator.lock().unwrap().free(allocation).unwrap();
         }
     }
+}
+
+fn normalized(direction: [f32; 3]) -> [f32; 3] {
+    let inverse_length = 1.0
+        / (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
+            .sqrt();
+    [
+        direction[0] * inverse_length,
+        direction[1] * inverse_length,
+        direction[2] * inverse_length,
+    ]
+}
+
+fn studio_environment(direction: [f32; 3], roughness: f32) -> [f32; 4] {
+    let key = normalized([-0.55, 0.65, 0.52]);
+    let rim = normalized([0.72, 0.2, -0.66]);
+    let ceiling = normalized([0.0, 1.0, 0.08]);
+    let dot = |axis: [f32; 3]| {
+        (direction[0] * axis[0] + direction[1] * axis[1] + direction[2] * axis[2]).max(0.0)
+    };
+    let sharpness = 2.0 + 126.0 * (1.0 - roughness).powi(4);
+    let key_light = dot(key).powf(sharpness) * (7.5 - 5.5 * roughness);
+    let rim_light = dot(rim).powf(sharpness * 0.55) * (3.2 - 2.0 * roughness);
+    let ceiling_light = dot(ceiling).powf(4.0 + sharpness * 0.12) * 1.4;
+    let horizon = (1.0 - direction[1].abs()).powf(3.0) * 0.18;
+    [
+        0.025 + horizon * 0.75 + key_light * 1.0 + rim_light * 0.32 + ceiling_light * 0.55,
+        0.035 + horizon * 0.9 + key_light * 0.96 + rim_light * 0.62 + ceiling_light * 0.7,
+        0.055 + horizon * 1.1 + key_light * 0.9 + rim_light * 1.0 + ceiling_light * 0.9,
+        1.0,
+    ]
+}
+
+fn create_studio_environment(ctx: &VulkanContext) -> (Image, vk::Sampler) {
+    const WIDTH: u32 = 256;
+    const HEIGHT: u32 = 128;
+    const MIP_LEVELS: u32 = 9;
+
+    let mut pixels = Vec::<f32>::new();
+    let mut regions = Vec::with_capacity(MIP_LEVELS as usize);
+    let mut byte_offset = 0_u64;
+    for mip_level in 0..MIP_LEVELS {
+        let width = (WIDTH >> mip_level).max(1);
+        let height = (HEIGHT >> mip_level).max(1);
+        let roughness = mip_level as f32 / (MIP_LEVELS - 1) as f32;
+        regions.push(
+            vk::BufferImageCopy::default()
+                .buffer_offset(byte_offset)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                }),
+        );
+        for y in 0..height {
+            let theta = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
+            let sin_theta = theta.sin();
+            for x in 0..width {
+                let phi = ((x as f32 + 0.5) / width as f32 - 0.5) * 2.0 * std::f32::consts::PI;
+                pixels.extend(studio_environment(
+                    [sin_theta * phi.cos(), theta.cos(), sin_theta * phi.sin()],
+                    roughness,
+                ));
+            }
+        }
+        byte_offset += (width * height * 4 * std::mem::size_of::<f32>() as u32) as u64;
+    }
+
+    let mut staging = Buffer::new(
+        ctx,
+        byte_offset,
+        vk::BufferUsageFlags::TRANSFER_SRC,
+        gpu_allocator::MemoryLocation::CpuToGpu,
+    );
+    staging.write_bytes(0, bytemuck::cast_slice(&pixels));
+    let image = Image::new_with_mip_levels(
+        ctx,
+        WIDTH,
+        HEIGHT,
+        vk::Format::R32G32B32A32_SFLOAT,
+        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+        vk::ImageAspectFlags::COLOR,
+        vk::SampleCountFlags::TYPE_1,
+        MIP_LEVELS,
+    );
+
+    let command_pool = unsafe {
+        ctx.device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(ctx.queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                None,
+            )
+            .unwrap()
+    };
+    let command_buffer = unsafe {
+        ctx.device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(command_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0]
+    };
+    unsafe {
+        ctx.device
+            .begin_command_buffer(
+                command_buffer,
+                &vk::CommandBufferBeginInfo::default()
+                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+            )
+            .unwrap();
+        let upload_barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::NONE)
+            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .old_layout(vk::ImageLayout::UNDEFINED)
+            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .image(image.vk_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        ctx.device.cmd_pipeline_barrier2(
+            command_buffer,
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&upload_barrier)),
+        );
+        ctx.device.cmd_copy_buffer_to_image(
+            command_buffer,
+            staging.vk_buffer,
+            image.vk_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            &regions,
+        );
+        let sample_barrier = vk::ImageMemoryBarrier2::default()
+            .src_stage_mask(vk::PipelineStageFlags2::COPY)
+            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
+            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
+            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image(image.vk_image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: 1,
+            });
+        ctx.device.cmd_pipeline_barrier2(
+            command_buffer,
+            &vk::DependencyInfo::default()
+                .image_memory_barriers(std::slice::from_ref(&sample_barrier)),
+        );
+        ctx.device.end_command_buffer(command_buffer).unwrap();
+        let command_buffers = [command_buffer];
+        ctx.device
+            .queue_submit(
+                ctx.queue,
+                &[vk::SubmitInfo::default().command_buffers(&command_buffers)],
+                vk::Fence::null(),
+            )
+            .unwrap();
+        ctx.device.queue_wait_idle(ctx.queue).unwrap();
+        ctx.device.destroy_command_pool(command_pool, None);
+    }
+    staging.destroy(ctx);
+
+    let sampler = unsafe {
+        ctx.device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .min_lod(0.0)
+                    .max_lod((MIP_LEVELS - 1) as f32),
+                None,
+            )
+            .unwrap()
+    };
+    (image, sampler)
 }
 
 pub struct VideoNv12Image {
@@ -554,6 +766,8 @@ enum PrepareMesh2DError {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RendererStats {
+    pub mesh_3d_opaque_draw_calls: u32,
+    pub mesh_3d_transparent_draw_calls: u32,
     pub mesh_2d_draw_calls: u32,
     pub mesh_2d_instances: u32,
     pub mesh_2d_geometry_uploads: u32,
@@ -563,6 +777,8 @@ pub struct RendererStats {
     pub sdf_dispatches: u32,
     pub raster_passes: u32,
     pub depth_attachment_raster_passes: u32,
+    pub tone_map_dispatches: u32,
+    pub bloom_dispatches: u32,
     pub downsample_dispatches: u32,
     pub fused_video_downsample_dispatches: u32,
     pub composite_dispatches: u32,
@@ -629,7 +845,7 @@ fn timestamp_delta(start: u64, end: u64, valid_bits: u32) -> u64 {
 enum FrameExecutionPlan {
     Empty,
     SdfOnly,
-    RasterDirect,
+    RasterToneMap,
     RasterDownsample,
     SdfRasterComposite,
 }
@@ -639,7 +855,7 @@ impl FrameExecutionPlan {
         match (has_sdf, has_raster, ssaa_factor) {
             (false, false, _) => Self::Empty,
             (true, false, _) => Self::SdfOnly,
-            (false, true, 1) => Self::RasterDirect,
+            (false, true, 1) => Self::RasterToneMap,
             (false, true, _) => Self::RasterDownsample,
             (true, true, _) => Self::SdfRasterComposite,
         }
@@ -652,7 +868,7 @@ impl FrameExecutionPlan {
     fn runs_raster(self) -> bool {
         matches!(
             self,
-            Self::RasterDirect | Self::RasterDownsample | Self::SdfRasterComposite
+            Self::RasterToneMap | Self::RasterDownsample | Self::SdfRasterComposite
         )
     }
 }
@@ -862,33 +1078,178 @@ pub struct CameraUniform {
     pub clip_h: f32,
     pub aa_level: u32,
     pub num_primitives: u32,
-    pub _pad2: u32,
+    pub raster_scale: u32,
     pub _pad3: u32,
     pub proj_mat: [f32; 16],
+    pub light_pos: [f32; 3],
+    pub light_intensity: f32,
+    pub light_color: [f32; 3],
+    pub environment_intensity: f32,
+    pub environment_color: [f32; 3],
+    pub environment_rotation: f32,
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct PrimitiveData3D {
-    pub color: [f32; 4],
-    pub params: [f32; 12],
+    pub material_index: u32,
     pub shape_type: u32,
-    pub padding: [u32; 3],
+    pub padding: [u32; 2],
+    pub params: [f32; 12],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialData3D {
+    base_color: [f32; 4],
+    emissive: [f32; 4],
+    grid_color: [f32; 4],
+    surface: [f32; 4],
+    grid: [f32; 4],
+    grid_backface: [f32; 4],
+    transmission: [f32; 4],
+    absorption: [f32; 4],
+    patch_corner_0: [f32; 4],
+    patch_corner_1: [f32; 4],
+    patch_corner_2: [f32; 4],
+    patch_color: [f32; 4],
+    patch_edge_color: [f32; 4],
+    patch_params: [f32; 4],
+}
+
+impl From<SurfaceMaterial> for MaterialData3D {
+    fn from(material: SurfaceMaterial) -> Self {
+        let grid = material.spherical_grid.unwrap_or_default();
+        let patch = material.spherical_patch;
+        let transmission = match material.alpha_mode {
+            AlphaMode3D::Opaque => None,
+            AlphaMode3D::Blend(transmission) => Some(transmission),
+        };
+        let patch_directions = patch.map(|patch| patch.directions).unwrap_or([[0.0; 3]; 3]);
+        Self {
+            base_color: material.base_color,
+            emissive: [
+                material.emissive[0],
+                material.emissive[1],
+                material.emissive[2],
+                material.emissive_strength,
+            ],
+            grid_color: grid.color,
+            surface: [
+                material.roughness,
+                material.metallic,
+                material.reflectance,
+                if transmission.is_some() { 1.0 } else { 0.0 },
+            ],
+            grid: [
+                grid.longitude_count,
+                grid.latitude_count,
+                grid.line_width_pixels,
+                if material.spherical_grid.is_some() {
+                    1.0
+                } else {
+                    0.0
+                },
+            ],
+            grid_backface: [grid.backface_intensity, 0.0, 0.0, 0.0],
+            transmission: transmission
+                .map(|transmission| {
+                    [
+                        transmission.opacity,
+                        transmission.fresnel_opacity,
+                        transmission.ior,
+                        0.0,
+                    ]
+                })
+                .unwrap_or([1.0, 0.0, 1.0, 0.0]),
+            absorption: transmission
+                .map(|transmission| {
+                    [
+                        transmission.absorption[0],
+                        transmission.absorption[1],
+                        transmission.absorption[2],
+                        transmission.backface_opacity_scale,
+                    ]
+                })
+                .unwrap_or([0.0, 0.0, 0.0, 1.0]),
+            patch_corner_0: [
+                patch_directions[0][0],
+                patch_directions[0][1],
+                patch_directions[0][2],
+                0.0,
+            ],
+            patch_corner_1: [
+                patch_directions[1][0],
+                patch_directions[1][1],
+                patch_directions[1][2],
+                0.0,
+            ],
+            patch_corner_2: [
+                patch_directions[2][0],
+                patch_directions[2][1],
+                patch_directions[2][2],
+                0.0,
+            ],
+            patch_color: patch.map(|patch| patch.color).unwrap_or([0.0; 4]),
+            patch_edge_color: patch.map(|patch| patch.edge_color).unwrap_or([0.0; 4]),
+            patch_params: [
+                patch
+                    .map(|patch| patch.edge_width_pixels)
+                    .unwrap_or_default(),
+                0.0,
+                0.0,
+                0.0,
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Mesh3DDraw {
+    first_index: u32,
+    index_count: u32,
+    material_index: u32,
+    transparent: bool,
+    view_depth: f32,
+}
+
+impl Mesh3DDraw {
+    fn is_transparent(self) -> bool {
+        self.transparent
+    }
 }
 
 struct RenderTargetSet {
     texture: Image,
     texture_state: TrackedImageState,
+    sdf_depth: Image,
+    sdf_depth_state: TrackedImageState,
     resolved_texture: Image,
     resolved_texture_state: TrackedImageState,
+    scene_color: Image,
+    scene_color_state: TrackedImageState,
+    transparent_back_depth: Image,
+    transparent_back_depth_state: TrackedImageState,
+    bloom_ping: Image,
+    bloom_ping_state: TrackedImageState,
+    bloom_pong: Image,
+    bloom_pong_state: TrackedImageState,
+    bloom_contains_data: bool,
     compute_descriptor_set: vk::DescriptorSet,
+    raster_descriptor_set: vk::DescriptorSet,
     composite_descriptor_set: vk::DescriptorSet,
+    bloom_descriptor_sets: [vk::DescriptorSet; 3],
 }
 
 impl RenderTargetSet {
     fn destroy(&mut self, ctx: &VulkanContext) {
         self.texture.destroy(ctx);
+        self.sdf_depth.destroy(ctx);
         self.resolved_texture.destroy(ctx);
+        self.scene_color.destroy(ctx);
+        self.transparent_back_depth.destroy(ctx);
+        self.bloom_ping.destroy(ctx);
+        self.bloom_pong.destroy(ctx);
     }
 }
 
@@ -907,14 +1268,32 @@ pub struct RenderCache {
     pub yuv444p_descriptor_sets: [vk::DescriptorSet; RENDER_FRAME_COUNT],
     pub video_nv12_slots: Vec<VideoNv12Slot>,
     pub current_frame: usize,
-    pub raster_descriptor_set: vk::DescriptorSet,
     pub raster_descriptor_set_2d: vk::DescriptorSet,
     pub padded_bytes_per_row: u32,
     pub rgba_preview_buffer: Vec<u8>,
 }
 
 impl RenderCache {
-    pub fn destroy(&mut self, ctx: &VulkanContext) {
+    pub fn destroy(&mut self, ctx: &VulkanContext, descriptor_pool: vk::DescriptorPool) {
+        let mut descriptor_sets = Vec::with_capacity(40);
+        for targets in &self.render_targets {
+            descriptor_sets.extend([
+                targets.compute_descriptor_set,
+                targets.raster_descriptor_set,
+                targets.composite_descriptor_set,
+            ]);
+            descriptor_sets.extend(targets.bloom_descriptor_sets);
+        }
+        descriptor_sets.push(self.raster_descriptor_set_2d);
+        descriptor_sets.extend(self.nv12_descriptor_sets);
+        descriptor_sets.extend(self.yuv444p_descriptor_sets);
+        descriptor_sets.extend(self.video_nv12_slots.iter().map(|slot| slot.descriptor_set));
+        unsafe {
+            ctx.device
+                .free_descriptor_sets(descriptor_pool, &descriptor_sets)
+                .unwrap();
+        }
+
         for targets in &mut self.render_targets {
             targets.destroy(ctx);
         }
@@ -1000,12 +1379,15 @@ pub struct VulkanRenderer {
     ctx: Arc<VulkanContext>,
     msaa_samples: u32,
     ssaa_factor: u32,
+    environment_map: Image,
+    environment_sampler: vk::Sampler,
 
     descriptor_pool: vk::DescriptorPool,
     compute_descriptor_set_layout: vk::DescriptorSetLayout,
     raster_descriptor_set_layout: vk::DescriptorSetLayout,
     raster_descriptor_set_layout_2d: vk::DescriptorSetLayout,
     composite_descriptor_set_layout: vk::DescriptorSetLayout,
+    bloom_descriptor_set_layout: vk::DescriptorSetLayout,
     nv12_descriptor_set_layout: vk::DescriptorSetLayout,
     video_nv12_descriptor_set_layout: vk::DescriptorSetLayout,
 
@@ -1014,6 +1396,10 @@ pub struct VulkanRenderer {
     composite_pipeline_layout: vk::PipelineLayout,
     composite_pipeline: vk::Pipeline,
     downsample_pipeline: vk::Pipeline,
+    bloom_pipeline_layout: vk::PipelineLayout,
+    bloom_extract_pipeline: vk::Pipeline,
+    bloom_horizontal_pipeline: vk::Pipeline,
+    bloom_vertical_pipeline: vk::Pipeline,
     nv12_pipeline_layout: vk::PipelineLayout,
     nv12_pipeline: vk::Pipeline,
     video_nv12_pipeline_layout: vk::PipelineLayout,
@@ -1023,10 +1409,14 @@ pub struct VulkanRenderer {
 
     raster_pipeline_layout: vk::PipelineLayout,
     raster_pipeline: vk::Pipeline,
+    raster_pipeline_transparent_depth: vk::Pipeline,
+    raster_pipeline_transparent_back: vk::Pipeline,
+    raster_pipeline_transparent_front: vk::Pipeline,
 
     vertex_buffer: Buffer,
     index_buffer: Buffer,
     camera_buffer: Buffer,
+    material_buffer_3d: Buffer,
     buffer_3d: Buffer,
     nv12_constants_buffer: Buffer,
 
@@ -1042,6 +1432,7 @@ pub struct VulkanRenderer {
     vertex_buffer_stride: u64,
     index_buffer_stride: u64,
     camera_buffer_stride: u64,
+    material_buffer_3d_stride: u64,
     primitive_buffer_stride: u64,
     vertex_staging_buffer_2d_stride: u64,
     index_staging_buffer_2d_stride: u64,
@@ -1053,6 +1444,7 @@ pub struct VulkanRenderer {
     last_stats: RendererStats,
     gpu_profiling: bool,
     last_gpu_timings: Option<GpuPassTimings>,
+    bloom_enabled: bool,
 
     frame_data: [FrameData; RENDER_FRAME_COUNT],
 
@@ -1065,9 +1457,14 @@ impl VulkanRenderer {
         let ssaa_factor = config.ssaa_factor;
         let requested_sample_count = msaa_to_vk_sample_count(msaa_samples);
         let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
+        let (environment_map, environment_sampler) = create_studio_environment(&ctx);
 
-        let compute_shader = compile_wgsl_full(&ctx, include_str!("shader.wgsl"));
-        let raster_shader = compile_wgsl_full(&ctx, include_str!("raster_shader.wgsl"));
+        let surface_lighting = include_str!("surface_lighting.wgsl");
+        let compute_shader_source = format!("{surface_lighting}\n{}", include_str!("shader.wgsl"));
+        let raster_shader_source =
+            format!("{surface_lighting}\n{}", include_str!("raster_shader.wgsl"));
+        let compute_shader = compile_wgsl_full(&ctx, &compute_shader_source);
+        let raster_shader = compile_wgsl_full(&ctx, &raster_shader_source);
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
         let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
         let video_nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12_image.wgsl"));
@@ -1076,6 +1473,7 @@ impl VulkanRenderer {
         let yuv444p_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_yuv444p.wgsl"));
         let composite_shader = compile_wgsl_full(&ctx, include_str!("composite_shader.wgsl"));
         let downsample_shader = compile_wgsl_full(&ctx, include_str!("downsample_shader.wgsl"));
+        let bloom_shader = compile_wgsl_full(&ctx, include_str!("bloom_shader.wgsl"));
 
         let composite_bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -1092,6 +1490,13 @@ impl VulkanRenderer {
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
             },
+            vk::DescriptorSetLayoutBinding {
+                binding: 2,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
         ];
         let composite_layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
@@ -1102,6 +1507,33 @@ impl VulkanRenderer {
         let composite_descriptor_set_layout = unsafe {
             ctx.device
                 .create_descriptor_set_layout(&composite_layout_info, None)
+                .unwrap()
+        };
+        let bloom_bindings = [
+            vk::DescriptorSetLayoutBinding {
+                binding: 0,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+        ];
+        let bloom_layout_info = vk::DescriptorSetLayoutCreateInfo {
+            s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            binding_count: bloom_bindings.len() as u32,
+            p_bindings: bloom_bindings.as_ptr(),
+            ..Default::default()
+        };
+        let bloom_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&bloom_layout_info, None)
                 .unwrap()
         };
 
@@ -1342,6 +1774,45 @@ impl VulkanRenderer {
                 )
                 .unwrap()[0]
         };
+        let bloom_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
+            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
+            set_layout_count: 1,
+            p_set_layouts: &bloom_descriptor_set_layout,
+            ..Default::default()
+        };
+        let bloom_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(&bloom_pipeline_layout_info, None)
+                .unwrap()
+        };
+        let create_bloom_pipeline = |entry_point: &str| {
+            let entry_point = std::ffi::CString::new(entry_point).unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo {
+                s_type: vk::StructureType::PIPELINE_SHADER_STAGE_CREATE_INFO,
+                stage: vk::ShaderStageFlags::COMPUTE,
+                module: bloom_shader,
+                p_name: entry_point.as_ptr(),
+                ..Default::default()
+            };
+            let info = vk::ComputePipelineCreateInfo {
+                s_type: vk::StructureType::COMPUTE_PIPELINE_CREATE_INFO,
+                stage,
+                layout: bloom_pipeline_layout,
+                ..Default::default()
+            };
+            unsafe {
+                ctx.device
+                    .create_compute_pipelines(
+                        vk::PipelineCache::null(),
+                        std::slice::from_ref(&info),
+                        None,
+                    )
+                    .unwrap()[0]
+            }
+        };
+        let bloom_extract_pipeline = create_bloom_pipeline("extract");
+        let bloom_horizontal_pipeline = create_bloom_pipeline("blur_horizontal");
+        let bloom_vertical_pipeline = create_bloom_pipeline("blur_vertical");
 
         let compute_bindings = [
             vk::DescriptorSetLayoutBinding {
@@ -1367,6 +1838,34 @@ impl VulkanRenderer {
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
             },
+            vk::DescriptorSetLayoutBinding {
+                binding: 3,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 4,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 5,
+                descriptor_type: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 6,
+                descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
         ];
 
         let compute_layout_info = vk::DescriptorSetLayoutCreateInfo {
@@ -1381,13 +1880,57 @@ impl VulkanRenderer {
                 .unwrap()
         };
 
-        let raster_bindings = [vk::DescriptorSetLayoutBinding {
-            binding: 1,
-            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-            descriptor_count: 1,
-            stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
-            ..Default::default()
-        }];
+        let raster_bindings = [
+            vk::DescriptorSetLayoutBinding {
+                binding: 1,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 2,
+                descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 3,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 4,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 5,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 6,
+                descriptor_type: vk::DescriptorType::SAMPLER,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 7,
+                descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::FRAGMENT,
+                ..Default::default()
+            },
+        ];
         let raster_layout_info = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: raster_bindings.len() as u32,
@@ -1506,6 +2049,12 @@ impl VulkanRenderer {
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: 24,
             },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::Format::R32G32B32_SFLOAT,
+                offset: 40,
+            },
         ];
 
         let vertex_input_info = vk::PipelineVertexInputStateCreateInfo {
@@ -1562,7 +2111,7 @@ impl VulkanRenderer {
 
         let color_blend_attachment = vk::PipelineColorBlendAttachmentState {
             color_write_mask: vk::ColorComponentFlags::RGBA,
-            blend_enable: vk::TRUE,
+            blend_enable: vk::FALSE,
             src_color_blend_factor: vk::BlendFactor::SRC_ALPHA,
             dst_color_blend_factor: vk::BlendFactor::ONE_MINUS_SRC_ALPHA,
             color_blend_op: vk::BlendOp::ADD,
@@ -1606,7 +2155,7 @@ impl VulkanRenderer {
                 ..Default::default()
             },
         ];
-        let raster_color_formats = [vk::Format::R8G8B8A8_UNORM];
+        let raster_color_formats = [vk::Format::R16G16B16A16_SFLOAT];
         let pipeline_rendering_info = vk::PipelineRenderingCreateInfo::default()
             .color_attachment_formats(&raster_color_formats)
             .depth_attachment_format(vk::Format::D32_SFLOAT);
@@ -1638,6 +2187,104 @@ impl VulkanRenderer {
                 )
                 .unwrap()[0]
         };
+
+        let transparent_depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
+            depth_write_enable: vk::FALSE,
+            ..depth_stencil
+        };
+        let transparent_blend_attachment = vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::TRUE,
+            ..color_blend_attachment
+        };
+        let transparent_color_blending = vk::PipelineColorBlendStateCreateInfo {
+            p_attachments: &transparent_blend_attachment,
+            ..color_blending
+        };
+        let transparent_back_rasterizer = vk::PipelineRasterizationStateCreateInfo {
+            cull_mode: vk::CullModeFlags::FRONT,
+            ..rasterizer
+        };
+        let transparent_front_rasterizer = vk::PipelineRasterizationStateCreateInfo {
+            cull_mode: vk::CullModeFlags::BACK,
+            ..rasterizer
+        };
+        let thickness_fs_name = std::ffi::CString::new("fs_back_depth").unwrap();
+        let thickness_shader_stages = [
+            shader_stages[0],
+            vk::PipelineShaderStageCreateInfo {
+                p_name: thickness_fs_name.as_ptr(),
+                ..shader_stages[1]
+            },
+        ];
+        let thickness_multisampling = vk::PipelineMultisampleStateCreateInfo {
+            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            ..multisampling
+        };
+        let thickness_depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
+            depth_test_enable: vk::FALSE,
+            depth_write_enable: vk::FALSE,
+            depth_compare_op: vk::CompareOp::ALWAYS,
+            ..depth_stencil
+        };
+        let thickness_blend_attachment = vk::PipelineColorBlendAttachmentState {
+            color_write_mask: vk::ColorComponentFlags::R,
+            blend_enable: vk::TRUE,
+            src_color_blend_factor: vk::BlendFactor::ONE,
+            dst_color_blend_factor: vk::BlendFactor::ONE,
+            color_blend_op: vk::BlendOp::MAX,
+            src_alpha_blend_factor: vk::BlendFactor::ONE,
+            dst_alpha_blend_factor: vk::BlendFactor::ONE,
+            alpha_blend_op: vk::BlendOp::MAX,
+        };
+        let thickness_color_blending = vk::PipelineColorBlendStateCreateInfo {
+            p_attachments: &thickness_blend_attachment,
+            ..color_blending
+        };
+        let thickness_color_formats = [vk::Format::R32_SFLOAT];
+        let thickness_rendering_info = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&thickness_color_formats);
+        let thickness_pipeline_info = vk::GraphicsPipelineCreateInfo {
+            p_next: (&thickness_rendering_info as *const vk::PipelineRenderingCreateInfo).cast(),
+            stage_count: thickness_shader_stages.len() as u32,
+            p_stages: thickness_shader_stages.as_ptr(),
+            p_rasterization_state: &transparent_back_rasterizer,
+            p_multisample_state: &thickness_multisampling,
+            p_depth_stencil_state: &thickness_depth_stencil,
+            p_color_blend_state: &thickness_color_blending,
+            ..raster_pipeline_info
+        };
+        let raster_pipeline_transparent_depth = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&thickness_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let transparent_back_info = vk::GraphicsPipelineCreateInfo {
+            p_rasterization_state: &transparent_back_rasterizer,
+            p_depth_stencil_state: &transparent_depth_stencil,
+            p_color_blend_state: &transparent_color_blending,
+            ..raster_pipeline_info
+        };
+        let transparent_front_info = vk::GraphicsPipelineCreateInfo {
+            p_rasterization_state: &transparent_front_rasterizer,
+            p_depth_stencil_state: &transparent_depth_stencil,
+            p_color_blend_state: &transparent_color_blending,
+            ..raster_pipeline_info
+        };
+        let transparent_pipelines = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    &[transparent_back_info, transparent_front_info],
+                    None,
+                )
+                .unwrap()
+        };
+        let raster_pipeline_transparent_back = transparent_pipelines[0];
+        let raster_pipeline_transparent_front = transparent_pipelines[1];
 
         let vertex_binding_descriptions_2d = [
             vk::VertexInputBindingDescription {
@@ -1736,7 +2383,7 @@ impl VulkanRenderer {
             p_rasterization_state: &rasterizer,
             p_multisample_state: &multisampling,
             p_depth_stencil_state: &depth_stencil_2d,
-            p_color_blend_state: &color_blending,
+            p_color_blend_state: &transparent_color_blending,
             p_dynamic_state: &dynamic_state,
             layout: raster_pipeline_layout_2d,
             render_pass: vk::RenderPass::null(),
@@ -1776,7 +2423,11 @@ impl VulkanRenderer {
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::SAMPLED_IMAGE,
-                descriptor_count: 20,
+                descriptor_count: 72,
+            },
+            vk::DescriptorPoolSize {
+                ty: vk::DescriptorType::SAMPLER,
+                descriptor_count: 8,
             },
             vk::DescriptorPoolSize {
                 ty: vk::DescriptorType::UNIFORM_BUFFER,
@@ -1799,7 +2450,7 @@ impl VulkanRenderer {
             s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
             pool_size_count: descriptor_pool_sizes.len() as u32,
             p_pool_sizes: descriptor_pool_sizes.as_ptr(),
-            max_sets: 32,
+            max_sets: 40,
             flags: vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET,
             ..Default::default()
         };
@@ -1821,6 +2472,10 @@ impl VulkanRenderer {
         let camera_buffer_stride = align_up(
             std::mem::size_of::<CameraUniform>() as u64,
             uniform_alignment,
+        );
+        let material_buffer_3d_stride = align_up(
+            (std::mem::size_of::<MaterialData3D>() * 10_000) as u64,
+            storage_alignment,
         );
         let primitive_buffer_stride = align_up(
             (std::mem::size_of::<PrimitiveData3D>() * 10_000) as u64,
@@ -1853,6 +2508,12 @@ impl VulkanRenderer {
             &ctx,
             camera_buffer_stride * frame_count,
             vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        let material_buffer_3d = Buffer::new(
+            &ctx,
+            material_buffer_3d_stride * frame_count,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::CpuToGpu,
         );
         let buffer_3d = Buffer::new(
@@ -1965,15 +2626,19 @@ impl VulkanRenderer {
             ctx.device.destroy_shader_module(yuv444p_shader, None);
             ctx.device.destroy_shader_module(composite_shader, None);
             ctx.device.destroy_shader_module(downsample_shader, None);
+            ctx.device.destroy_shader_module(bloom_shader, None);
         }
 
         Self {
             ctx,
+            environment_map,
+            environment_sampler,
             descriptor_pool,
             compute_descriptor_set_layout,
             raster_descriptor_set_layout,
             raster_descriptor_set_layout_2d,
             composite_descriptor_set_layout,
+            bloom_descriptor_set_layout,
             nv12_descriptor_set_layout,
             video_nv12_descriptor_set_layout,
             compute_pipeline_layout,
@@ -1981,6 +2646,10 @@ impl VulkanRenderer {
             composite_pipeline_layout,
             composite_pipeline,
             downsample_pipeline,
+            bloom_pipeline_layout,
+            bloom_extract_pipeline,
+            bloom_horizontal_pipeline,
+            bloom_vertical_pipeline,
             nv12_pipeline_layout,
             nv12_pipeline,
             video_nv12_pipeline_layout,
@@ -1989,9 +2658,13 @@ impl VulkanRenderer {
             yuv444p_pipeline,
             raster_pipeline_layout,
             raster_pipeline,
+            raster_pipeline_transparent_depth,
+            raster_pipeline_transparent_back,
+            raster_pipeline_transparent_front,
             vertex_buffer,
             index_buffer,
             camera_buffer,
+            material_buffer_3d,
             buffer_3d,
             nv12_constants_buffer,
             raster_pipeline_layout_2d,
@@ -2006,6 +2679,7 @@ impl VulkanRenderer {
             vertex_buffer_stride,
             index_buffer_stride,
             camera_buffer_stride,
+            material_buffer_3d_stride,
             primitive_buffer_stride,
             vertex_staging_buffer_2d_stride,
             index_staging_buffer_2d_stride,
@@ -2017,6 +2691,7 @@ impl VulkanRenderer {
             last_stats: RendererStats::default(),
             gpu_profiling: false,
             last_gpu_timings: None,
+            bloom_enabled: false,
             frame_data,
             cache: std::sync::Mutex::new(None),
             msaa_samples: sample_count.as_raw(),
@@ -2033,6 +2708,10 @@ impl VulkanRenderer {
         if !enabled {
             self.last_gpu_timings = None;
         }
+    }
+
+    pub fn set_bloom_enabled(&mut self, enabled: bool) {
+        self.bloom_enabled = enabled;
     }
 
     pub fn last_gpu_timings(&self) -> Option<GpuPassTimings> {
@@ -2090,6 +2769,8 @@ impl VulkanRenderer {
         let mut primitives_3d = Vec::new();
         let mut mesh_vertices = Vec::new();
         let mut mesh_indices = Vec::new();
+        let mut mesh_draws_3d = Vec::new();
+        let mut surface_materials = Vec::new();
 
         let mut mesh_submissions_2d = Vec::new();
 
@@ -2097,7 +2778,11 @@ impl VulkanRenderer {
             primitives_3d: &'a mut Vec<PrimitiveData3D>,
             mesh_vertices: &'a mut Vec<Vertex>,
             mesh_indices: &'a mut Vec<u32>,
+            mesh_draws_3d: &'a mut Vec<Mesh3DDraw>,
+            surface_materials: &'a mut Vec<SurfaceMaterial>,
             mesh_submissions_2d: &'a mut Vec<Mesh2DSubmission>,
+            camera_position: nalgebra::Point3<crate::GMFloat>,
+            camera_look: nalgebra::Vector3<crate::GMFloat>,
         }
 
         impl<'a> crate::mobjects::RenderVisitor for VulkanDataCollector<'a> {
@@ -2112,42 +2797,72 @@ impl VulkanRenderer {
                 });
             }
 
-            fn push_mesh_3d(
-                &mut self,
-                mesh: &crate::mobjects::mesh_3d::TriangleMesh3D,
-                transform: nalgebra::Matrix4<crate::GMFloat>,
-            ) {
-                let base_index = self.mesh_vertices.len() as u32;
-                for v in &mesh.vertices {
-                    let pos = nalgebra::Point3::new(
-                        v.position[0] as crate::GMFloat,
-                        v.position[1] as crate::GMFloat,
-                        v.position[2] as crate::GMFloat,
-                    );
-                    let t_pos = transform.transform_point(&pos);
-                    let n = nalgebra::Vector3::new(
-                        v.normal[0] as crate::GMFloat,
-                        v.normal[1] as crate::GMFloat,
-                        v.normal[2] as crate::GMFloat,
-                    );
-                    let t_n = transform.transform_vector(&n).normalize();
-                    self.mesh_vertices.push(Vertex {
-                        position: [t_pos.x as f32, t_pos.y as f32, t_pos.z as f32],
-                        normal: [t_n.x as f32, t_n.y as f32, t_n.z as f32],
-                        color: v.color,
-                    });
+            fn push_surface_3d(&mut self, surface: crate::mobjects::Surface3DSubmission<'_>) {
+                let material_index = self.surface_materials.len() as u32;
+                self.surface_materials.push(surface.material);
+                match surface.geometry {
+                    crate::mobjects::Geometry3DRef::Mesh(mesh) => {
+                        let base_index = self.mesh_vertices.len() as u32;
+                        let first_index = self.mesh_indices.len() as u32;
+                        let mut world_center = nalgebra::Point3::origin();
+                        for vertex in &mesh.vertices {
+                            let position = nalgebra::Point3::new(
+                                vertex.position[0] as crate::GMFloat,
+                                vertex.position[1] as crate::GMFloat,
+                                vertex.position[2] as crate::GMFloat,
+                            );
+                            let world_position = surface.transform.transform_point(&position);
+                            world_center.coords += world_position.coords;
+                            let normal = nalgebra::Vector3::new(
+                                vertex.normal[0] as crate::GMFloat,
+                                vertex.normal[1] as crate::GMFloat,
+                                vertex.normal[2] as crate::GMFloat,
+                            );
+                            let world_normal =
+                                surface.transform.transform_vector(&normal).normalize();
+                            self.mesh_vertices.push(Vertex {
+                                position: [
+                                    world_position.x as f32,
+                                    world_position.y as f32,
+                                    world_position.z as f32,
+                                ],
+                                normal: [
+                                    world_normal.x as f32,
+                                    world_normal.y as f32,
+                                    world_normal.z as f32,
+                                ],
+                                color: vertex.color,
+                                surface_coord: vertex.surface_coord,
+                            });
+                        }
+                        for index in &mesh.indices {
+                            self.mesh_indices.push(*index + base_index);
+                        }
+                        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
+                            world_center.coords /= mesh.vertices.len() as crate::GMFloat;
+                            self.mesh_draws_3d.push(Mesh3DDraw {
+                                first_index,
+                                index_count: mesh.indices.len() as u32,
+                                material_index,
+                                transparent: matches!(
+                                    surface.material.alpha_mode,
+                                    AlphaMode3D::Blend(_)
+                                ),
+                                view_depth: (world_center - self.camera_position)
+                                    .dot(&self.camera_look)
+                                    as f32,
+                            });
+                        }
+                    }
+                    crate::mobjects::Geometry3DRef::Sdf(sdf) => {
+                        assert!(
+                            matches!(surface.material.alpha_mode, AlphaMode3D::Opaque),
+                            "transparent SDF surfaces require entry/exit ray marching"
+                        );
+                        self.primitives_3d
+                            .push(sdf.as_primitive_data(surface.transform, material_index));
+                    }
                 }
-                for i in &mesh.indices {
-                    self.mesh_indices.push(*i + base_index);
-                }
-            }
-
-            fn push_object_3d(
-                &mut self,
-                obj: &dyn crate::mobjects::object_3d::Object3D,
-                transform: nalgebra::Matrix4<crate::GMFloat>,
-            ) {
-                self.primitives_3d.push(obj.as_primitive_data(transform));
             }
         }
 
@@ -2155,7 +2870,11 @@ impl VulkanRenderer {
             primitives_3d: &mut primitives_3d,
             mesh_vertices: &mut mesh_vertices,
             mesh_indices: &mut mesh_indices,
+            mesh_draws_3d: &mut mesh_draws_3d,
+            surface_materials: &mut surface_materials,
             mesh_submissions_2d: &mut mesh_submissions_2d,
+            camera_position: scene.camera.position,
+            camera_look: scene.camera.look_at_dir(),
         };
 
         for m in &scene.mobjects {
@@ -2201,7 +2920,7 @@ impl VulkanRenderer {
             clip_h,
             aa_level: scene.aa_level,
             num_primitives: primitives_3d.len() as u32,
-            _pad2: 0,
+            raster_scale: self.ssaa_factor,
             _pad3: 0,
             proj_mat: {
                 if scene.camera.proj_type() == 0 {
@@ -2226,7 +2945,36 @@ impl VulkanRenderer {
                     )
                 }
             },
+            light_pos: [
+                scene.point_light.position.x as f32,
+                scene.point_light.position.y as f32,
+                scene.point_light.position.z as f32,
+            ],
+            light_intensity: scene.point_light.intensity as f32,
+            light_color: [
+                scene.point_light.color.r as f32 / 255.0,
+                scene.point_light.color.g as f32 / 255.0,
+                scene.point_light.color.b as f32 / 255.0,
+            ],
+            environment_intensity: scene.environment_light.intensity as f32,
+            environment_color: [
+                scene.environment_light.color.r as f32 / 255.0,
+                scene.environment_light.color.g as f32 / 255.0,
+                scene.environment_light.color.b as f32 / 255.0,
+            ],
+            environment_rotation: scene.environment_light.rotation_radians as f32,
         };
+
+        mesh_draws_3d.sort_by(|left, right| {
+            left.is_transparent()
+                .cmp(&right.is_transparent())
+                .then_with(|| {
+                    right
+                        .view_depth
+                        .partial_cmp(&left.view_depth)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+        });
 
         self.render(
             scene_config.output_width,
@@ -2234,8 +2982,10 @@ impl VulkanRenderer {
             &camera_uniform,
             &camera_uniform_2d,
             &primitives_3d,
+            &surface_materials,
             &mesh_vertices,
             &mesh_indices,
+            &mesh_draws_3d,
             &mesh_batches_2d,
             output,
             outputs,
@@ -2249,8 +2999,10 @@ impl VulkanRenderer {
         camera_uniform: &CameraUniform,
         camera_uniform_2d: &CameraUniform2D,
         objects_3d: &[PrimitiveData3D],
+        surface_materials: &[SurfaceMaterial],
         mesh_vertices: &[Vertex],
         mesh_indices: &[u32],
+        mesh_draws_3d: &[Mesh3DDraw],
         mesh_batches_2d: &[Mesh2DBatch],
         output: Option<&mut [u8]>,
         outputs: RenderOutputs,
@@ -2269,7 +3021,7 @@ impl VulkanRenderer {
                 unsafe {
                     self.ctx.device.device_wait_idle().unwrap();
                 }
-                old_cache.destroy(&self.ctx);
+                old_cache.destroy(&self.ctx, self.descriptor_pool);
             }
             self.nv12_constants_buffer.write_bytes(
                 0,
@@ -2294,22 +3046,87 @@ impl VulkanRenderer {
                     vk::ImageAspectFlags::COLOR,
                     vk::SampleCountFlags::TYPE_1,
                 );
+                let sdf_depth = Image::new(
+                    &self.ctx,
+                    width,
+                    height,
+                    vk::Format::R32_SFLOAT,
+                    vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
                 let resolved_texture = Image::new(
                     &self.ctx,
                     width * self.ssaa_factor,
                     height * self.ssaa_factor,
-                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                    vk::ImageUsageFlags::COLOR_ATTACHMENT
+                        | vk::ImageUsageFlags::SAMPLED
+                        | vk::ImageUsageFlags::TRANSFER_SRC,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let scene_color = Image::new(
+                    &self.ctx,
+                    width * self.ssaa_factor,
+                    height * self.ssaa_factor,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                    vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let transparent_back_depth = Image::new(
+                    &self.ctx,
+                    width * self.ssaa_factor,
+                    height * self.ssaa_factor,
+                    vk::Format::R32_SFLOAT,
                     vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let bloom_width = (width / 2).max(1);
+                let bloom_height = (height / 2).max(1);
+                let bloom_usage = vk::ImageUsageFlags::STORAGE
+                    | vk::ImageUsageFlags::SAMPLED
+                    | vk::ImageUsageFlags::TRANSFER_DST;
+                let bloom_ping = Image::new(
+                    &self.ctx,
+                    bloom_width,
+                    bloom_height,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                    bloom_usage,
+                    vk::ImageAspectFlags::COLOR,
+                    vk::SampleCountFlags::TYPE_1,
+                );
+                let bloom_pong = Image::new(
+                    &self.ctx,
+                    bloom_width,
+                    bloom_height,
+                    vk::Format::R16G16B16A16_SFLOAT,
+                    bloom_usage,
                     vk::ImageAspectFlags::COLOR,
                     vk::SampleCountFlags::TYPE_1,
                 );
                 RenderTargetSet {
                     texture,
                     texture_state: TrackedImageState::UNDEFINED,
+                    sdf_depth,
+                    sdf_depth_state: TrackedImageState::UNDEFINED,
                     resolved_texture,
                     resolved_texture_state: TrackedImageState::UNDEFINED,
+                    scene_color,
+                    scene_color_state: TrackedImageState::UNDEFINED,
+                    transparent_back_depth,
+                    transparent_back_depth_state: TrackedImageState::UNDEFINED,
+                    bloom_ping,
+                    bloom_ping_state: TrackedImageState::UNDEFINED,
+                    bloom_pong,
+                    bloom_pong_state: TrackedImageState::UNDEFINED,
+                    bloom_contains_data: false,
                     compute_descriptor_set: vk::DescriptorSet::null(),
+                    raster_descriptor_set: vk::DescriptorSet::null(),
                     composite_descriptor_set: vk::DescriptorSet::null(),
+                    bloom_descriptor_sets: [vk::DescriptorSet::null(); 3],
                 }
             });
             let raster_sample_count = msaa_to_vk_sample_count(self.msaa_samples);
@@ -2318,7 +3135,7 @@ impl VulkanRenderer {
                     &self.ctx,
                     width * self.ssaa_factor,
                     height * self.ssaa_factor,
-                    vk::Format::R8G8B8A8_UNORM,
+                    vk::Format::R16G16B16A16_SFLOAT,
                     vk::ImageUsageFlags::COLOR_ATTACHMENT,
                     vk::ImageAspectFlags::COLOR,
                     raster_sample_count,
@@ -2411,19 +3228,26 @@ impl VulkanRenderer {
                 targets.compute_descriptor_set = descriptor_set;
             }
 
+            let raster_layouts = [self.raster_descriptor_set_layout; RENDER_FRAME_COUNT];
             let alloc_info_raster = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
                 descriptor_pool: self.descriptor_pool,
-                descriptor_set_count: 1,
-                p_set_layouts: &self.raster_descriptor_set_layout,
+                descriptor_set_count: RENDER_FRAME_COUNT as u32,
+                p_set_layouts: raster_layouts.as_ptr(),
                 ..Default::default()
             };
-            let raster_descriptor_set = unsafe {
+            let raster_descriptor_sets = unsafe {
                 self.ctx
                     .device
                     .allocate_descriptor_sets(&alloc_info_raster)
-                    .unwrap()[0]
+                    .unwrap()
             };
+            for (targets, descriptor_set) in render_targets
+                .iter_mut()
+                .zip(raster_descriptor_sets.into_iter())
+            {
+                targets.raster_descriptor_set = descriptor_set;
+            }
 
             let alloc_info_raster_2d = vk::DescriptorSetAllocateInfo {
                 s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
@@ -2458,6 +3282,26 @@ impl VulkanRenderer {
                 .zip(composite_descriptor_sets.into_iter())
             {
                 targets.composite_descriptor_set = descriptor_set;
+            }
+            let bloom_layouts = [self.bloom_descriptor_set_layout; RENDER_FRAME_COUNT * 3];
+            let bloom_alloc_info = vk::DescriptorSetAllocateInfo {
+                s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
+                descriptor_pool: self.descriptor_pool,
+                descriptor_set_count: bloom_layouts.len() as u32,
+                p_set_layouts: bloom_layouts.as_ptr(),
+                ..Default::default()
+            };
+            let bloom_descriptor_sets = unsafe {
+                self.ctx
+                    .device
+                    .allocate_descriptor_sets(&bloom_alloc_info)
+                    .unwrap()
+            };
+            for (targets, sets) in render_targets
+                .iter_mut()
+                .zip(bloom_descriptor_sets.chunks_exact(3))
+            {
+                targets.bloom_descriptor_sets.copy_from_slice(sets);
             }
 
             let nv12_layouts = [self.nv12_descriptor_set_layout; 3];
@@ -2525,6 +3369,14 @@ impl VulkanRenderer {
                     ..Default::default()
                 })
                 .collect();
+            let sdf_depth_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.sdf_depth.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
             let resolved_image_infos: Vec<_> = render_targets
                 .iter()
                 .map(|targets| vk::DescriptorImageInfo {
@@ -2533,10 +3385,57 @@ impl VulkanRenderer {
                     ..Default::default()
                 })
                 .collect();
+            let scene_color_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.scene_color.view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    ..Default::default()
+                })
+                .collect();
+            let transparent_back_depth_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.transparent_back_depth.view,
+                    image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    ..Default::default()
+                })
+                .collect();
+            let environment_image_info = vk::DescriptorImageInfo {
+                image_view: self.environment_map.view,
+                image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ..Default::default()
+            };
+            let environment_sampler_info = vk::DescriptorImageInfo {
+                sampler: self.environment_sampler,
+                ..Default::default()
+            };
+            let bloom_ping_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.bloom_ping.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
+            let bloom_pong_infos: Vec<_> = render_targets
+                .iter()
+                .map(|targets| vk::DescriptorImageInfo {
+                    image_view: targets.bloom_pong.view,
+                    image_layout: vk::ImageLayout::GENERAL,
+                    ..Default::default()
+                })
+                .collect();
             let camera_buffer_info = vk::DescriptorBufferInfo {
                 buffer: self.camera_buffer.vk_buffer,
                 offset: 0,
                 range: self.camera_buffer_stride,
+                ..Default::default()
+            };
+            let material_buffer_3d_info = vk::DescriptorBufferInfo {
+                buffer: self.material_buffer_3d.vk_buffer,
+                offset: 0,
+                range: self.material_buffer_3d_stride,
                 ..Default::default()
             };
             let buffer_3d_info = vk::DescriptorBufferInfo {
@@ -2553,28 +3452,80 @@ impl VulkanRenderer {
                 ..Default::default()
             };
 
-            let mut write_descriptor_sets = vec![
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: raster_descriptor_set,
-                    dst_binding: 1,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                    descriptor_count: 1,
-                    p_buffer_info: &camera_buffer_info,
-                    ..Default::default()
-                },
-                vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: raster_descriptor_set_2d,
-                    dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
-                    descriptor_count: 1,
-                    p_buffer_info: &camera_buffer_2d_info,
-                    ..Default::default()
-                },
-            ];
+            let mut write_descriptor_sets = vec![vk::WriteDescriptorSet {
+                s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                dst_set: raster_descriptor_set_2d,
+                dst_binding: 0,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                descriptor_count: 1,
+                p_buffer_info: &camera_buffer_2d_info,
+                ..Default::default()
+            }];
             for (index, targets) in render_targets.iter().enumerate() {
                 write_descriptor_sets.extend([
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &camera_buffer_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 2,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &material_buffer_3d_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 3,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &scene_color_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 4,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &transparent_back_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 5,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &environment_image_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 6,
+                        descriptor_type: vk::DescriptorType::SAMPLER,
+                        descriptor_count: 1,
+                        p_image_info: &environment_sampler_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.raster_descriptor_set,
+                        dst_binding: 7,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &sdf_depth_infos[index],
+                        ..Default::default()
+                    },
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.compute_descriptor_set,
@@ -2604,6 +3555,42 @@ impl VulkanRenderer {
                     },
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 3,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                        descriptor_count: 1,
+                        p_buffer_info: &material_buffer_3d_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 4,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &environment_image_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 5,
+                        descriptor_type: vk::DescriptorType::SAMPLER,
+                        descriptor_count: 1,
+                        p_image_info: &environment_sampler_info,
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.compute_descriptor_set,
+                        dst_binding: 6,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &sdf_depth_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.composite_descriptor_set,
                         dst_binding: 0,
                         descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
@@ -2618,6 +3605,69 @@ impl VulkanRenderer {
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                         descriptor_count: 1,
                         p_image_info: &resolved_image_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.composite_descriptor_set,
+                        dst_binding: 2,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_ping_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[0],
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &resolved_image_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[0],
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_ping_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[1],
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_ping_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[1],
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_pong_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[2],
+                        dst_binding: 0,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_pong_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.bloom_descriptor_sets[2],
+                        dst_binding: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        descriptor_count: 1,
+                        p_image_info: &bloom_ping_infos[index],
                         ..Default::default()
                     },
                 ]);
@@ -2780,7 +3830,6 @@ impl VulkanRenderer {
                 yuv444p_descriptor_sets,
                 video_nv12_slots,
                 current_frame: 0,
-                raster_descriptor_set,
                 raster_descriptor_set_2d,
                 padded_bytes_per_row,
                 rgba_preview_buffer: vec![0; (width * height * 4) as usize],
@@ -2842,15 +3891,14 @@ impl VulkanRenderer {
         );
         let fused_video_downsample = frame_plan == FrameExecutionPlan::RasterDownsample
             && self.ssaa_factor == 2
+            && !self.bloom_enabled
             && outputs.vulkan_video
             && !outputs.cpu_nv12
             && !outputs.cpu_yuv444p
             && !outputs.cpu_rgba;
-        let runs_postprocess = matches!(
-            frame_plan,
-            FrameExecutionPlan::RasterDownsample | FrameExecutionPlan::SdfRasterComposite
-        ) && !fused_video_downsample;
+        let runs_postprocess = frame_plan.runs_raster() && !fused_video_downsample;
         let raster_uses_depth = !mesh_indices.is_empty();
+        let has_transparent_meshes = mesh_draws_3d.iter().any(|draw| draw.is_transparent());
         if raster_uses_depth && cache.msaa_depth_texture.is_none() {
             cache.msaa_depth_texture = Some(Image::new(
                 &self.ctx,
@@ -2865,6 +3913,15 @@ impl VulkanRenderer {
         }
 
         self.last_stats = RendererStats {
+            mesh_3d_opaque_draw_calls: mesh_draws_3d
+                .iter()
+                .filter(|draw| !draw.is_transparent())
+                .count() as u32,
+            mesh_3d_transparent_draw_calls: mesh_draws_3d
+                .iter()
+                .filter(|draw| draw.is_transparent())
+                .count() as u32
+                * 2,
             mesh_2d_draw_calls: prepared_mesh_batches_2d.len() as u32,
             mesh_2d_instances: instances_2d.len() as u32,
             mesh_2d_geometry_uploads: geometry_uploads_2d.len() as u32,
@@ -2878,8 +3935,15 @@ impl VulkanRenderer {
                 .sum(),
             mesh_2d_arena_rebuilds,
             sdf_dispatches: frame_plan.runs_sdf() as u32,
-            raster_passes: frame_plan.runs_raster() as u32,
-            depth_attachment_raster_passes: raster_uses_depth as u32,
+            raster_passes: frame_plan.runs_raster() as u32 + has_transparent_meshes as u32 * 2,
+            depth_attachment_raster_passes: raster_uses_depth as u32
+                * (1 + has_transparent_meshes as u32),
+            tone_map_dispatches: (frame_plan == FrameExecutionPlan::RasterToneMap) as u32,
+            bloom_dispatches: if self.bloom_enabled && frame_plan.runs_raster() {
+                3
+            } else {
+                0
+            },
             downsample_dispatches: (frame_plan == FrameExecutionPlan::RasterDownsample
                 && !fused_video_downsample) as u32,
             fused_video_downsample_dispatches: fused_video_downsample as u32,
@@ -2895,14 +3959,22 @@ impl VulkanRenderer {
         let vertex_buffer_offset = self.vertex_buffer_stride * frame_idx as u64;
         let index_buffer_offset = self.index_buffer_stride * frame_idx as u64;
         let camera_buffer_offset = self.camera_buffer_stride * frame_idx as u64;
+        let material_buffer_3d_offset = self.material_buffer_3d_stride * frame_idx as u64;
         let primitive_buffer_offset = self.primitive_buffer_stride * frame_idx as u64;
         let vertex_staging_buffer_2d_offset =
             self.vertex_staging_buffer_2d_stride * frame_idx as u64;
         let index_staging_buffer_2d_offset = self.index_staging_buffer_2d_stride * frame_idx as u64;
         let instance_buffer_2d_offset = self.instance_buffer_2d_stride * frame_idx as u64;
         let camera_buffer_2d_offset = self.camera_buffer_2d_stride * frame_idx as u64;
-        let compute_dynamic_offsets = [camera_buffer_offset as u32, primitive_buffer_offset as u32];
-        let raster_dynamic_offsets = [camera_buffer_offset as u32];
+        let compute_dynamic_offsets = [
+            camera_buffer_offset as u32,
+            primitive_buffer_offset as u32,
+            material_buffer_3d_offset as u32,
+        ];
+        let raster_dynamic_offsets = [
+            camera_buffer_offset as u32,
+            material_buffer_3d_offset as u32,
+        ];
         let raster_2d_dynamic_offsets = [camera_buffer_2d_offset as u32];
         let targets = &mut cache.render_targets[frame_idx];
 
@@ -2972,6 +4044,20 @@ impl VulkanRenderer {
                 camera_buffer_2d_offset,
                 bytemuck::bytes_of(camera_uniform_2d),
             );
+            if !surface_materials.is_empty() {
+                let materials: Vec<MaterialData3D> = surface_materials
+                    .iter()
+                    .copied()
+                    .map(MaterialData3D::from)
+                    .collect();
+                assert!(
+                    std::mem::size_of_val(materials.as_slice())
+                        <= self.material_buffer_3d_stride as usize,
+                    "3D material count exceeds the per-frame material buffer capacity"
+                );
+                self.material_buffer_3d
+                    .write_bytes(material_buffer_3d_offset, bytemuck::cast_slice(&materials));
+            }
             if !objects_3d.is_empty() {
                 let bytes = bytemuck::cast_slice(objects_3d);
                 let len = (self.primitive_buffer_stride as usize).min(bytes.len());
@@ -3154,6 +4240,14 @@ impl VulkanRenderer {
                     &mut targets.texture_state,
                     compute_write_state,
                 );
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.sdf_depth.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.sdf_depth_state,
+                    compute_write_state,
+                );
                 self.ctx.device.cmd_bind_pipeline(
                     fd.command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
@@ -3173,6 +4267,20 @@ impl VulkanRenderer {
                     (height + 15) / 16,
                     1,
                 );
+                if frame_plan.runs_raster() {
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.sdf_depth.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.sdf_depth_state,
+                        TrackedImageState {
+                            layout: vk::ImageLayout::GENERAL,
+                            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            access: vk::AccessFlags2::SHADER_READ,
+                        },
+                    );
+                }
             }
             write_gpu_timestamp(
                 &self.ctx.device,
@@ -3183,20 +4291,9 @@ impl VulkanRenderer {
             );
 
             if frame_plan.runs_raster() {
-                let direct = frame_plan == FrameExecutionPlan::RasterDirect;
-                let (target_image, target_view, target_state) = if direct {
-                    (
-                        targets.texture.vk_image,
-                        targets.texture.view,
-                        &mut targets.texture_state,
-                    )
-                } else {
-                    (
-                        targets.resolved_texture.vk_image,
-                        targets.resolved_texture.view,
-                        &mut targets.resolved_texture_state,
-                    )
-                };
+                let target_image = targets.resolved_texture.vk_image;
+                let target_view = targets.resolved_texture.view;
+                let target_state = &mut targets.resolved_texture_state;
                 transition_image(
                     &self.ctx.device,
                     fd.command_buffer,
@@ -3246,7 +4343,7 @@ impl VulkanRenderer {
                     );
                     color_attachment = color_attachment
                         .image_view(msaa_texture.view)
-                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .store_op(vk::AttachmentStoreOp::STORE)
                         .resolve_mode(vk::ResolveModeFlags::AVERAGE)
                         .resolve_image_view(target_view)
                         .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
@@ -3258,7 +4355,11 @@ impl VulkanRenderer {
                         .image_view(texture.view)
                         .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
-                        .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        .store_op(if has_transparent_meshes {
+                            vk::AttachmentStoreOp::STORE
+                        } else {
+                            vk::AttachmentStoreOp::DONT_CARE
+                        })
                         .clear_value(vk::ClearValue {
                             depth_stencil: vk::ClearDepthStencilValue {
                                 depth: 1.0,
@@ -3310,18 +4411,13 @@ impl VulkanRenderer {
                     }],
                 );
 
-                if !mesh_indices.is_empty() {
-                    self.ctx.device.cmd_bind_pipeline(
-                        fd.command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.raster_pipeline,
-                    );
+                if !mesh_draws_3d.is_empty() {
                     self.ctx.device.cmd_bind_descriptor_sets(
                         fd.command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,
                         self.raster_pipeline_layout,
                         0,
-                        std::slice::from_ref(&cache.raster_descriptor_set),
+                        std::slice::from_ref(&targets.raster_descriptor_set),
                         &raster_dynamic_offsets,
                     );
                     self.ctx.device.cmd_bind_vertex_buffers(
@@ -3336,19 +4432,24 @@ impl VulkanRenderer {
                         index_buffer_offset,
                         vk::IndexType::UINT32,
                     );
-                    let indices_to_draw =
-                        (mesh_indices.len() as u32).min((self.index_buffer_stride / 4) as u32);
-                    self.ctx.device.cmd_draw_indexed(
+                    self.ctx.device.cmd_bind_pipeline(
                         fd.command_buffer,
-                        indices_to_draw,
-                        1,
-                        0,
-                        0,
-                        0,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline,
                     );
+                    for draw in mesh_draws_3d.iter().filter(|draw| !draw.is_transparent()) {
+                        self.ctx.device.cmd_draw_indexed(
+                            fd.command_buffer,
+                            draw.index_count,
+                            1,
+                            draw.first_index,
+                            0,
+                            draw.material_index,
+                        );
+                    }
                 }
 
-                if !prepared_mesh_batches_2d.is_empty() {
+                if !has_transparent_meshes && !prepared_mesh_batches_2d.is_empty() {
                     self.ctx.device.cmd_bind_pipeline(
                         fd.command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,
@@ -3394,6 +4495,283 @@ impl VulkanRenderer {
                     }
                 }
                 self.ctx.device.cmd_end_rendering(fd.command_buffer);
+
+                if has_transparent_meshes {
+                    let transfer_source_state = TrackedImageState {
+                        layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        stage: vk::PipelineStageFlags2::COPY,
+                        access: vk::AccessFlags2::TRANSFER_READ,
+                    };
+                    let transfer_destination_state = TrackedImageState {
+                        layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        stage: vk::PipelineStageFlags2::COPY,
+                        access: vk::AccessFlags2::TRANSFER_WRITE,
+                    };
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.resolved_texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.resolved_texture_state,
+                        transfer_source_state,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.scene_color.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.scene_color_state,
+                        transfer_destination_state,
+                    );
+                    let copy_region = vk::ImageCopy::default()
+                        .src_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .dst_subresource(vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        })
+                        .extent(vk::Extent3D {
+                            width: raster_extent.width,
+                            height: raster_extent.height,
+                            depth: 1,
+                        });
+                    self.ctx.device.cmd_copy_image(
+                        fd.command_buffer,
+                        targets.resolved_texture.vk_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        targets.scene_color.vk_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        std::slice::from_ref(&copy_region),
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.resolved_texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.resolved_texture_state,
+                        color_attachment_state,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.scene_color.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.scene_color_state,
+                        TrackedImageState {
+                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            access: vk::AccessFlags2::SHADER_READ,
+                        },
+                    );
+
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.transparent_back_depth.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.transparent_back_depth_state,
+                        color_attachment_state,
+                    );
+                    let thickness_attachment = vk::RenderingAttachmentInfo::default()
+                        .image_view(targets.transparent_back_depth.view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue { float32: [0.0; 4] },
+                        });
+                    let thickness_attachments = [thickness_attachment];
+                    let thickness_rendering_info = vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: raster_extent,
+                        })
+                        .layer_count(1)
+                        .color_attachments(&thickness_attachments);
+                    self.ctx
+                        .device
+                        .cmd_begin_rendering(fd.command_buffer, &thickness_rendering_info);
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_transparent_depth,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&targets.raster_descriptor_set),
+                        &raster_dynamic_offsets,
+                    );
+                    self.ctx.device.cmd_bind_vertex_buffers(
+                        fd.command_buffer,
+                        0,
+                        std::slice::from_ref(&self.vertex_buffer.vk_buffer),
+                        &[vertex_buffer_offset],
+                    );
+                    self.ctx.device.cmd_bind_index_buffer(
+                        fd.command_buffer,
+                        self.index_buffer.vk_buffer,
+                        index_buffer_offset,
+                        vk::IndexType::UINT32,
+                    );
+                    for draw in mesh_draws_3d.iter().filter(|draw| draw.is_transparent()) {
+                        self.ctx.device.cmd_draw_indexed(
+                            fd.command_buffer,
+                            draw.index_count,
+                            1,
+                            draw.first_index,
+                            0,
+                            draw.material_index,
+                        );
+                    }
+                    self.ctx.device.cmd_end_rendering(fd.command_buffer);
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.transparent_back_depth.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.transparent_back_depth_state,
+                        TrackedImageState {
+                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                            access: vk::AccessFlags2::SHADER_READ,
+                        },
+                    );
+
+                    let mut transparent_color_attachment = vk::RenderingAttachmentInfo::default()
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::LOAD)
+                        .store_op(vk::AttachmentStoreOp::STORE);
+                    if let Some(msaa_texture) = &cache.msaa_texture {
+                        transparent_color_attachment = transparent_color_attachment
+                            .image_view(msaa_texture.view)
+                            .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                            .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                            .resolve_image_view(target_view)
+                            .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL);
+                    } else {
+                        transparent_color_attachment =
+                            transparent_color_attachment.image_view(target_view);
+                    }
+                    let transparent_depth_attachment =
+                        cache.msaa_depth_texture.as_ref().map(|texture| {
+                            vk::RenderingAttachmentInfo::default()
+                                .image_view(texture.view)
+                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::LOAD)
+                                .store_op(vk::AttachmentStoreOp::DONT_CARE)
+                        });
+                    let transparent_color_attachments = [transparent_color_attachment];
+                    let mut transparent_rendering_info = vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: raster_extent,
+                        })
+                        .layer_count(1)
+                        .color_attachments(&transparent_color_attachments);
+                    if raster_uses_depth {
+                        transparent_rendering_info = transparent_rendering_info.depth_attachment(
+                            transparent_depth_attachment
+                                .as_ref()
+                                .expect("transparent 3D raster requires a depth attachment"),
+                        );
+                    }
+                    self.ctx
+                        .device
+                        .cmd_begin_rendering(fd.command_buffer, &transparent_rendering_info);
+
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&targets.raster_descriptor_set),
+                        &raster_dynamic_offsets,
+                    );
+                    self.ctx.device.cmd_bind_vertex_buffers(
+                        fd.command_buffer,
+                        0,
+                        std::slice::from_ref(&self.vertex_buffer.vk_buffer),
+                        &[vertex_buffer_offset],
+                    );
+                    self.ctx.device.cmd_bind_index_buffer(
+                        fd.command_buffer,
+                        self.index_buffer.vk_buffer,
+                        index_buffer_offset,
+                        vk::IndexType::UINT32,
+                    );
+                    for draw in mesh_draws_3d.iter().filter(|draw| draw.is_transparent()) {
+                        for pipeline in [
+                            self.raster_pipeline_transparent_back,
+                            self.raster_pipeline_transparent_front,
+                        ] {
+                            self.ctx.device.cmd_bind_pipeline(
+                                fd.command_buffer,
+                                vk::PipelineBindPoint::GRAPHICS,
+                                pipeline,
+                            );
+                            self.ctx.device.cmd_draw_indexed(
+                                fd.command_buffer,
+                                draw.index_count,
+                                1,
+                                draw.first_index,
+                                0,
+                                draw.material_index,
+                            );
+                        }
+                    }
+
+                    if !prepared_mesh_batches_2d.is_empty() {
+                        self.ctx.device.cmd_bind_pipeline(
+                            fd.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.raster_pipeline_2d,
+                        );
+                        self.ctx.device.cmd_bind_descriptor_sets(
+                            fd.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.raster_pipeline_layout_2d,
+                            0,
+                            std::slice::from_ref(&cache.raster_descriptor_set_2d),
+                            &raster_2d_dynamic_offsets,
+                        );
+                        let vertex_buffers = [
+                            self.vertex_buffer_2d.vk_buffer,
+                            self.instance_buffer_2d.vk_buffer,
+                        ];
+                        self.ctx.device.cmd_bind_vertex_buffers(
+                            fd.command_buffer,
+                            0,
+                            &vertex_buffers,
+                            &[0, instance_buffer_2d_offset],
+                        );
+                        self.ctx.device.cmd_bind_index_buffer(
+                            fd.command_buffer,
+                            self.index_buffer_2d.vk_buffer,
+                            0,
+                            vk::IndexType::UINT32,
+                        );
+                        for batch in &prepared_mesh_batches_2d {
+                            self.ctx.device.cmd_draw_indexed(
+                                fd.command_buffer,
+                                batch.index_count,
+                                batch.instance_count,
+                                batch.first_index,
+                                batch.vertex_offset,
+                                batch.first_instance,
+                            );
+                        }
+                    }
+                    self.ctx.device.cmd_end_rendering(fd.command_buffer);
+                }
             }
             write_gpu_timestamp(
                 &self.ctx.device,
@@ -3402,6 +4780,167 @@ impl VulkanRenderer {
                 3,
                 gpu_profiling,
             );
+
+            if frame_plan.runs_raster() {
+                if self.bloom_enabled {
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.resolved_texture.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.resolved_texture_state,
+                        compute_read_state,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_ping.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_ping_state,
+                        compute_write_state,
+                    );
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_extract_pipeline,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&targets.bloom_descriptor_sets[0]),
+                        &[],
+                    );
+                    self.ctx.device.cmd_dispatch(
+                        fd.command_buffer,
+                        (targets.bloom_ping.width + 15) / 16,
+                        (targets.bloom_ping.height + 15) / 16,
+                        1,
+                    );
+
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_ping.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_ping_state,
+                        compute_read_state,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_pong.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_pong_state,
+                        compute_write_state,
+                    );
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_horizontal_pipeline,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&targets.bloom_descriptor_sets[1]),
+                        &[],
+                    );
+                    self.ctx.device.cmd_dispatch(
+                        fd.command_buffer,
+                        (targets.bloom_pong.width + 15) / 16,
+                        (targets.bloom_pong.height + 15) / 16,
+                        1,
+                    );
+
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_pong.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_pong_state,
+                        compute_read_state,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_ping.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_ping_state,
+                        compute_write_state,
+                    );
+                    self.ctx.device.cmd_bind_pipeline(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_vertical_pipeline,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.bloom_pipeline_layout,
+                        0,
+                        std::slice::from_ref(&targets.bloom_descriptor_sets[2]),
+                        &[],
+                    );
+                    self.ctx.device.cmd_dispatch(
+                        fd.command_buffer,
+                        (targets.bloom_ping.width + 15) / 16,
+                        (targets.bloom_ping.height + 15) / 16,
+                        1,
+                    );
+                    transition_image(
+                        &self.ctx.device,
+                        fd.command_buffer,
+                        targets.bloom_ping.vk_image,
+                        vk::ImageAspectFlags::COLOR,
+                        &mut targets.bloom_ping_state,
+                        compute_read_state,
+                    );
+                    targets.bloom_contains_data = true;
+                } else {
+                    if targets.bloom_contains_data
+                        || targets.bloom_ping_state.layout == vk::ImageLayout::UNDEFINED
+                    {
+                        let clear_state = TrackedImageState {
+                            layout: vk::ImageLayout::GENERAL,
+                            stage: vk::PipelineStageFlags2::CLEAR,
+                            access: vk::AccessFlags2::TRANSFER_WRITE,
+                        };
+                        transition_image(
+                            &self.ctx.device,
+                            fd.command_buffer,
+                            targets.bloom_ping.vk_image,
+                            vk::ImageAspectFlags::COLOR,
+                            &mut targets.bloom_ping_state,
+                            clear_state,
+                        );
+                        self.ctx.device.cmd_clear_color_image(
+                            fd.command_buffer,
+                            targets.bloom_ping.vk_image,
+                            vk::ImageLayout::GENERAL,
+                            &vk::ClearColorValue { float32: [0.0; 4] },
+                            &[vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }],
+                        );
+                        transition_image(
+                            &self.ctx.device,
+                            fd.command_buffer,
+                            targets.bloom_ping.vk_image,
+                            vk::ImageAspectFlags::COLOR,
+                            &mut targets.bloom_ping_state,
+                            compute_read_state,
+                        );
+                        targets.bloom_contains_data = false;
+                    }
+                }
+            }
 
             if runs_postprocess {
                 transition_image(
@@ -3859,11 +5398,14 @@ mod tests {
     use nalgebra::Matrix4;
 
     use super::{
-        FrameExecutionPlan, Instance2D, Mesh2DSubmission, MeshGeometry2D, PrepareMesh2DError,
-        build_ordered_mesh_2d_batches, prepare_mesh_2d_batches, timestamp_delta,
-        video_timeline_values,
+        FrameExecutionPlan, Instance2D, MaterialData3D, Mesh2DSubmission, MeshGeometry2D,
+        PrepareMesh2DError, build_ordered_mesh_2d_batches, prepare_mesh_2d_batches,
+        timestamp_delta, video_timeline_values,
     };
     use crate::mobjects::mesh_2d::Vertex2D;
+    use crate::mobjects::mesh_3d::{
+        AlphaMode3D, SphericalPatchMaterial, SurfaceMaterial, Transmission3D,
+    };
 
     fn triangle(offset: f32) -> Arc<MeshGeometry2D> {
         Arc::new(MeshGeometry2D::new(
@@ -3911,7 +5453,7 @@ mod tests {
         );
         assert_eq!(
             FrameExecutionPlan::build(false, true, 1),
-            FrameExecutionPlan::RasterDirect
+            FrameExecutionPlan::RasterToneMap
         );
         assert_eq!(
             FrameExecutionPlan::build(false, true, 2),
@@ -3925,6 +5467,36 @@ mod tests {
             FrameExecutionPlan::build(true, true, 2),
             FrameExecutionPlan::SdfRasterComposite
         );
+    }
+
+    #[test]
+    fn spherical_patch_material_has_a_stable_gpu_layout() {
+        let material = SurfaceMaterial {
+            alpha_mode: AlphaMode3D::Blend(Transmission3D {
+                opacity: 0.1,
+                fresnel_opacity: 0.2,
+                absorption: [0.3, 0.4, 0.5],
+                ior: 1.7,
+                backface_opacity_scale: 0.8,
+            }),
+            spherical_patch: Some(SphericalPatchMaterial {
+                directions: [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]],
+                color: [0.1, 0.2, 0.3, 0.4],
+                edge_color: [0.5, 0.6, 0.7, 0.8],
+                edge_width_pixels: 2.25,
+            }),
+            ..Default::default()
+        };
+        let gpu = MaterialData3D::from(material);
+
+        assert_eq!(std::mem::size_of::<MaterialData3D>(), 14 * 16);
+        assert_eq!(gpu.patch_corner_0, [1.0, 2.0, 3.0, 0.0]);
+        assert_eq!(gpu.patch_corner_2, [7.0, 8.0, 9.0, 0.0]);
+        assert_eq!(gpu.patch_color, [0.1, 0.2, 0.3, 0.4]);
+        assert_eq!(gpu.patch_edge_color, [0.5, 0.6, 0.7, 0.8]);
+        assert_eq!(gpu.patch_params[0], 2.25);
+        assert_eq!(gpu.transmission, [0.1, 0.2, 1.7, 0.0]);
+        assert_eq!(gpu.absorption, [0.3, 0.4, 0.5, 0.8]);
     }
 
     #[test]

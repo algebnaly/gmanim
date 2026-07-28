@@ -21,22 +21,50 @@ struct CameraUniform {
     clip_h: f32,
     aa_level: u32,
     num_primitives: u32,
-    _pad2: u32,
+    raster_scale: u32,
     _pad3: u32,
+    proj_mat: mat4x4<f32>,
+    light_pos: vec3<f32>,
+    light_intensity: f32,
+    light_color: vec3<f32>,
+    environment_intensity: f32,
+    environment_color: vec3<f32>,
+    environment_rotation: f32,
 }
 @group(0) @binding(1) var<uniform> camera: CameraUniform;
 
 struct PrimitiveData3D {
-    color: vec4<f32>,
-    params: array<f32, 12>,
+    material_index: u32,
     shape_type: u32,
-    padding: array<u32, 3>,
+    padding: array<u32, 2>,
+    params: array<f32, 12>,
 }
 @group(0) @binding(2) var<storage, read> primitives: array<PrimitiveData3D>;
 
+struct MaterialData3D {
+    base_color: vec4<f32>,
+    emissive: vec4<f32>,
+    grid_color: vec4<f32>,
+    surface: vec4<f32>,
+    grid: vec4<f32>,
+    grid_backface: vec4<f32>,
+    transmission: vec4<f32>,
+    absorption: vec4<f32>,
+    patch_corner_0: vec4<f32>,
+    patch_corner_1: vec4<f32>,
+    patch_corner_2: vec4<f32>,
+    patch_color: vec4<f32>,
+    patch_edge_color: vec4<f32>,
+    patch_params: vec4<f32>,
+}
+@group(0) @binding(3) var<storage, read> materials: array<MaterialData3D>;
+@group(0) @binding(4) var environment_map: texture_2d<f32>;
+@group(0) @binding(5) var environment_sampler: sampler;
+@group(0) @binding(6) var depth_tex: texture_storage_2d<r32float, write>;
+
 struct MapResult {
     dist: f32,
-    color: vec4<f32>,
+    material_index: u32,
 }
 
 fn sphere_3d(p: vec3<f32>, center: vec3<f32>, radius: f32) -> f32 {
@@ -83,7 +111,7 @@ fn sd_capped_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, ra: f32, rb: f32) ->
 // Map function traversing all primitives
 fn map(p: vec3<f32>) -> MapResult {
     var min_dist: f32 = 99999.0;
-    var best_color: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var material_index = 0u;
     let num_primitives = camera.num_primitives;
     
     for (var i = 0u; i < num_primitives; i = i + 1u) {
@@ -142,11 +170,11 @@ fn map(p: vec3<f32>) -> MapResult {
         
         if (d < min_dist) {
             min_dist = d;
-            best_color = prim.color;
+            material_index = prim.material_index;
         }
     }
     
-    return MapResult(min_dist, best_color);
+    return MapResult(min_dist, material_index);
 }
 
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
@@ -159,13 +187,32 @@ fn calc_normal(p: vec3<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
-fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+fn aces_tone_map(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp(
+        (color * (a * color + vec3<f32>(b)))
+            / (color * (c * color + vec3<f32>(d)) + vec3<f32>(e)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
+
+struct RayResult {
+    color: vec4<f32>,
+    linear_depth: f32,
+}
+
+fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     var t: f32 = 0.0;
     let max_dist: f32 = 100.0;
     let surf_dist: f32 = 0.001;
     let max_steps: i32 = 100;
     
-    var hit_color: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var material_index = 0u;
     var hit = false;
     
     for (var i: i32 = 0; i < max_steps; i = i + 1) {
@@ -173,7 +220,7 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         let res = map(p);
         if (res.dist < surf_dist) {
             hit = true;
-            hit_color = res.color;
+            material_index = res.material_index;
             break;
         }
         t = t + res.dist;
@@ -182,33 +229,33 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
         }
     }
     
-    var final_color = vec4<f32>(0.0, 0.0, 0.0, 0.0); // Transparent background by default
-    
-    if (hit) {
-        let p = ro + rd * t;
-        let normal = calc_normal(p);
-        let view_dir = -normalize(camera.look_at);
-        var up = vec3<f32>(0.0, 1.0, 0.0);
-        if (abs(view_dir.y) > 0.99) {
-            up = vec3<f32>(1.0, 0.0, 0.0);
-        }
-        let right = normalize(cross(view_dir, up));
-        let cam_up = cross(right, view_dir);
-
-        let key_light_dir = normalize(view_dir + right * 0.8 + cam_up * 0.6);
-        let fill_light_dir = normalize(view_dir - right * 0.8 - cam_up * 0.2);
-        
-        let ambient = 0.35;
-        let diff_key = max(dot(normal, key_light_dir), 0.0);
-        let diff_fill = max(dot(normal, fill_light_dir), 0.0);
-        
-        // Raymarching spec can be added too if desired, but for now just diffuse + ambient
-        let light_intensity = ambient + diff_key * 0.6 + diff_fill * 0.3;
-        
-        final_color = vec4<f32>(hit_color.rgb * light_intensity, hit_color.a);
+    if (!hit) {
+        return RayResult(vec4<f32>(0.0), 1e20);
     }
-    
-    return final_color;
+
+    let p = ro + rd * t;
+    let normal = calc_normal(p);
+    let material = materials[material_index];
+    let albedo = material.base_color.rgb;
+    let roughness = clamp(material.surface.x, 0.04, 1.0);
+    let metallic = clamp(material.surface.y, 0.0, 1.0);
+    let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
+    let f0 = mix(vec3<f32>(reflectance_f0), albedo, metallic);
+    let view_direction = normalize(camera.pos - p);
+    let lighting = shade_surface(
+        p,
+        normal,
+        view_direction,
+        albedo,
+        roughness,
+        metallic,
+        f0,
+        material.emissive.rgb * material.emissive.a,
+    );
+
+    let alpha = material.base_color.a;
+    let linear_depth = dot(p - camera.pos, normalize(camera.look_at));
+    return RayResult(vec4<f32>(aces_tone_map(lighting.color) * alpha, alpha), linear_depth);
 }
 
 @compute @workgroup_size(16, 16)
@@ -224,6 +271,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (f32(x) < camera.clip_x || f32(x) >= camera.clip_x + camera.clip_w ||
             f32(y) < camera.clip_y || f32(y) >= camera.clip_y + camera.clip_h) {
             textureStore(output_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(0.0, 0.0, 0.0, 0.0));
+            textureStore(depth_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(1e20));
             return;
         }
     }
@@ -239,6 +287,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let aa = max(camera.aa_level, 1u);
     var accumulated_color = vec4<f32>(0.0);
+    var nearest_depth = 1e20;
 
     for (var i = 0u; i < aa; i = i + 1u) {
         for (var j = 0u; j < aa; j = j + 1u) {
@@ -263,12 +312,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 rd_sample = cz;
             }
             
-            let sample_color = render_ray(ro_sample, rd_sample);
-            let final_sample_color = vec4<f32>(sample_color.rgb * sample_color.a, sample_color.a);
-            accumulated_color = accumulated_color + final_sample_color;
+            let sample_result = render_ray(ro_sample, rd_sample);
+            accumulated_color += sample_result.color;
+            nearest_depth = min(nearest_depth, sample_result.linear_depth);
         }
     }
 
     let final_color = accumulated_color / f32(aa * aa);
     textureStore(output_tex, vec2<i32>(i32(x), i32(y)), final_color);
+    textureStore(depth_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(nearest_depth));
 }

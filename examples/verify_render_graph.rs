@@ -1,6 +1,10 @@
 use gmanim_core::{
     Color, RendererConfig, Scene, SceneConfig,
-    mobjects::{MobjectBase, Rectangle, Transform, object_3d::Sphere3D},
+    mobjects::{
+        MobjectBase, Rectangle, Transform,
+        mesh_3d::{SurfaceMaterial, TriangleMesh3D},
+        object_3d::Sphere3D,
+    },
     vulkan::{
         context::VulkanContext,
         renderer::{RenderOutputs, RendererStats, VulkanRenderer},
@@ -51,7 +55,10 @@ fn main() {
     let mut sphere = Sphere3D {
         base: MobjectBase::new("verify-sphere"),
         radius: 1.0,
-        color: Color::new(220, 80, 60, 255),
+        material: SurfaceMaterial {
+            base_color: [0.86, 0.31, 0.24, 1.0],
+            ..Default::default()
+        },
     };
     sphere.move_this(nalgebra::Vector3::new(0.0, 0.0, -3.0));
     sdf.add(sphere);
@@ -95,6 +102,61 @@ fn main() {
     assert_eq!(stats.raster_passes, 1);
     assert_eq!(stats.composite_dispatches, 1);
     assert!(non_black > 100);
+
+    let depth_scene = |mesh_z| {
+        let mut scene = Scene::default();
+        let mut sphere = Sphere3D {
+            base: MobjectBase::new("depth-sphere"),
+            radius: 1.0,
+            material: SurfaceMaterial {
+                base_color: [0.9, 0.08, 0.03, 1.0],
+                emissive: [1.0, 0.0, 0.0],
+                emissive_strength: 1.0,
+                ..Default::default()
+            },
+        };
+        sphere.move_this(nalgebra::Vector3::new(0.0, 0.0, -3.0));
+        scene.add(sphere);
+        scene.add(
+            TriangleMesh3D::box_mesh(
+                nalgebra::Point3::new(0.0, 0.0, mesh_z),
+                nalgebra::Vector3::new(0.8, 0.8, 0.05),
+                Color::new(20, 255, 30, 255),
+            )
+            .with_material(SurfaceMaterial {
+                base_color: [0.03, 0.9, 0.05, 1.0],
+                emissive: [0.0, 1.0, 0.0],
+                emissive_strength: 1.0,
+                ..Default::default()
+            }),
+        );
+        scene
+    };
+    let center =
+        (config.output_height / 2 * config.output_width + config.output_width / 2) as usize;
+    renderer.render_scene_with_outputs(
+        &depth_scene(-4.5),
+        &config,
+        None,
+        RenderOutputs::CPU_RGBA_ONLY,
+    );
+    let behind_pixel = &renderer.get_rgba_bytes().unwrap()[center * 4..center * 4 + 4];
+    assert!(
+        behind_pixel[0] > behind_pixel[1],
+        "SDF must occlude a raster mesh behind it"
+    );
+
+    renderer.render_scene_with_outputs(
+        &depth_scene(-1.5),
+        &config,
+        None,
+        RenderOutputs::CPU_RGBA_ONLY,
+    );
+    let front_pixel = &renderer.get_rgba_bytes().unwrap()[center * 4..center * 4 + 4];
+    assert!(
+        front_pixel[1] > front_pixel[0],
+        "raster mesh must occlude an SDF behind it"
+    );
 
     println!("render graph verification passed");
 }

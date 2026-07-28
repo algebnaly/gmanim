@@ -3,8 +3,9 @@ use rayon::prelude::*;
 use std::sync::Arc;
 
 use crate::camera::Camera;
+use crate::mobjects::mesh_3d::SurfaceMaterial;
 use crate::mobjects::{Draw, Mobject, Transform};
-use crate::{Color, Context, GMFloat};
+use crate::{Context, GMFloat};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 3D Object Trait
@@ -14,13 +15,13 @@ use crate::{Color, Context, GMFloat};
 pub trait Object3D {
     /// Returns the shortest distance from point `p` to the surface of the object (Used by CPU rendering).
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat;
-    /// Returns the color of the object at point `p`.
-    fn color(&self, p: &Point3<GMFloat>) -> Color;
+    fn material(&self) -> SurfaceMaterial;
 
     /// Returns the GPU-compatible primitive data
     fn as_primitive_data(
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
     ) -> crate::vulkan::renderer::PrimitiveData3D;
 }
 
@@ -32,28 +33,26 @@ pub trait Object3D {
 pub struct Sphere3D {
     pub base: crate::mobjects::MobjectBase,
     pub radius: GMFloat,
-    pub color: Color,
+    pub material: SurfaceMaterial,
 }
 
 impl Object3D for Sphere3D {
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat {
         (p - Point3::origin()).norm() - self.radius
     }
-    fn color(&self, _p: &Point3<GMFloat>) -> Color {
-        self.color
+    fn material(&self) -> SurfaceMaterial {
+        self.material
     }
     fn as_primitive_data(
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
         let center = global_mat.transform_point(&Point3::origin());
         crate::vulkan::renderer::PrimitiveData3D {
-            color: [
-                self.color.r as f32 / 255.0,
-                self.color.g as f32 / 255.0,
-                self.color.b as f32 / 255.0,
-                self.color.a as f32 / 255.0,
-            ],
+            material_index,
+            shape_type: 0,
+            padding: [0; 2],
             params: [
                 center.x as f32,
                 center.y as f32,
@@ -68,8 +67,6 @@ impl Object3D for Sphere3D {
                 0.0,
                 0.0,
             ],
-            shape_type: 0,
-            padding: [0; 3],
         }
     }
 }
@@ -82,7 +79,11 @@ impl Mobject for Sphere3D {
         visitor: &mut dyn crate::mobjects::RenderVisitor,
         parent_mat: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
+            geometry: crate::mobjects::Geometry3DRef::Sdf(self),
+            material: self.material,
+            transform: parent_mat * self.base.model_matrix,
+        });
         let global_mat = parent_mat * self.base.model_matrix;
         for child in self.base.children.iter() {
             child.borrow().submit_to_renderer(visitor, global_mat);
@@ -103,7 +104,7 @@ pub struct LineSegment3D {
     pub a: Point3<GMFloat>,
     pub b: Point3<GMFloat>,
     pub radius: GMFloat,
-    pub color: Color,
+    pub material: SurfaceMaterial,
 }
 
 impl Object3D for LineSegment3D {
@@ -113,22 +114,20 @@ impl Object3D for LineSegment3D {
         let h = (pa.dot(&ba) / ba.dot(&ba)).clamp(0.0, 1.0);
         (pa - ba * h).norm() - self.radius
     }
-    fn color(&self, _p: &Point3<GMFloat>) -> Color {
-        self.color
+    fn material(&self) -> SurfaceMaterial {
+        self.material
     }
     fn as_primitive_data(
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
         let a = global_mat.transform_point(&self.a);
         let b = global_mat.transform_point(&self.b);
         crate::vulkan::renderer::PrimitiveData3D {
-            color: [
-                self.color.r as f32 / 255.0,
-                self.color.g as f32 / 255.0,
-                self.color.b as f32 / 255.0,
-                self.color.a as f32 / 255.0,
-            ],
+            material_index,
+            shape_type: 1,
+            padding: [0; 2],
             params: [
                 a.x as f32,
                 a.y as f32,
@@ -143,8 +142,6 @@ impl Object3D for LineSegment3D {
                 0.0,
                 0.0,
             ],
-            shape_type: 1,
-            padding: [0; 3],
         }
     }
 }
@@ -157,7 +154,11 @@ impl Mobject for LineSegment3D {
         visitor: &mut dyn crate::mobjects::RenderVisitor,
         parent_mat: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
+            geometry: crate::mobjects::Geometry3DRef::Sdf(self),
+            material: self.material,
+            transform: parent_mat * self.base.model_matrix,
+        });
         let global_mat = parent_mat * self.base.model_matrix;
         for child in self.base.children.iter() {
             child.borrow().submit_to_renderer(visitor, global_mat);
@@ -193,7 +194,7 @@ pub struct Arrow3D {
     pub shaft_radius: GMFloat,
     pub head_radius: GMFloat,
     pub head_length: GMFloat,
-    pub color: Color,
+    pub material: SurfaceMaterial,
 }
 
 impl Object3D for Arrow3D {
@@ -222,23 +223,21 @@ impl Object3D for Arrow3D {
         d_shaft.min(d_cone)
     }
 
-    fn color(&self, _p: &Point3<GMFloat>) -> Color {
-        self.color
+    fn material(&self) -> SurfaceMaterial {
+        self.material
     }
 
     fn as_primitive_data(
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
         let start = global_mat.transform_point(&self.start);
         let end = global_mat.transform_point(&self.end);
         crate::vulkan::renderer::PrimitiveData3D {
-            color: [
-                self.color.r as f32 / 255.0,
-                self.color.g as f32 / 255.0,
-                self.color.b as f32 / 255.0,
-                self.color.a as f32 / 255.0,
-            ],
+            material_index,
+            shape_type: 2,
+            padding: [0; 2],
             params: [
                 start.x as f32,
                 start.y as f32,
@@ -253,8 +252,6 @@ impl Object3D for Arrow3D {
                 0.0,
                 0.0,
             ],
-            shape_type: 2,
-            padding: [0; 3],
         }
     }
 }
@@ -267,7 +264,11 @@ impl Mobject for Arrow3D {
         visitor: &mut dyn crate::mobjects::RenderVisitor,
         parent_mat: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
+            geometry: crate::mobjects::Geometry3DRef::Sdf(self),
+            material: self.material,
+            transform: parent_mat * self.base.model_matrix,
+        });
         let global_mat = parent_mat * self.base.model_matrix;
         for child in self.base.children.iter() {
             child.borrow().submit_to_renderer(visitor, global_mat);
@@ -288,7 +289,7 @@ pub struct Box3DSdf {
     pub x_axis: Vector3<GMFloat>,
     pub y_axis: Vector3<GMFloat>,
     pub z_axis: Vector3<GMFloat>,
-    pub color: Color,
+    pub material: SurfaceMaterial,
 }
 
 impl Object3D for Box3DSdf {
@@ -310,25 +311,23 @@ impl Object3D for Box3DSdf {
         d_max.norm() + max_comp
     }
 
-    fn color(&self, _p: &Point3<GMFloat>) -> Color {
-        self.color
+    fn material(&self) -> SurfaceMaterial {
+        self.material
     }
 
     fn as_primitive_data(
         &self,
         global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
     ) -> crate::vulkan::renderer::PrimitiveData3D {
         let center = global_mat.transform_point(&Point3::origin());
         let x_axis = global_mat.transform_vector(&self.x_axis);
         let y_axis = global_mat.transform_vector(&self.y_axis);
         let z_axis = global_mat.transform_vector(&self.z_axis);
         crate::vulkan::renderer::PrimitiveData3D {
-            color: [
-                self.color.r as f32 / 255.0,
-                self.color.g as f32 / 255.0,
-                self.color.b as f32 / 255.0,
-                self.color.a as f32 / 255.0,
-            ],
+            material_index,
+            shape_type: 3,
+            padding: [0; 2],
             params: [
                 center.x as f32,
                 center.y as f32,
@@ -343,8 +342,6 @@ impl Object3D for Box3DSdf {
                 y_axis.y as f32,
                 y_axis.z as f32,
             ],
-            shape_type: 3,
-            padding: [0; 3],
         }
     }
 }
@@ -359,7 +356,11 @@ impl Mobject for Box3DSdf {
         visitor: &mut dyn crate::mobjects::RenderVisitor,
         parent_mat: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_object_3d(self, parent_mat * self.base.model_matrix);
+        visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
+            geometry: crate::mobjects::Geometry3DRef::Sdf(self),
+            material: self.material,
+            transform: parent_mat * self.base.model_matrix,
+        });
         let global_mat = parent_mat * self.base.model_matrix;
         for child in self.base.children.iter() {
             child.borrow().submit_to_renderer(visitor, global_mat);

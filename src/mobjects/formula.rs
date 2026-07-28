@@ -73,18 +73,7 @@ fn test_formula_to_mobject() {
         ) {
             self.vertex_count += mesh.vertices().len();
         }
-        fn push_mesh_3d(
-            &mut self,
-            _mesh: &crate::mobjects::mesh_3d::TriangleMesh3D,
-            _transform: nalgebra::Matrix4<crate::GMFloat>,
-        ) {
-        }
-        fn push_object_3d(
-            &mut self,
-            _obj: &dyn crate::mobjects::object_3d::Object3D,
-            _transform: nalgebra::Matrix4<crate::GMFloat>,
-        ) {
-        }
+        fn push_surface_3d(&mut self, _surface: crate::mobjects::Surface3DSubmission<'_>) {}
     }
 
     let mut visitor = TestVisitor { vertex_count: 0 };

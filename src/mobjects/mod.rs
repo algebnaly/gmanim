@@ -20,22 +20,24 @@ use std::rc::Rc;
 
 pub type MobjectRef = Rc<RefCell<dyn Mobject>>;
 
+pub enum Geometry3DRef<'a> {
+    Mesh(&'a crate::mobjects::mesh_3d::TriangleMesh3D),
+    Sdf(&'a dyn crate::mobjects::object_3d::Object3D),
+}
+
+pub struct Surface3DSubmission<'a> {
+    pub geometry: Geometry3DRef<'a>,
+    pub material: crate::mobjects::mesh_3d::SurfaceMaterial,
+    pub transform: nalgebra::Matrix4<crate::GMFloat>,
+}
+
 pub trait RenderVisitor {
     fn push_mesh_2d(
         &mut self,
         mesh: &crate::mobjects::mesh_2d::TriangleMesh2D,
         transform: nalgebra::Matrix4<crate::GMFloat>,
     );
-    fn push_mesh_3d(
-        &mut self,
-        mesh: &crate::mobjects::mesh_3d::TriangleMesh3D,
-        transform: nalgebra::Matrix4<crate::GMFloat>,
-    );
-    fn push_object_3d(
-        &mut self,
-        obj: &dyn crate::mobjects::object_3d::Object3D,
-        transform: nalgebra::Matrix4<crate::GMFloat>,
-    );
+    fn push_surface_3d(&mut self, surface: Surface3DSubmission<'_>);
 }
 
 impl std::fmt::Debug for MobjectBase {

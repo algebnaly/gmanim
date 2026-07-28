@@ -1,5 +1,20 @@
 @group(0) @binding(0) var background: texture_storage_2d<rgba8unorm, read_write>;
 @group(0) @binding(1) var foreground: texture_2d<f32>;
+@group(0) @binding(2) var bloom_image: texture_2d<f32>;
+
+fn aces_tone_map(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp(
+        (color * (a * color + vec3<f32>(b)))
+            / (color * (c * color + vec3<f32>(d)) + vec3<f32>(e)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
 
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
@@ -22,7 +37,11 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         }
     }
     
-    let fg_color = fg_color_sum / f32(ssaa_factor * ssaa_factor);
+    let fg_hdr = fg_color_sum / f32(ssaa_factor * ssaa_factor);
+    let bloom_size = textureDimensions(bloom_image);
+    let bloom_coord = min(global_id.xy * bloom_size / dim, bloom_size - vec2<u32>(1u));
+    let bloom = textureLoad(bloom_image, vec2<i32>(bloom_coord), 0).rgb;
+    let fg_color = vec4<f32>(aces_tone_map(fg_hdr.rgb + bloom * 0.7), fg_hdr.a);
     let bg_color = textureLoad(background, vec2<i32>(global_id.xy));
     
     // Alpha blending

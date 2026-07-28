@@ -149,10 +149,24 @@ pub enum ClipRect {
 pub struct Scene {
     pub mobjects: Vec<mobjects::MobjectRef>,
     pub camera: camera::Camera,
-    pub light_pos: Point3<GMFloat>,
-    pub light_color: Color,
+    pub point_light: PointLight,
+    pub environment_light: EnvironmentLight,
     pub clip_rect: Option<ClipRect>,
     pub aa_level: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct PointLight {
+    pub position: Point3<GMFloat>,
+    pub color: Color,
+    pub intensity: GMFloat,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct EnvironmentLight {
+    pub color: Color,
+    pub intensity: GMFloat,
+    pub rotation_radians: GMFloat,
 }
 
 impl Scene {
@@ -160,8 +174,16 @@ impl Scene {
         Scene {
             mobjects: Vec::new(),
             camera: camera::Camera::default(),
-            light_pos: Point3::new(5.0, 5.0, 5.0),
-            light_color: Color::new(255, 255, 255, 255),
+            point_light: PointLight {
+                position: Point3::new(5.0, 5.0, 5.0),
+                color: Color::new(255, 255, 255, 255),
+                intensity: 180.0,
+            },
+            environment_light: EnvironmentLight {
+                color: Color::new(115, 130, 145, 255),
+                intensity: 0.12,
+                rotation_radians: 0.0,
+            },
             clip_rect: None,
             aa_level: 1,
         }

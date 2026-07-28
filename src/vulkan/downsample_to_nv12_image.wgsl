@@ -2,6 +2,20 @@
 @group(0) @binding(1) var y_plane: texture_storage_2d<r8unorm, write>;
 @group(0) @binding(2) var uv_plane: texture_storage_2d<rg8unorm, write>;
 
+fn aces_tone_map(color: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp(
+        (color * (a * color + vec3<f32>(b)))
+            / (color * (c * color + vec3<f32>(d)) + vec3<f32>(e)),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
+}
+
 fn rgb_to_yuv(rgb: vec3<f32>) -> vec3<f32> {
     let y = 16.0 / 255.0 + 0.256788 * rgb.r + 0.504129 * rgb.g + 0.097906 * rgb.b;
     let u = 128.0 / 255.0 - 0.148223 * rgb.r - 0.290993 * rgb.g + 0.439216 * rgb.b;
@@ -10,12 +24,13 @@ fn rgb_to_yuv(rgb: vec3<f32>) -> vec3<f32> {
 }
 
 fn average_2x2(base: vec2<u32>) -> vec3<f32> {
-    return (
+    let color = (
         textureLoad(input_img, vec2<i32>(base), 0).rgb
         + textureLoad(input_img, vec2<i32>(base + vec2<u32>(1u, 0u)), 0).rgb
         + textureLoad(input_img, vec2<i32>(base + vec2<u32>(0u, 1u)), 0).rgb
         + textureLoad(input_img, vec2<i32>(base + vec2<u32>(1u, 1u)), 0).rgb
     ) * 0.25;
+    return aces_tone_map(color);
 }
 
 @compute @workgroup_size(16, 16, 1)
