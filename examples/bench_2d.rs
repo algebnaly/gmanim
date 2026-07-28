@@ -133,7 +133,7 @@ fn main() {
     assert_eq!(renderer.last_stats().sdf_dispatches, 0);
     assert_eq!(renderer.last_stats().raster_passes, 1);
     assert_eq!(renderer.last_stats().downsample_dispatches, 1);
-    assert_eq!(renderer.last_stats().surface_merge_dispatches, 0);
+    assert_eq!(renderer.last_stats().surface_resolve_dispatches, 0);
     drop(video_backend);
 
     println!("Total time: {:?}", start_time.elapsed());

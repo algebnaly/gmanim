@@ -51,8 +51,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let stats = renderer.last_stats();
     assert_eq!(stats.mesh_3d_opaque_draw_calls, 4);
     assert_eq!(stats.mesh_3d_transparent_draw_calls, 2);
-    assert_eq!(stats.raster_lighting_dispatches, 1);
-    assert_eq!(stats.surface_merge_dispatches, 1);
+    assert_eq!(stats.surface_lighting_dispatches, 1);
+    assert_eq!(stats.surface_resolve_dispatches, 1);
     assert_eq!(stats.tone_map_dispatches, 1);
     assert_eq!(stats.bloom_dispatches, 3);
 
@@ -204,8 +204,31 @@ fn render_scene(
         Some(&mut rgba),
         RenderOutputs::CPU_RGBA_ONLY,
     );
+    assert_visible_frame(path, &rgba);
     write_ppm(path, WIDTH, HEIGHT, &rgba)?;
     Ok(())
+}
+
+fn assert_visible_frame(path: &str, rgba: &[u8]) {
+    let visible_pixels = rgba
+        .chunks_exact(4)
+        .filter(|pixel| pixel[..3].iter().copied().max().unwrap_or(0) > 8)
+        .count();
+    let rgb_energy: u64 = rgba
+        .chunks_exact(4)
+        .flat_map(|pixel| pixel[..3].iter().copied())
+        .map(u64::from)
+        .sum();
+    let average_rgb = rgb_energy as f64 / (WIDTH as f64 * HEIGHT as f64 * 3.0);
+
+    assert!(
+        visible_pixels > 100_000,
+        "{path} lost visible geometry: only {visible_pixels} lit pixels"
+    );
+    assert!(
+        average_rgb > 5.0,
+        "{path} is effectively black: average RGB energy is {average_rgb:.3}"
+    );
 }
 
 fn write_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {

@@ -20,7 +20,7 @@ struct CameraUniform {
     aa_level: u32,
     num_primitives: u32,
     raster_scale: u32,
-    _pad3: u32,
+    has_raster_surfaces: u32,
     proj_mat: mat4x4<f32>,
     light_pos: vec3<f32>,
     light_intensity: f32,
@@ -224,19 +224,6 @@ struct GBufferOutput {
 
 @fragment
 fn fs_gbuffer(in: VertexOutput, @builtin(front_facing) is_front: bool) -> GBufferOutput {
-    if camera.num_primitives > 0u {
-        let depth_dimensions = textureDimensions(sdf_depth);
-        let depth_position = min(
-            vec2<u32>(in.clip_position.xy) / max(camera.raster_scale, 1u),
-            depth_dimensions - vec2<u32>(1),
-        );
-        let sdf_linear_depth = textureLoad(sdf_depth, vec2<i32>(depth_position), 0).r;
-        let mesh_linear_depth = dot(in.frag_pos - camera.pos, normalize(camera.look_at));
-        if sdf_linear_depth + 1e-4 < mesh_linear_depth {
-            discard;
-        }
-    }
-
     let material = materials[in.material_index];
     let geometric_normal = normalize(in.normal);
     let normal = select(-geometric_normal, geometric_normal, is_front);

@@ -22,7 +22,7 @@ struct CameraUniform {
     aa_level: u32,
     num_primitives: u32,
     raster_scale: u32,
-    _pad3: u32,
+    has_raster_surfaces: u32,
     proj_mat: mat4x4<f32>,
     light_pos: vec3<f32>,
     light_intensity: f32,

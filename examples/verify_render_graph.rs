@@ -48,7 +48,7 @@ fn main() {
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &empty, &config);
     assert_eq!(stats.sdf_dispatches, 0);
     assert_eq!(stats.raster_passes, 0);
-    assert_eq!(stats.surface_merge_dispatches, 0);
+    assert_eq!(stats.surface_resolve_dispatches, 0);
     assert_eq!(non_black, 0);
 
     let mut sdf = Scene::default();
@@ -65,7 +65,7 @@ fn main() {
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &sdf, &config);
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 0);
-    assert_eq!(stats.surface_merge_dispatches, 1);
+    assert_eq!(stats.surface_resolve_dispatches, 1);
     assert!(non_black > 100);
 
     let mut raster = Scene::default();
@@ -83,7 +83,7 @@ fn main() {
     assert_eq!(stats.sdf_dispatches, 0);
     assert_eq!(stats.raster_passes, 1);
     assert_eq!(stats.downsample_dispatches, 0);
-    assert_eq!(stats.surface_merge_dispatches, 0);
+    assert_eq!(stats.surface_resolve_dispatches, 0);
     assert!(non_black > 100);
 
     let mut mixed = sdf;
@@ -100,8 +100,15 @@ fn main() {
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &mixed, &config);
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 1);
-    assert_eq!(stats.surface_merge_dispatches, 1);
+    assert_eq!(stats.surface_resolve_dispatches, 1);
     assert!(non_black > 100);
+    let sdf_sample =
+        ((config.output_height / 2 + 12) * config.output_width + config.output_width / 2) as usize;
+    let sdf_pixel = &renderer.get_rgba_bytes().unwrap()[sdf_sample * 4..sdf_sample * 4 + 4];
+    assert!(
+        sdf_pixel[0] > sdf_pixel[1],
+        "2D overlay composition must preserve the SDF surface outside the overlay"
+    );
 
     let depth_scene = |mesh_z| {
         let mut scene = Scene::default();
@@ -141,7 +148,7 @@ fn main() {
         RenderOutputs::CPU_RGBA_ONLY,
     );
     let behind_pixel = &renderer.get_rgba_bytes().unwrap()[center * 4..center * 4 + 4];
-    assert_eq!(renderer.last_stats().raster_lighting_dispatches, 1);
+    assert_eq!(renderer.last_stats().surface_lighting_dispatches, 1);
     assert!(
         behind_pixel[0] > behind_pixel[1],
         "SDF must occlude a raster mesh behind it"
@@ -168,7 +175,7 @@ fn main() {
     );
     let (stats, non_black) =
         render_and_count_non_black(&mut single_sample_renderer, &depth_scene(-1.5), &config);
-    assert_eq!(stats.raster_lighting_dispatches, 1);
+    assert_eq!(stats.surface_lighting_dispatches, 1);
     assert!(non_black > 100);
 
     let mut deferred_with_overlay = Scene::default();
@@ -189,9 +196,9 @@ fn main() {
     deferred_with_overlay.add(overlay);
     let (stats, non_black) =
         render_and_count_non_black(&mut renderer, &deferred_with_overlay, &config);
-    assert_eq!(stats.raster_lighting_dispatches, 1);
+    assert_eq!(stats.surface_lighting_dispatches, 1);
     assert_eq!(stats.mesh_2d_draw_calls, 1);
-    assert_eq!(stats.surface_merge_dispatches, 1);
+    assert_eq!(stats.surface_resolve_dispatches, 1);
     assert!(non_black > 100);
 
     println!("render graph verification passed");
