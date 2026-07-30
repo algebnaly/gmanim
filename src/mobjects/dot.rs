@@ -9,11 +9,10 @@ use std::f32::consts::PI;
 
 use crate::{
     Color, Context, GMFloat,
-    mobjects::{Draw, DrawConfig, Mobject, Transform},
+    mobjects::{Draw, DrawConfig, Mobject},
 };
 
 pub struct Dot {
-    pub base: crate::mobjects::MobjectBase,
     pub position: Point3<GMFloat>,
     pub radius: GMFloat,
     pub color: Color,
@@ -24,7 +23,6 @@ pub struct Dot {
 impl Default for Dot {
     fn default() -> Self {
         Self {
-            base: crate::mobjects::MobjectBase::new("Dot"),
             position: Point3::origin(),
             radius: 0.05,
             color: Color::default(),
@@ -42,7 +40,6 @@ impl Dot {
         draw_config: DrawConfig,
     ) -> Self {
         Self {
-            base: crate::mobjects::MobjectBase::new("Dot"),
             position,
             radius,
             color,
@@ -57,22 +54,15 @@ impl Draw for Dot {
 }
 
 impl Mobject for Dot {
+    fn default_name(&self) -> &'static str {
+        "Dot"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }

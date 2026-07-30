@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         RendererConfig {
             msaa_samples: 4,
             ssaa_factor: 1,
+            output_color_profile: Default::default(),
         },
     );
     renderer.set_bloom_enabled(true);
@@ -34,6 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         output_width: WIDTH,
         output_height: HEIGHT,
         scale_factor: WIDTH as f32 / 16.0,
+        framerate: 60,
     };
 
     render_scene(

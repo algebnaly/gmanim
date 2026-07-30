@@ -1,7 +1,7 @@
 use gmanim_core::{
     Color, RendererConfig, Scene, SceneConfig,
     mobjects::{
-        MobjectBase, Rectangle, Transform,
+        Rectangle,
         mesh_3d::{SurfaceMaterial, TriangleMesh3D},
         object_3d::Sphere3D,
     },
@@ -34,6 +34,7 @@ fn main() {
         output_width: 320,
         output_height: 180,
         scale_factor: 20.0,
+        framerate: 60,
     };
     let context = VulkanContext::new().unwrap();
     let mut renderer = VulkanRenderer::new(
@@ -41,6 +42,7 @@ fn main() {
         RendererConfig {
             msaa_samples: 4,
             ssaa_factor: 1,
+            output_color_profile: Default::default(),
         },
     );
 
@@ -54,16 +56,18 @@ fn main() {
     assert_eq!(non_black, 0);
 
     let mut sdf = Scene::default();
-    let mut sphere = Sphere3D {
-        base: MobjectBase::new("verify-sphere"),
+    let sphere = Sphere3D {
         radius: 1.0,
         material: SurfaceMaterial {
             base_color: [0.86, 0.31, 0.24, 1.0],
             ..Default::default()
         },
     };
-    sphere.move_this(nalgebra::Vector3::new(0.0, 0.0, -3.0));
-    sdf.add(sphere);
+    let sphere = sdf.add_named("verify-sphere", sphere);
+    sdf.world
+        .get_mut(sphere)
+        .unwrap()
+        .move_by(nalgebra::Vector3::new(0.0, 0.0, -3.0));
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &sdf, &config);
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 0);
@@ -73,7 +77,7 @@ fn main() {
     assert!(non_black > 100);
 
     let mut raster = Scene::default();
-    let mut rectangle = Rectangle {
+    let rectangle = Rectangle {
         p0: nalgebra::Point3::new(-2.0, -1.0, 0.0),
         p1: nalgebra::Point3::new(2.0, -1.0, 0.0),
         p2: nalgebra::Point3::new(2.0, 1.0, 0.0),
@@ -81,8 +85,7 @@ fn main() {
         color: Color::new(40, 180, 240, 255),
         ..Default::default()
     };
-    rectangle.update_mesh();
-    raster.add(rectangle);
+    let rectangle = raster.add_rectangle(rectangle);
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &raster, &config);
     assert_eq!(stats.sdf_dispatches, 0);
     assert_eq!(stats.raster_passes, 1);
@@ -91,9 +94,27 @@ fn main() {
     assert_eq!(stats.surface_lighting_dispatches, 0);
     assert_eq!(stats.surface_composite_dispatches, 0);
     assert!(non_black > 100);
+    let original_non_black = non_black;
+
+    raster
+        .world
+        .set_rectangle_corners(
+            rectangle,
+            [
+                nalgebra::Point3::new(-3.0, -0.25, 0.0),
+                nalgebra::Point3::new(3.0, -0.25, 0.0),
+                nalgebra::Point3::new(1.0, 0.25, 0.0),
+                nalgebra::Point3::new(-1.0, 0.25, 0.0),
+            ],
+        )
+        .unwrap();
+    let (stats, non_black) = render_and_count_non_black(&mut renderer, &raster, &config);
+    assert_eq!(stats.mesh_2d_geometry_uploads, 1);
+    assert_eq!(stats.mesh_2d_arena_rebuilds, 0);
+    assert!(non_black < original_non_black);
 
     let mut mixed = sdf;
-    let mut overlay = Rectangle {
+    let overlay = Rectangle {
         p0: nalgebra::Point3::new(-0.7, -0.2, 0.0),
         p1: nalgebra::Point3::new(0.7, -0.2, 0.0),
         p2: nalgebra::Point3::new(0.7, 0.2, 0.0),
@@ -101,8 +122,7 @@ fn main() {
         color: Color::new(30, 220, 120, 255),
         ..Default::default()
     };
-    overlay.update_mesh();
-    mixed.add(overlay);
+    mixed.add_rectangle(overlay);
     let (stats, non_black) = render_and_count_non_black(&mut renderer, &mixed, &config);
     assert_eq!(stats.sdf_dispatches, 1);
     assert_eq!(stats.raster_passes, 1);
@@ -120,8 +140,7 @@ fn main() {
 
     let depth_scene = |mesh_z| {
         let mut scene = Scene::default();
-        let mut sphere = Sphere3D {
-            base: MobjectBase::new("depth-sphere"),
+        let sphere = Sphere3D {
             radius: 1.0,
             material: SurfaceMaterial {
                 base_color: [0.9, 0.08, 0.03, 1.0],
@@ -130,8 +149,12 @@ fn main() {
                 ..Default::default()
             },
         };
-        sphere.move_this(nalgebra::Vector3::new(0.0, 0.0, -3.0));
-        scene.add(sphere);
+        let sphere = scene.add_named("depth-sphere", sphere);
+        scene
+            .world
+            .get_mut(sphere)
+            .unwrap()
+            .move_by(nalgebra::Vector3::new(0.0, 0.0, -3.0));
         scene.add(
             TriangleMesh3D::box_mesh(
                 nalgebra::Point3::new(0.0, 0.0, mesh_z),
@@ -179,6 +202,7 @@ fn main() {
         RendererConfig {
             msaa_samples: 1,
             ssaa_factor: 1,
+            output_color_profile: Default::default(),
         },
     );
     let (stats, non_black) =
@@ -192,7 +216,7 @@ fn main() {
         nalgebra::Vector3::new(0.8, 0.8, 0.8),
         Color::new(40, 120, 230, 255),
     ));
-    let mut overlay = Rectangle {
+    let overlay = Rectangle {
         p0: nalgebra::Point3::new(-0.4, -0.1, 0.0),
         p1: nalgebra::Point3::new(0.4, -0.1, 0.0),
         p2: nalgebra::Point3::new(0.4, 0.1, 0.0),
@@ -200,8 +224,7 @@ fn main() {
         color: Color::new(255, 240, 30, 255),
         ..Default::default()
     };
-    overlay.update_mesh();
-    deferred_with_overlay.add(overlay);
+    deferred_with_overlay.add_rectangle(overlay);
     let (stats, non_black) =
         render_and_count_non_black(&mut renderer, &deferred_with_overlay, &config);
     assert_eq!(stats.surface_lighting_dispatches, 1);

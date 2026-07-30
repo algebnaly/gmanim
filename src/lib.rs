@@ -1,8 +1,5 @@
 #![allow(unused)]
 
-use std::cell::RefCell;
-use std::rc::Rc;
-
 use mobjects::{coordinate_change_x, coordinate_change_y};
 
 pub mod camera;
@@ -28,7 +25,7 @@ cfg_if::cfg_if! {
 }
 
 pub type GMPoint = Point3<GMFloat>;
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Color {
     pub r: u8,
     pub g: u8,
@@ -71,12 +68,28 @@ pub struct SceneConfig {
     pub output_width: u32,
     pub output_height: u32,
     pub scale_factor: GMFloat,
+    pub framerate: u32,
 }
 
 #[derive(Clone, Copy)]
 pub struct RendererConfig {
     pub msaa_samples: u32,
     pub ssaa_factor: u32,
+    pub output_color_profile: OutputColorProfile,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum OutputColorProfile {
+    #[default]
+    Bt709Sdr,
+    Bt2020Pq,
+    Bt2020Hlg,
+}
+
+impl OutputColorProfile {
+    pub const fn is_hdr(self) -> bool {
+        matches!(self, Self::Bt2020Pq | Self::Bt2020Hlg)
+    }
 }
 
 impl Default for RendererConfig {
@@ -84,10 +97,12 @@ impl Default for RendererConfig {
         Self {
             msaa_samples: 8,
             ssaa_factor: 1,
+            output_color_profile: OutputColorProfile::Bt709Sdr,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct Context {
     pub scene_config: SceneConfig,
 }
@@ -99,6 +114,7 @@ impl Context {
         output_width: u32,
         output_height: u32,
         scale_factor: GMFloat,
+        framerate: u32,
     ) -> Self {
         Context {
             scene_config: SceneConfig {
@@ -107,6 +123,7 @@ impl Context {
                 output_width,
                 output_height,
                 scale_factor,
+                framerate,
             },
         }
     }
@@ -129,6 +146,7 @@ impl Default for SceneConfig {
             output_width: 1920,
             output_height: 1080,
             scale_factor: 1920.0 / 16.0,
+            framerate: 60,
         }
     }
 }
@@ -140,14 +158,15 @@ impl Default for Context {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ClipRect {
     Logical(f32, f32, f32, f32), // center_x, center_y, width, height
     Pixel(u32, u32, u32, u32),   // top_left_x, top_left_y, width, height
 }
 
+#[derive(Clone)]
 pub struct Scene {
-    pub mobjects: Vec<mobjects::MobjectRef>,
+    pub world: mobjects::SceneWorld,
     pub camera: camera::Camera,
     pub point_light: PointLight,
     pub environment_light: EnvironmentLight,
@@ -155,14 +174,24 @@ pub struct Scene {
     pub aa_level: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone)]
+pub struct SceneSnapshot {
+    world: mobjects::SceneWorld,
+    camera: camera::Camera,
+    point_light: PointLight,
+    environment_light: EnvironmentLight,
+    clip_rect: Option<ClipRect>,
+    aa_level: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointLight {
     pub position: Point3<GMFloat>,
     pub color: Color,
     pub intensity: GMFloat,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct EnvironmentLight {
     pub color: Color,
     pub intensity: GMFloat,
@@ -170,9 +199,40 @@ pub struct EnvironmentLight {
 }
 
 impl Scene {
+    pub fn snapshot(&self) -> SceneSnapshot {
+        SceneSnapshot {
+            world: self.world.clone(),
+            camera: self.camera.clone(),
+            point_light: self.point_light,
+            environment_light: self.environment_light,
+            clip_rect: self.clip_rect,
+            aa_level: self.aa_level,
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: &SceneSnapshot) {
+        self.world = snapshot.world.clone();
+        self.camera = snapshot.camera.clone();
+        self.point_light = snapshot.point_light;
+        self.environment_light = snapshot.environment_light;
+        self.clip_rect = snapshot.clip_rect;
+        self.aa_level = snapshot.aa_level;
+    }
+
+    pub fn from_snapshot(snapshot: &SceneSnapshot) -> Self {
+        Self {
+            world: snapshot.world.clone(),
+            camera: snapshot.camera.clone(),
+            point_light: snapshot.point_light,
+            environment_light: snapshot.environment_light,
+            clip_rect: snapshot.clip_rect,
+            aa_level: snapshot.aa_level,
+        }
+    }
+
     pub fn new() -> Self {
         Scene {
-            mobjects: Vec::new(),
+            world: mobjects::SceneWorld::default(),
             camera: camera::Camera::default(),
             point_light: PointLight {
                 position: Point3::new(5.0, 5.0, 5.0),
@@ -190,6 +250,12 @@ impl Scene {
     }
 }
 
+impl SceneSnapshot {
+    pub(crate) fn synchronize_identities_from(&mut self, scene: &Scene) {
+        self.world.synchronize_identities_from(&scene.world);
+    }
+}
+
 impl Default for Scene {
     fn default() -> Self {
         Scene::new()
@@ -197,12 +263,31 @@ impl Default for Scene {
 }
 
 impl Scene {
-    pub fn add(&mut self, mobject: impl mobjects::Mobject + 'static) {
-        self.mobjects
-            .push(std::rc::Rc::new(std::cell::RefCell::new(mobject)));
+    pub fn add(&mut self, mobject: impl mobjects::Mobject) -> mobjects::MobjectId {
+        self.world.spawn(mobject)
     }
 
-    pub fn add_ref(&mut self, mobject: mobjects::MobjectRef) {
-        self.mobjects.push(mobject);
+    pub fn add_named(
+        &mut self,
+        name: impl Into<String>,
+        mobject: impl mobjects::Mobject,
+    ) -> mobjects::MobjectId {
+        self.world.spawn_named(name, mobject)
+    }
+
+    pub fn add_rectangle(&mut self, rectangle: mobjects::Rectangle) -> mobjects::MobjectId {
+        self.world.spawn_rectangle(rectangle)
+    }
+
+    pub fn add_rectangle_named(
+        &mut self,
+        name: impl Into<String>,
+        rectangle: mobjects::Rectangle,
+    ) -> mobjects::MobjectId {
+        self.world.spawn_rectangle_named(name, rectangle)
+    }
+
+    pub fn add_tree(&mut self, bundle: mobjects::NodeBundle) -> mobjects::MobjectId {
+        self.world.spawn_tree(bundle)
     }
 }

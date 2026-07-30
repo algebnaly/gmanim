@@ -118,6 +118,11 @@ impl Encoder {
 
     /// Create a new encoder with an explicit VAAPI device path.
     fn try_new(config: &VideoConfig, vaapi_device: &str) -> io::Result<Self> {
+        if config.output_color_profile != crate::OutputColorProfile::Bt709Sdr {
+            return Err(io::Error::other(
+                "VAAPI H.264 currently supports only 8-bit BT.709 SDR output",
+            ));
+        }
         ffmpeg_next::init().map_err(io::Error::other)?;
 
         #[cfg(not(test))]
@@ -267,6 +272,10 @@ impl Encoder {
         (*ctx).bit_rate = config.bitrate.unwrap_or(2_000_000) as i64;
         (*ctx).gop_size = config.framerate as i32;
         (*ctx).max_b_frames = 0;
+        (*ctx).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+        (*ctx).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*ctx).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*ctx).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         (*ctx).hw_frames_ctx = ffi::av_buffer_ref(frames_ref);
         if (*ctx).hw_frames_ctx.is_null() {
             return Err(io::Error::other("av_buffer_ref for hw_frames_ctx failed"));
@@ -286,6 +295,10 @@ impl Encoder {
         (*frame).format = ffi::AVPixelFormat::AV_PIX_FMT_NV12 as i32;
         (*frame).width = config.output_width as i32;
         (*frame).height = config.output_height as i32;
+        (*frame).color_range = ffi::AVColorRange::AVCOL_RANGE_MPEG;
+        (*frame).colorspace = ffi::AVColorSpace::AVCOL_SPC_BT709;
+        (*frame).color_primaries = ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+        (*frame).color_trc = ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         check("av_frame_get_buffer", ffi::av_frame_get_buffer(frame, 32))?;
         Ok(frame)
     }
@@ -637,7 +650,7 @@ fn convert_rgba_to_nv12(
             rgba,
             (width * 4) as u32,
             YuvRange::Limited,
-            YuvStandardMatrix::Bt601,
+            YuvStandardMatrix::Bt709,
             YuvConversionMode::Fast,
         )
         .expect("RGBA/BGRA → NV12 conversion failed");

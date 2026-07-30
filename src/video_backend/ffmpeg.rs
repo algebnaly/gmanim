@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::time::Instant;
 
 use ffmpeg_next::format::{Pixel, pixel};
+use ffmpeg_next::util::color;
 
 use ffmpeg_next::Dictionary;
 use ffmpeg_next::{ChannelLayout, StreamMut};
@@ -28,6 +29,11 @@ pub struct FfmpegBackend {
 
 impl FfmpegBackend {
     pub fn new(video_config: &VideoConfig) -> Self {
+        assert_eq!(
+            video_config.output_color_profile,
+            crate::OutputColorProfile::Bt709Sdr,
+            "FFmpeg backend currently supports only 8-bit BT.709 SDR output"
+        );
         ffmpeg_next::init().unwrap();
 
         #[cfg(not(test))]
@@ -57,6 +63,8 @@ impl FfmpegBackend {
         }
         v_enc.set_time_base((1, video_config.framerate as i32));
         v_enc.set_gop(12);
+        v_enc.set_colorspace(color::Space::BT709);
+        v_enc.set_color_range(color::Range::MPEG);
         if let Some(br) = video_config.bitrate {
             v_enc.set_bit_rate(br as usize);
         }
@@ -68,6 +76,10 @@ impl FfmpegBackend {
         let mut v_opts = Dictionary::new();
         v_opts.set("preset", "ultrafast");
         v_opts.set("tune", "fastdecode");
+        v_opts.set(
+            "x264-params",
+            "colorprim=bt709:transfer=bt709:colormatrix=bt709:range=limited",
+        );
 
         let v_enc = v_enc
             .open_as_with(v_codec, v_opts)
@@ -126,6 +138,10 @@ impl FfmpegBackend {
                 _ => Pixel::NV12,
             };
             output_frame.alloc(pix_fmt, width, height);
+            output_frame.set_color_space(color::Space::BT709);
+            output_frame.set_color_range(color::Range::MPEG);
+            output_frame.set_color_primaries(color::Primaries::BT709);
+            output_frame.set_color_transfer_characteristic(color::TransferCharacteristic::BT709);
 
             if matches!(self.color_order, crate::video_backend::ColorOrder::Yuv444p) {
                 // YUV444p has 3 planes (Y, U, V), each full resolution WxH
@@ -286,7 +302,7 @@ fn do_scale(
         input_frame.data(0),
         width * 4,
         YuvRange::Limited,
-        YuvStandardMatrix::Bt601,
+        YuvStandardMatrix::Bt709,
         YuvConversionMode::Fast,
     );
 }
@@ -470,7 +486,7 @@ fn test_bench_scaler() {
         //     input_frame.data(0),
         //     width * 4,
         //     YuvRange::Limited,
-        //     YuvStandardMatrix::Bt601,
+        //     YuvStandardMatrix::Bt709,
         //     YuvConversionMode::Balanced,
         // );
     }

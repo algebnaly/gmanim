@@ -25,7 +25,7 @@ impl Formula {
         .unwrap();
     }
 
-    pub fn to_mobject(&self) -> crate::mobjects::group::MobjectGroup {
+    pub fn to_node_bundle(&self) -> crate::mobjects::NodeBundle {
         let typst_path = "formula_temp.typst";
         let svg_path = "formula_temp.svg";
         self.write_to_typst(typst_path);
@@ -53,14 +53,14 @@ pub fn compile_to_svg(typst_file_path: &str, svg_file_path: &str) {
 }
 
 #[test]
-fn test_formula_to_mobject() {
+fn test_formula_to_node_bundle() {
     let f = Formula::new("pi");
-    let mut mobj = f.to_mobject();
+    let tree = f.to_node_bundle();
 
     // The SVGShape parser should have populated the elements,
     // but update_mesh() must be called to populate the mesh.
     // In our open_svg_file, update_mesh is already called!
-    use crate::mobjects::{Mobject, RenderVisitor};
+    use crate::mobjects::RenderVisitor;
 
     struct TestVisitor {
         vertex_count: usize,
@@ -73,11 +73,23 @@ fn test_formula_to_mobject() {
         ) {
             self.vertex_count += mesh.vertices().len();
         }
+        fn push_rectangle_2d(
+            &mut self,
+            _id: crate::mobjects::RectangleId,
+            rectangle: &crate::mobjects::Rectangle,
+            _geometry_revision: u64,
+            _dynamic: bool,
+            _transform: nalgebra::Matrix4<crate::GMFloat>,
+        ) {
+            self.vertex_count += rectangle.tessellate().vertices().len();
+        }
         fn push_surface_3d(&mut self, _surface: crate::mobjects::Surface3DSubmission<'_>) {}
     }
 
     let mut visitor = TestVisitor { vertex_count: 0 };
-    mobj.submit_to_renderer(&mut visitor, nalgebra::Matrix4::identity());
+    let mut scene = crate::Scene::default();
+    scene.add_tree(tree);
+    scene.world.submit_to_renderer(&mut visitor);
 
     assert!(
         visitor.vertex_count > 0,

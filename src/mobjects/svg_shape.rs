@@ -4,13 +4,13 @@ use nalgebra::Vector2;
 use usvg::{Group, Node, tiny_skia_path::PathSegment};
 
 use crate::{
-    Context, GMFloat, Scene,
+    Context, GMFloat,
     math_utils::{point2d_to_point3d, point3d_to_point2d},
 };
 
 use super::{
-    Draw, DrawConfig, Mobject, Transform, coordinate_change_x, coordinate_change_y,
-    group::MobjectGroup, path::PathElement,
+    Draw, DrawConfig, Mobject, NodeBundle, coordinate_change_x, coordinate_change_y,
+    path::PathElement,
 };
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
@@ -21,7 +21,6 @@ use lyon::tessellation::{
 
 #[derive(Debug)]
 pub struct SVGPath {
-    pub base: crate::mobjects::MobjectBase,
     pub elements: Vec<PathElement>,
     pub is_closed: bool,
     pub draw_config: DrawConfig,
@@ -31,7 +30,6 @@ pub struct SVGPath {
 impl SVGPath {
     pub fn new() -> Self {
         Self {
-            base: crate::mobjects::MobjectBase::new("SVGPath"),
             elements: vec![],
             is_closed: false,
             draw_config: Default::default(),
@@ -165,27 +163,20 @@ impl Draw for SVGPath {
 }
 
 impl Mobject for SVGPath {
+    fn default_name(&self) -> &'static str {
+        "SVGPath"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }
 
-pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
+pub fn open_svg_file(svg_filepath: &str) -> NodeBundle {
     let mut svg_file = fs::File::options()
         .read(true)
         .open(svg_filepath)
@@ -222,17 +213,11 @@ pub fn open_svg_file(svg_filepath: &str) -> MobjectGroup {
         extract_paths(&node, &mut paths);
     }
 
-    let mut grp_mobj = MobjectGroup {
-        base: crate::mobjects::MobjectBase::new("FormulaGroup"),
-    };
-    grp_mobj.base.children = paths
-        .into_iter()
-        .map(|p| std::rc::Rc::new(std::cell::RefCell::new(p)) as crate::mobjects::MobjectRef)
-        .collect();
     let scaling_matrix =
         nalgebra::Matrix4::new_nonuniform_scaling(&nalgebra::Vector3::new(0.01, -0.01, 1.0));
-    grp_mobj.apply_transform(scaling_matrix);
-    grp_mobj
+    let mut root = NodeBundle::group("SvgRoot").with_transform(scaling_matrix);
+    root.children = paths.into_iter().map(NodeBundle::new).collect();
+    root
 }
 
 fn map_point(

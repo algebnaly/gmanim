@@ -23,6 +23,7 @@ gpu-allocator = { version = "0.28.0", features = ["vulkan"] }
 naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
 lyon = "1.0.19"
 memoffset = "0.9.1"
+slotmap = "1.0.7"
 
 [features]
 default = ["gmfloat_f32"]

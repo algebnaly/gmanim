@@ -6,12 +6,11 @@ use lyon::tessellation::{
 };
 use nalgebra::Point3;
 
-use crate::{Color, Context, GMFloat, GMPoint, Scene};
+use crate::{Color, Context, GMFloat, GMPoint};
 
-use super::{Draw, DrawConfig, Mobject, Transform};
+use super::{Draw, DrawConfig, Mobject};
 
 pub struct Polygon {
-    pub base: crate::mobjects::MobjectBase,
     pub vertices: Vec<GMPoint>,
     pub draw_config: DrawConfig,
     pub mesh: TriangleMesh2D,
@@ -20,7 +19,6 @@ pub struct Polygon {
 impl Polygon {
     pub fn new(vertices: Vec<GMPoint>) -> Self {
         let mut p = Self {
-            base: crate::mobjects::MobjectBase::new("Polygon"),
             vertices,
             draw_config: DrawConfig::default(),
             mesh: TriangleMesh2D::default(),
@@ -79,22 +77,15 @@ impl Draw for Polygon {
 }
 
 impl Mobject for Polygon {
+    fn default_name(&self) -> &'static str {
+        "Polygon"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }

@@ -1,9 +1,9 @@
 use nalgebra::Point3;
 use std::f32::consts::PI;
 
-use crate::{Color, Context, GMFloat, Scene, math_utils::k_for_bezier_arc};
+use crate::{Color, Context, GMFloat, math_utils::k_for_bezier_arc};
 
-use super::{Draw, DrawConfig, Mobject, Transform};
+use super::{Draw, DrawConfig, Mobject};
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
 use lyon::path::Path;
@@ -11,34 +11,31 @@ use lyon::tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
 };
 
+#[derive(Clone, Debug)]
 pub struct Rectangle {
-    pub base: crate::mobjects::MobjectBase,
     pub p0: Point3<GMFloat>, // Top left
     pub p1: Point3<GMFloat>, // Bottom left
     pub p2: Point3<GMFloat>, // Bottom right
     pub p3: Point3<GMFloat>, // Top right
     pub color: Color,
     pub draw_config: DrawConfig,
-    pub mesh: TriangleMesh2D,
 }
 
 impl Default for Rectangle {
     fn default() -> Self {
         Rectangle {
-            base: crate::mobjects::MobjectBase::new("Rectangle"),
             p0: Point3::new(0.0, 0.0, 0.0),
             p1: Point3::new(1.0, 0.0, 0.0),
             p2: Point3::new(1.0, 1.0, 0.0),
             p3: Point3::new(0.0, 1.0, 0.0),
             color: Color::default(),
             draw_config: DrawConfig::default(),
-            mesh: TriangleMesh2D::default(),
         }
     }
 }
 
 impl Rectangle {
-    pub fn update_mesh(&mut self) {
+    pub fn tessellate(&self) -> TriangleMesh2D {
         let mut builder = Path::builder();
         builder.begin(point(self.p0.x as f32, self.p0.y as f32));
         builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
@@ -70,41 +67,33 @@ impl Rectangle {
                 .unwrap();
         }
 
-        self.mesh
-            .replace_geometry(geometry.vertices, geometry.indices, self.color);
-    }
-}
-
-impl Draw for Rectangle {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {
-        // empty
-    }
-}
-
-impl Mobject for Rectangle {
-    fn submit_to_renderer(
-        &self,
-        visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
-    ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
+        TriangleMesh2D::new(geometry.vertices, geometry.indices, self.color)
     }
 
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
+    pub fn corners(&self) -> [Point3<GMFloat>; 4] {
+        [self.p0, self.p1, self.p2, self.p3]
     }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+
+    pub fn set_corners(&mut self, corners: [Point3<GMFloat>; 4]) {
+        [self.p0, self.p1, self.p2, self.p3] = corners;
+    }
+
+    pub fn same_geometry(&self, other: &Self) -> bool {
+        self.corners()
+            .into_iter()
+            .zip(other.corners())
+            .all(|(left, right)| {
+                left.x.to_bits() == right.x.to_bits()
+                    && left.y.to_bits() == right.y.to_bits()
+                    && left.z.to_bits() == right.z.to_bits()
+            })
+            && self.draw_config.fill == other.draw_config.fill
+            && self.draw_config.stoke_width.to_bits() == other.draw_config.stoke_width.to_bits()
     }
 }
 
 #[derive(Default)]
 pub struct SimpleLine {
-    pub base: crate::mobjects::MobjectBase,
     pub p0: Point3<GMFloat>,
     pub p1: Point3<GMFloat>,
     pub draw_config: DrawConfig,
@@ -114,7 +103,6 @@ pub struct SimpleLine {
 impl SimpleLine {
     pub fn new(p0: Point3<GMFloat>, p1: Point3<GMFloat>) -> Self {
         let mut sl = Self {
-            base: crate::mobjects::MobjectBase::new("SimpleLine"),
             p0,
             p1,
             draw_config: DrawConfig::default(),
@@ -156,29 +144,21 @@ impl Draw for SimpleLine {
 }
 
 impl Mobject for SimpleLine {
+    fn default_name(&self) -> &'static str {
+        "SimpleLine"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }
 
 #[derive(Default)]
 pub struct PolyLine {
-    pub base: crate::mobjects::MobjectBase,
     pub points: Vec<Point3<GMFloat>>,
     pub draw_config: DrawConfig,
     pub mesh: TriangleMesh2D,
@@ -187,7 +167,6 @@ pub struct PolyLine {
 impl PolyLine {
     pub fn new(points: Vec<Point3<GMFloat>>) -> Self {
         let mut pl = Self {
-            base: crate::mobjects::MobjectBase::new("PolyLine"),
             points,
             draw_config: DrawConfig::default(),
             mesh: TriangleMesh2D::default(),
@@ -198,7 +177,6 @@ impl PolyLine {
 }
 
 pub struct Arc {
-    pub base: crate::mobjects::MobjectBase,
     pub center_point: Point3<GMFloat>,
     pub start_angle: GMFloat,
     pub end_angle: GMFloat,
@@ -215,7 +193,6 @@ impl Arc {
         radius: GMFloat,
     ) -> Self {
         let mut a = Self {
-            base: crate::mobjects::MobjectBase::new("Arc"),
             center_point,
             start_angle,
             end_angle,
@@ -294,23 +271,16 @@ impl Draw for Arc {
 }
 
 impl Mobject for Arc {
+    fn default_name(&self) -> &'static str {
+        "Arc"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }
 
@@ -366,22 +336,15 @@ impl Draw for PolyLine {
 }
 
 impl Mobject for PolyLine {
+    fn default_name(&self) -> &'static str {
+        "PolyLine"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, parent_mat * self.base.model_matrix);
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+        visitor.push_mesh_2d(&self.mesh, world_transform);
     }
 }

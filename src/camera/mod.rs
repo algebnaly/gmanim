@@ -3,7 +3,7 @@ use crate::math_utils::constants::PI;
 use nalgebra::{Isometry3, Matrix4, Perspective3, Point3, Vector3, Vector4};
 use usvg::tiny_skia_path::Scalar;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Camera {
     pub position: Point3<GMFloat>,
     look_at: Vector3<GMFloat>, // attention that this vector is assumed to be a unit vector
@@ -11,7 +11,7 @@ pub struct Camera {
     projection: Projection,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Projection {
     Perspective(PerspectiveSetting),
     Orthographic(OrthographicSetting),
@@ -75,7 +75,7 @@ impl Default for Projection {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PerspectiveSetting {
     near: GMFloat,
     far: GMFloat,
@@ -95,6 +95,19 @@ impl Default for PerspectiveSetting {
 }
 
 impl PerspectiveSetting {
+    pub fn new(aspect: GMFloat, fovy: GMFloat, near: GMFloat, far: GMFloat) -> Self {
+        Self {
+            near,
+            far,
+            fovy,
+            aspect,
+        }
+    }
+
+    pub fn params(&self) -> (GMFloat, GMFloat, GMFloat, GMFloat) {
+        (self.aspect, self.fovy, self.near, self.far)
+    }
+
     pub fn get_perspective_project_matrix(&self) -> Matrix4<GMFloat> {
         let mut mat = Perspective3::new(self.aspect, self.fovy, self.near, self.far)
             .as_matrix()
@@ -104,7 +117,7 @@ impl PerspectiveSetting {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct OrthographicSetting {
     left: GMFloat,
     right: GMFloat,
@@ -131,6 +144,17 @@ impl OrthographicSetting {
             near,
             far,
         }
+    }
+
+    pub fn params(&self) -> (GMFloat, GMFloat, GMFloat, GMFloat, GMFloat, GMFloat) {
+        (
+            self.left,
+            self.right,
+            self.bottom,
+            self.top,
+            self.near,
+            self.far,
+        )
     }
     pub fn get_orthographic_project_matrix(&self) -> Matrix4<GMFloat> {
         Matrix4::from_columns(&[
@@ -169,6 +193,13 @@ impl Default for Camera {
             Projection::default(),
         )
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraPose {
+    pub position: Point3<GMFloat>,
+    pub look_at: Vector3<GMFloat>,
+    pub up_direction: Vector3<GMFloat>,
 }
 
 impl Camera {
@@ -228,6 +259,24 @@ impl Camera {
     pub fn set_up_direction(&mut self, up_direction: Vector3<GMFloat>) {
         self.up_direction = up_direction.normalize();
     }
+    pub fn pose(&self) -> CameraPose {
+        CameraPose {
+            position: self.position,
+            look_at: self.look_at,
+            up_direction: self.up_direction,
+        }
+    }
+    pub fn set_pose(&mut self, pose: CameraPose) {
+        self.position = pose.position;
+        self.set_look_at(pose.look_at);
+        self.set_up_direction(pose.up_direction);
+    }
+    pub fn projection(&self) -> &Projection {
+        &self.projection
+    }
+    pub fn set_projection(&mut self, projection: Projection) {
+        self.projection = projection;
+    }
     pub fn set_orthographic(
         &mut self,
         left: GMFloat,
@@ -242,12 +291,7 @@ impl Camera {
         ));
     }
     pub fn set_perspective(&mut self, fovy: GMFloat, aspect: GMFloat, near: GMFloat, far: GMFloat) {
-        self.projection = Projection::Perspective(PerspectiveSetting {
-            fovy,
-            aspect,
-            near,
-            far,
-        });
+        self.projection = Projection::Perspective(PerspectiveSetting::new(aspect, fovy, near, far));
     }
     pub fn get_camera_transform_matrix(&self) -> Matrix4<GMFloat> {
         Isometry3::look_at_rh(

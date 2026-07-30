@@ -1,6 +1,6 @@
 use std::f32::INFINITY;
 
-use crate::{Color, math_utils::constants::PI, mobjects::Transform};
+use crate::{Color, math_utils::constants::PI};
 use nalgebra::{Isometry2, Matrix2, Point2, Point3, Point4, RealField};
 
 use crate::{GMFloat, camera::Camera};

@@ -64,6 +64,7 @@ pub struct VideoConfig {
     pub output_height: u32,
     pub color_order: ColorOrder,
     pub bitrate: Option<u64>,
+    pub output_color_profile: crate::OutputColorProfile,
 }
 
 pub enum FfmpegPipeEncoder {
@@ -171,6 +172,20 @@ impl FfmpegPipeOutputOptionBuilder {
 
         self.specify_hwaccel_device_option(args);
         self.specify_quality_option(args);
+        args.extend(
+            [
+                "-color_range",
+                "tv",
+                "-colorspace",
+                "bt709",
+                "-color_primaries",
+                "bt709",
+                "-color_trc",
+                "bt709",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
     }
     fn specify_hwaccel_device_option(&self, args: &mut Vec<String>) {
         if matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
@@ -225,6 +240,11 @@ impl FfmpegPipeBackend {
         encoder_config: FfmpegPipeEncoder,
         high_profile: bool,
     ) -> Self {
+        assert_eq!(
+            video_config.output_color_profile,
+            crate::OutputColorProfile::Bt709Sdr,
+            "FFmpeg pipe currently supports only 8-bit BT.709 SDR output"
+        );
         let encoder_name = encoder_config.get_encoder_name();
 
         let mut args = vec![
@@ -332,6 +352,7 @@ mod tests {
             output_height: 128,
             color_order: ColorOrder::Rgba,
             bitrate: None,
+            output_color_profile: Default::default(),
         };
 
         let mut backend = FfmpegVaapiBackend::try_new(&config, 3).unwrap();

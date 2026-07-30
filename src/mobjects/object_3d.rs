@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use crate::camera::Camera;
 use crate::mobjects::mesh_3d::SurfaceMaterial;
-use crate::mobjects::{Draw, Mobject, Transform};
+use crate::mobjects::{Draw, Mobject};
 use crate::{Context, GMFloat};
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -12,7 +12,7 @@ use crate::{Context, GMFloat};
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Represents an object defined by a Signed Distance Function.
-pub trait Object3D {
+pub trait Object3D: Send + Sync {
     /// Returns the shortest distance from point `p` to the surface of the object (Used by CPU rendering).
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat;
     fn material(&self) -> SurfaceMaterial;
@@ -31,7 +31,6 @@ pub trait Object3D {
 
 /// A 3D Sphere
 pub struct Sphere3D {
-    pub base: crate::mobjects::MobjectBase,
     pub radius: GMFloat,
     pub material: SurfaceMaterial,
 }
@@ -74,33 +73,25 @@ impl Draw for Sphere3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for Sphere3D {
+    fn default_name(&self) -> &'static str {
+        "Sphere3D"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
             geometry: crate::mobjects::Geometry3DRef::Sdf(self),
             material: self.material,
-            transform: parent_mat * self.base.model_matrix,
+            transform: world_transform,
         });
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
     }
 }
 
 /// A 3D Line Segment (Capsule)
 pub struct LineSegment3D {
-    pub base: crate::mobjects::MobjectBase,
     pub a: Point3<GMFloat>,
     pub b: Point3<GMFloat>,
     pub radius: GMFloat,
@@ -149,27 +140,20 @@ impl Draw for LineSegment3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for LineSegment3D {
+    fn default_name(&self) -> &'static str {
+        "LineSegment3D"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
             geometry: crate::mobjects::Geometry3DRef::Sdf(self),
             material: self.material,
-            transform: parent_mat * self.base.model_matrix,
+            transform: world_transform,
         });
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
     }
 }
 
@@ -188,7 +172,6 @@ fn sd_capped_cone_local(axial: GMFloat, radial: GMFloat, h: GMFloat, r: GMFloat)
 
 /// A 3D Arrow (Union of a line segment and a cone)
 pub struct Arrow3D {
-    pub base: crate::mobjects::MobjectBase,
     pub start: Point3<GMFloat>,
     pub end: Point3<GMFloat>,
     pub shaft_radius: GMFloat,
@@ -259,32 +242,24 @@ impl Draw for Arrow3D {
     fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for Arrow3D {
+    fn default_name(&self) -> &'static str {
+        "Arrow3D"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
             geometry: crate::mobjects::Geometry3DRef::Sdf(self),
             material: self.material,
-            transform: parent_mat * self.base.model_matrix,
+            transform: world_transform,
         });
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
     }
 }
 
 pub struct Box3DSdf {
-    pub base: crate::mobjects::MobjectBase,
     pub size: Vector3<GMFloat>,
     pub x_axis: Vector3<GMFloat>,
     pub y_axis: Vector3<GMFloat>,
@@ -351,27 +326,20 @@ impl Draw for Box3DSdf {
 }
 
 impl Mobject for Box3DSdf {
+    fn default_name(&self) -> &'static str {
+        "Box3DSdf"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
             geometry: crate::mobjects::Geometry3DRef::Sdf(self),
             material: self.material,
-            transform: parent_mat * self.base.model_matrix,
+            transform: world_transform,
         });
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
     }
 }
 

@@ -1,11 +1,12 @@
 use crate::mobjects::mesh_2d::{GeometryFingerprint, MeshGeometry2D, TriangleMesh2D, Vertex2D};
 use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial, TriangleMesh3D, Vertex};
+use crate::mobjects::{Rectangle, RectangleId};
 use crate::video_backend::vulkan_h264::VulkanVideoFrame;
 use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
 use ash::vk;
 use ash::vk::Handle;
 use ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // The encoder keeps 8 frames in flight; one extra image prevents the renderer
@@ -727,11 +728,19 @@ impl Instance2D {
 struct Mesh2DSubmission {
     geometry: Arc<MeshGeometry2D>,
     instance: Instance2D,
+    dynamic: bool,
 }
 
 struct Mesh2DBatch {
     geometry: Arc<MeshGeometry2D>,
     instances: Vec<Instance2D>,
+    dynamic: bool,
+}
+
+struct CachedRectangle2D {
+    geometry_revision: u64,
+    source: Rectangle,
+    geometry: Arc<MeshGeometry2D>,
 }
 
 #[derive(Clone)]
@@ -761,6 +770,7 @@ struct PreparedMesh2DBatch {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrepareMesh2DError {
     StaticArenaExhausted,
+    FrameDynamicArenaExhausted,
     FrameStagingArenaExhausted,
     FrameInstanceArenaExhausted,
 }
@@ -947,7 +957,9 @@ fn build_ordered_mesh_2d_batches(submissions: Vec<Mesh2DSubmission>) -> Vec<Mesh
     let mut batches: Vec<Mesh2DBatch> = Vec::new();
     for submission in submissions {
         if let Some(last) = batches.last_mut() {
-            if last.geometry.same_geometry(&submission.geometry) {
+            if last.dynamic == submission.dynamic
+                && last.geometry.same_geometry(&submission.geometry)
+            {
                 last.instances.push(submission.instance);
                 continue;
             }
@@ -955,6 +967,7 @@ fn build_ordered_mesh_2d_batches(submissions: Vec<Mesh2DSubmission>) -> Vec<Mesh
         batches.push(Mesh2DBatch {
             geometry: submission.geometry,
             instances: vec![submission.instance],
+            dynamic: submission.dynamic,
         });
     }
     batches
@@ -966,6 +979,10 @@ fn prepare_mesh_2d_batches(
     static_index_used: &mut u64,
     static_vertex_capacity: u64,
     static_index_capacity: u64,
+    dynamic_vertex_base: u64,
+    dynamic_index_base: u64,
+    dynamic_vertex_capacity: u64,
+    dynamic_index_capacity: u64,
     staging_vertex_capacity: u64,
     staging_index_capacity: u64,
     instance_capacity: u64,
@@ -983,61 +1000,101 @@ fn prepare_mesh_2d_batches(
     let mut instances = Vec::new();
     let mut staging_vertex_used = 0u64;
     let mut staging_index_used = 0u64;
+    let mut dynamic_vertex_used = 0u64;
+    let mut dynamic_index_used = 0u64;
 
     for batch in batches {
         if batch.geometry.indices().is_empty() || batch.instances.is_empty() {
             continue;
         }
-        let fingerprint = batch.geometry.fingerprint();
-        let cached = mesh_cache.get(&fingerprint).and_then(|entries| {
-            entries
-                .iter()
-                .find(|entry| entry.geometry.same_geometry(&batch.geometry))
-                .cloned()
-        });
-        let cached = match cached {
-            Some(cached) => cached,
-            None => {
-                let vertex_size = std::mem::size_of_val(batch.geometry.vertices()) as u64;
-                let index_size = std::mem::size_of_val(batch.geometry.indices()) as u64;
-                let device_vertex_offset = align_up(*static_vertex_used, 4);
-                let device_index_offset = align_up(*static_index_used, 4);
-                let staging_vertex_offset = align_up(staging_vertex_used, 4);
-                let staging_index_offset = align_up(staging_index_used, 4);
+        let cached = if batch.dynamic {
+            let vertex_size = std::mem::size_of_val(batch.geometry.vertices()) as u64;
+            let index_size = std::mem::size_of_val(batch.geometry.indices()) as u64;
+            let device_vertex_offset = dynamic_vertex_base + align_up(dynamic_vertex_used, 4);
+            let device_index_offset = dynamic_index_base + align_up(dynamic_index_used, 4);
+            let staging_vertex_offset = align_up(staging_vertex_used, 4);
+            let staging_index_offset = align_up(staging_index_used, 4);
 
-                if device_vertex_offset + vertex_size > static_vertex_capacity
-                    || device_index_offset + index_size > static_index_capacity
-                {
-                    return Err(PrepareMesh2DError::StaticArenaExhausted);
-                }
-                if staging_vertex_offset + vertex_size > staging_vertex_capacity
-                    || staging_index_offset + index_size > staging_index_capacity
-                {
-                    return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
-                }
+            if device_vertex_offset + vertex_size > dynamic_vertex_base + dynamic_vertex_capacity
+                || device_index_offset + index_size > dynamic_index_base + dynamic_index_capacity
+            {
+                return Err(PrepareMesh2DError::FrameDynamicArenaExhausted);
+            }
+            if staging_vertex_offset + vertex_size > staging_vertex_capacity
+                || staging_index_offset + index_size > staging_index_capacity
+            {
+                return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
+            }
 
-                let cached = CachedMesh2D {
-                    geometry: batch.geometry.clone(),
-                    vertex_offset: device_vertex_offset,
-                    index_offset: device_index_offset,
-                    index_count: batch.geometry.indices().len() as u32,
-                };
-                mesh_cache
-                    .entry(fingerprint)
-                    .or_default()
-                    .push(cached.clone());
-                uploads.push(GeometryUpload2D {
-                    geometry: batch.geometry.clone(),
-                    staging_vertex_offset,
-                    staging_index_offset,
-                    device_vertex_offset,
-                    device_index_offset,
-                });
-                *static_vertex_used = device_vertex_offset + vertex_size;
-                *static_index_used = device_index_offset + index_size;
-                staging_vertex_used = staging_vertex_offset + vertex_size;
-                staging_index_used = staging_index_offset + index_size;
-                cached
+            uploads.push(GeometryUpload2D {
+                geometry: batch.geometry.clone(),
+                staging_vertex_offset,
+                staging_index_offset,
+                device_vertex_offset,
+                device_index_offset,
+            });
+            dynamic_vertex_used = device_vertex_offset + vertex_size - dynamic_vertex_base;
+            dynamic_index_used = device_index_offset + index_size - dynamic_index_base;
+            staging_vertex_used = staging_vertex_offset + vertex_size;
+            staging_index_used = staging_index_offset + index_size;
+            CachedMesh2D {
+                geometry: batch.geometry.clone(),
+                vertex_offset: device_vertex_offset,
+                index_offset: device_index_offset,
+                index_count: batch.geometry.indices().len() as u32,
+            }
+        } else {
+            let fingerprint = batch.geometry.fingerprint();
+            let cached = mesh_cache.get(&fingerprint).and_then(|entries| {
+                entries
+                    .iter()
+                    .find(|entry| entry.geometry.same_geometry(&batch.geometry))
+                    .cloned()
+            });
+            match cached {
+                Some(cached) => cached,
+                None => {
+                    let vertex_size = std::mem::size_of_val(batch.geometry.vertices()) as u64;
+                    let index_size = std::mem::size_of_val(batch.geometry.indices()) as u64;
+                    let device_vertex_offset = align_up(*static_vertex_used, 4);
+                    let device_index_offset = align_up(*static_index_used, 4);
+                    let staging_vertex_offset = align_up(staging_vertex_used, 4);
+                    let staging_index_offset = align_up(staging_index_used, 4);
+
+                    if device_vertex_offset + vertex_size > static_vertex_capacity
+                        || device_index_offset + index_size > static_index_capacity
+                    {
+                        return Err(PrepareMesh2DError::StaticArenaExhausted);
+                    }
+                    if staging_vertex_offset + vertex_size > staging_vertex_capacity
+                        || staging_index_offset + index_size > staging_index_capacity
+                    {
+                        return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
+                    }
+
+                    let cached = CachedMesh2D {
+                        geometry: batch.geometry.clone(),
+                        vertex_offset: device_vertex_offset,
+                        index_offset: device_index_offset,
+                        index_count: batch.geometry.indices().len() as u32,
+                    };
+                    mesh_cache
+                        .entry(fingerprint)
+                        .or_default()
+                        .push(cached.clone());
+                    uploads.push(GeometryUpload2D {
+                        geometry: batch.geometry.clone(),
+                        staging_vertex_offset,
+                        staging_index_offset,
+                        device_vertex_offset,
+                        device_index_offset,
+                    });
+                    *static_vertex_used = device_vertex_offset + vertex_size;
+                    *static_index_used = device_index_offset + index_size;
+                    staging_vertex_used = staging_vertex_offset + vertex_size;
+                    staging_index_used = staging_index_offset + index_size;
+                    cached
+                }
             }
         };
 
@@ -1617,6 +1674,9 @@ pub struct VulkanRenderer {
     instance_buffer_2d_stride: u64,
     camera_buffer_2d_stride: u64,
     mesh_cache_2d: HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
+    rectangle_cache_2d: HashMap<RectangleId, CachedRectangle2D>,
+    static_vertex_buffer_2d_capacity: u64,
+    static_index_buffer_2d_capacity: u64,
     static_vertex_buffer_2d_used: u64,
     static_index_buffer_2d_used: u64,
     last_stats: RendererStats,
@@ -1633,6 +1693,17 @@ impl VulkanRenderer {
     pub fn new(ctx: Arc<VulkanContext>, config: crate::RendererConfig) -> Self {
         let msaa_samples = config.msaa_samples;
         let ssaa_factor = config.ssaa_factor;
+        let output_transform = match config.output_color_profile {
+            crate::OutputColorProfile::Bt709Sdr => {
+                include_str!("output_transform_bt709.wgsl")
+            }
+            crate::OutputColorProfile::Bt2020Pq | crate::OutputColorProfile::Bt2020Hlg => {
+                panic!(
+                    "{:?} requires a 10-bit HDR output path; the current renderer outputs RGBA8/NV12",
+                    config.output_color_profile
+                )
+            }
+        };
         let requested_sample_count = msaa_to_vk_sample_count(msaa_samples);
         let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
         let (environment_map, environment_sampler) = create_studio_environment(&ctx);
@@ -1701,12 +1772,16 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let surface_composite_shader =
             compile_wgsl_full(&ctx, include_str!("surface_composite_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
-        let nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12.wgsl"));
-        let video_nv12_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_nv12_image.wgsl"));
+        let compile_output_shader = |source| {
+            let source = format!("{output_transform}\n{source}");
+            compile_wgsl_full(&ctx, &source)
+        };
+        let nv12_shader = compile_output_shader(include_str!("rgba_to_nv12.wgsl"));
+        let video_nv12_shader = compile_output_shader(include_str!("rgba_to_nv12_image.wgsl"));
         let video_nv12_downsample_shader =
-            compile_wgsl_full(&ctx, include_str!("downsample_to_nv12_image.wgsl"));
-        let yuv444p_shader = compile_wgsl_full(&ctx, include_str!("rgba_to_yuv444p.wgsl"));
-        let downsample_shader = compile_wgsl_full(&ctx, include_str!("downsample_shader.wgsl"));
+            compile_output_shader(include_str!("downsample_to_nv12_image.wgsl"));
+        let yuv444p_shader = compile_output_shader(include_str!("rgba_to_yuv444p.wgsl"));
+        let downsample_shader = compile_output_shader(include_str!("downsample_shader.wgsl"));
         let bloom_shader = compile_wgsl_full(&ctx, include_str!("bloom_shader.wgsl"));
 
         let composite_bindings = [
@@ -2913,13 +2988,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
 
         let vertex_buffer_2d = Buffer::new(
             &ctx,
-            static_vertex_buffer_2d_size,
+            static_vertex_buffer_2d_size + vertex_staging_buffer_2d_stride * frame_count,
             vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::GpuOnly,
         );
         let index_buffer_2d = Buffer::new(
             &ctx,
-            static_index_buffer_2d_size,
+            static_index_buffer_2d_size + index_staging_buffer_2d_stride * frame_count,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             gpu_allocator::MemoryLocation::GpuOnly,
         );
@@ -3082,6 +3157,9 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             instance_buffer_2d_stride,
             camera_buffer_2d_stride,
             mesh_cache_2d: HashMap::new(),
+            rectangle_cache_2d: HashMap::new(),
+            static_vertex_buffer_2d_capacity: static_vertex_buffer_2d_size,
+            static_index_buffer_2d_capacity: static_index_buffer_2d_size,
             static_vertex_buffer_2d_used: 0,
             static_index_buffer_2d_used: 0,
             last_stats: RendererStats::default(),
@@ -3169,6 +3247,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let mut surface_materials = Vec::new();
 
         let mut mesh_submissions_2d = Vec::new();
+        let mut active_rectangles_2d = HashSet::new();
 
         struct VulkanDataCollector<'a> {
             primitives_3d: &'a mut Vec<PrimitiveData3D>,
@@ -3177,6 +3256,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             mesh_draws_3d: &'a mut Vec<Mesh3DDraw>,
             surface_materials: &'a mut Vec<SurfaceMaterial>,
             mesh_submissions_2d: &'a mut Vec<Mesh2DSubmission>,
+            rectangle_cache_2d: &'a mut HashMap<RectangleId, CachedRectangle2D>,
+            active_rectangles_2d: &'a mut HashSet<RectangleId>,
             camera_position: nalgebra::Point3<crate::GMFloat>,
             camera_look: nalgebra::Vector3<crate::GMFloat>,
         }
@@ -3190,6 +3271,50 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 self.mesh_submissions_2d.push(Mesh2DSubmission {
                     geometry: mesh.geometry(),
                     instance: Instance2D::new(transform, mesh.color()),
+                    dynamic: false,
+                });
+            }
+
+            fn push_rectangle_2d(
+                &mut self,
+                id: RectangleId,
+                rectangle: &Rectangle,
+                geometry_revision: u64,
+                dynamic: bool,
+                transform: nalgebra::Matrix4<crate::GMFloat>,
+            ) {
+                self.active_rectangles_2d.insert(id);
+                let rebuild = self
+                    .rectangle_cache_2d
+                    .get(&id)
+                    .map(|cached| {
+                        cached.geometry_revision != geometry_revision
+                            || !cached.source.same_geometry(rectangle)
+                    })
+                    .unwrap_or(true);
+                if rebuild {
+                    self.rectangle_cache_2d.insert(
+                        id,
+                        CachedRectangle2D {
+                            geometry_revision,
+                            source: rectangle.clone(),
+                            geometry: rectangle.tessellate().geometry(),
+                        },
+                    );
+                }
+                let geometry = self.rectangle_cache_2d[&id].geometry.clone();
+                self.mesh_submissions_2d.push(Mesh2DSubmission {
+                    geometry,
+                    instance: Instance2D::new(
+                        transform,
+                        [
+                            rectangle.color.r as f32 / 255.0,
+                            rectangle.color.g as f32 / 255.0,
+                            rectangle.color.b as f32 / 255.0,
+                            rectangle.color.a as f32 / 255.0,
+                        ],
+                    ),
+                    dynamic,
                 });
             }
 
@@ -3269,14 +3394,16 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             mesh_draws_3d: &mut mesh_draws_3d,
             surface_materials: &mut surface_materials,
             mesh_submissions_2d: &mut mesh_submissions_2d,
+            rectangle_cache_2d: &mut self.rectangle_cache_2d,
+            active_rectangles_2d: &mut active_rectangles_2d,
             camera_position: scene.camera.position,
             camera_look: scene.camera.look_at_dir(),
         };
 
-        for m in &scene.mobjects {
-            m.borrow()
-                .submit_to_renderer(&mut collector, nalgebra::Matrix4::identity());
-        }
+        scene.world.submit_to_renderer(&mut collector);
+        drop(collector);
+        self.rectangle_cache_2d
+            .retain(|id, _| active_rectangles_2d.contains(id));
         let mesh_batches_2d = build_ordered_mesh_2d_batches(mesh_submissions_2d);
 
         let camera_uniform_2d = CameraUniform2D {
@@ -4755,8 +4882,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             &mut self.mesh_cache_2d,
             &mut self.static_vertex_buffer_2d_used,
             &mut self.static_index_buffer_2d_used,
-            self.vertex_buffer_2d.size,
-            self.index_buffer_2d.size,
+            self.static_vertex_buffer_2d_capacity,
+            self.static_index_buffer_2d_capacity,
+            self.static_vertex_buffer_2d_capacity
+                + frame_idx as u64 * self.vertex_staging_buffer_2d_stride,
+            self.static_index_buffer_2d_capacity
+                + frame_idx as u64 * self.index_staging_buffer_2d_stride,
+            self.vertex_staging_buffer_2d_stride,
+            self.index_staging_buffer_2d_stride,
             self.vertex_staging_buffer_2d_stride,
             self.index_staging_buffer_2d_stride,
             self.instance_buffer_2d_stride,
@@ -4776,8 +4909,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     &mut self.mesh_cache_2d,
                     &mut self.static_vertex_buffer_2d_used,
                     &mut self.static_index_buffer_2d_used,
-                    self.vertex_buffer_2d.size,
-                    self.index_buffer_2d.size,
+                    self.static_vertex_buffer_2d_capacity,
+                    self.static_index_buffer_2d_capacity,
+                    self.static_vertex_buffer_2d_capacity
+                        + frame_idx as u64 * self.vertex_staging_buffer_2d_stride,
+                    self.static_index_buffer_2d_capacity
+                        + frame_idx as u64 * self.index_staging_buffer_2d_stride,
+                    self.vertex_staging_buffer_2d_stride,
+                    self.index_staging_buffer_2d_stride,
                     self.vertex_staging_buffer_2d_stride,
                     self.index_staging_buffer_2d_stride,
                     self.instance_buffer_2d_stride,
@@ -7034,18 +7173,22 @@ mod tests {
             Mesh2DSubmission {
                 geometry: first.clone(),
                 instance: instance([1.0, 0.0, 0.0, 1.0]),
+                dynamic: false,
             },
             Mesh2DSubmission {
                 geometry: equal_to_first,
                 instance: instance([0.0, 1.0, 0.0, 1.0]),
+                dynamic: false,
             },
             Mesh2DSubmission {
                 geometry: second,
                 instance: instance([0.0, 0.0, 1.0, 1.0]),
+                dynamic: false,
             },
             Mesh2DSubmission {
                 geometry: first,
                 instance: instance([1.0, 1.0, 1.0, 1.0]),
+                dynamic: false,
             },
         ]);
 
@@ -7062,10 +7205,12 @@ mod tests {
             Mesh2DSubmission {
                 geometry: geometry.clone(),
                 instance: instance([1.0; 4]),
+                dynamic: false,
             },
             Mesh2DSubmission {
                 geometry,
                 instance: instance([0.5; 4]),
+                dynamic: false,
             },
         ]);
         let mut cache = HashMap::new();
@@ -7081,6 +7226,10 @@ mod tests {
             4096,
             4096,
             4096,
+            4096,
+            4096,
+            4096,
+            4096,
             &batches,
         )
         .unwrap();
@@ -7090,6 +7239,10 @@ mod tests {
             &mut cache,
             &mut vertex_used,
             &mut index_used,
+            4096,
+            4096,
+            4096,
+            4096,
             4096,
             4096,
             4096,
@@ -7110,10 +7263,48 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_geometry_uses_frame_arena_without_growing_static_cache() {
+        let batches = build_ordered_mesh_2d_batches(vec![Mesh2DSubmission {
+            geometry: triangle(0.0),
+            instance: instance([1.0; 4]),
+            dynamic: true,
+        }]);
+        let mut cache = HashMap::new();
+        let mut vertex_used = 0;
+        let mut index_used = 0;
+
+        for dynamic_base in [4096, 8192] {
+            let (_, uploads, _) = prepare_mesh_2d_batches(
+                &mut cache,
+                &mut vertex_used,
+                &mut index_used,
+                4096,
+                4096,
+                dynamic_base,
+                dynamic_base,
+                4096,
+                4096,
+                4096,
+                4096,
+                4096,
+                &batches,
+            )
+            .unwrap();
+            assert_eq!(uploads.len(), 1);
+            assert_eq!(uploads[0].device_vertex_offset, dynamic_base);
+        }
+
+        assert!(cache.is_empty());
+        assert_eq!(vertex_used, 0);
+        assert_eq!(index_used, 0);
+    }
+
+    #[test]
     fn persistent_arena_exhaustion_is_reported_for_generation_rebuild() {
         let batches = build_ordered_mesh_2d_batches(vec![Mesh2DSubmission {
             geometry: triangle(0.0),
             instance: instance([1.0; 4]),
+            dynamic: false,
         }]);
         let mut cache = HashMap::new();
         let mut vertex_used = 0;
@@ -7125,6 +7316,10 @@ mod tests {
             &mut index_used,
             1,
             1,
+            4096,
+            4096,
+            4096,
+            4096,
             4096,
             4096,
             4096,

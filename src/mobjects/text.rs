@@ -10,10 +10,9 @@ use crate::{GMFloat, log_utils};
 use nalgebra::{Point2, Point3, Vector3};
 
 use super::path::PathElement;
-use super::{DrawConfig, Mobject, Transform, coordinate_change_x, coordinate_change_y};
+use super::{DrawConfig, Mobject, coordinate_change_x, coordinate_change_y};
 
 pub struct Text {
-    pub base: crate::mobjects::MobjectBase,
     pub text: String,
     glyph_paths: Vec<GlyphPath>,
     pub position: Point3<GMFloat>,
@@ -139,11 +138,8 @@ impl Draw for Text {
 }
 
 impl Mobject for Text {
-    fn base(&self) -> &crate::mobjects::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut crate::mobjects::MobjectBase {
-        &mut self.base
+    fn default_name(&self) -> &'static str {
+        "Text"
     }
 }
 
@@ -158,7 +154,6 @@ impl Text {
         if text.len() == 0 {
             info!("text len is 0");
             return Text {
-                base: crate::mobjects::MobjectBase::new("Text"),
                 text,
                 glyph_paths,
                 position,
@@ -199,7 +194,6 @@ impl Text {
             glyph_paths.push(glyph_path);
         }
         Text {
-            base: crate::mobjects::MobjectBase::new("Text"),
             text,
             glyph_paths,
             position,

@@ -655,6 +655,11 @@ impl Drop for AsyncMp4Muxer {
 }
 
 fn spawn_mp4_muxer_process(config: &VideoConfig) -> io::Result<(Child, ChildStdin)> {
+    if config.output_color_profile != crate::OutputColorProfile::Bt709Sdr {
+        return Err(io::Error::other(
+            "Vulkan H.264 currently supports only 8-bit BT.709 SDR output",
+        ));
+    }
     let mut child = Command::new("ffmpeg")
         .args([
             "-y",
@@ -669,6 +674,14 @@ fn spawn_mp4_muxer_process(config: &VideoConfig) -> io::Result<(Child, ChildStdi
             "-",
             "-c:v",
             "copy",
+            "-color_range",
+            "tv",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-movflags",
             "+faststart",
             &config.filename,
@@ -2287,6 +2300,7 @@ mod tests {
             output_height: height,
             color_order: ColorOrder::Nv12,
             bitrate: None,
+            output_color_profile: Default::default(),
         }
     }
 

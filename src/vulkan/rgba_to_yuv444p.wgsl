@@ -8,15 +8,15 @@ struct Constants {
 @group(0) @binding(2) var<uniform> constants: Constants;
 
 fn rgb_to_y(color: vec3<f32>) -> f32 {
-    return 16.0/255.0 + 0.256788 * color.r + 0.504129 * color.g + 0.097906 * color.b;
+    return bt709_to_yuv_limited(color).x;
 }
 
 fn rgb_to_u(color: vec3<f32>) -> f32 {
-    return 128.0/255.0 - 0.148223 * color.r - 0.290993 * color.g + 0.439216 * color.b;
+    return bt709_to_yuv_limited(color).y;
 }
 
 fn rgb_to_v(color: vec3<f32>) -> f32 {
-    return 128.0/255.0 + 0.439216 * color.r - 0.367788 * color.g - 0.071427 * color.b;
+    return bt709_to_yuv_limited(color).z;
 }
 
 @compute @workgroup_size(16, 16, 1)

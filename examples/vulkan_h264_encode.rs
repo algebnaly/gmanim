@@ -3,37 +3,32 @@ use std::process::Command;
 
 use gmanim_core::{
     Color, Context, GMFloat, Scene, SceneConfig,
-    animation::{Animation, Timeline},
+    animation::{AnimationClip, Curve, TimelineBuilder},
     math_utils::constants::PI,
-    mobjects::{Rectangle, Transform},
+    mobjects::{MobjectId, Rectangle},
     video_backend::{ColorOrder, VideoConfig, vulkan_h264::AsyncVulkanH264Backend},
 };
 
-struct OrbitRects {
-    frames: u32,
-}
-
-impl Animation for OrbitRects {
-    fn update(&mut self, alpha: GMFloat, scene: &mut Scene) {
-        let angle = alpha as f32 * PI * 2.0;
-        for (i, m) in scene.mobjects.iter().enumerate() {
-            let ring = (i % 6) as f32 + 1.0;
-            let local = angle + i as f32 * 0.37;
-            let x = local.cos() * ring * 0.55;
-            let y = local.sin() * ring * 0.32;
-            let matrix =
+fn orbit_clip(frames: u32, targets: &[MobjectId]) -> AnimationClip {
+    let mut clip = AnimationClip::new(frames);
+    for (i, id) in targets.iter().copied().enumerate() {
+        let values: Vec<_> = (0..=frames)
+            .map(|frame| {
+                let angle = frame as GMFloat / frames as GMFloat * PI * 2.0;
+                let ring = (i % 6) as f32 + 1.0;
+                let local = angle + i as f32 * 0.37;
+                let x = local.cos() * ring * 0.55;
+                let y = local.sin() * ring * 0.32;
                 nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
                     x as GMFloat,
                     y as GMFloat,
                     0.0,
-                )) * nalgebra::Matrix4::from_euler_angles(0.0, 0.0, -angle * 1.7 + i as f32 * 0.11);
-            m.borrow_mut().set_model_matrix(matrix);
-        }
+                )) * nalgebra::Matrix4::from_euler_angles(0.0, 0.0, -angle * 1.7 + i as f32 * 0.11)
+            })
+            .collect();
+        clip = clip.transform(id, Curve::sampled(values));
     }
-
-    fn total_frames(&self) -> u32 {
-        self.frames
-    }
+    clip
 }
 
 fn main() -> io::Result<()> {
@@ -49,12 +44,14 @@ fn main() -> io::Result<()> {
             output_width: width,
             output_height: height,
             scale_factor: 1920.0 / 16.0,
+            framerate: 120,
         },
     };
 
     let mut scene = Scene::default();
+    let mut targets = Vec::with_capacity(96);
     for i in 0..96 {
-        let mut rect = Rectangle {
+        let rect = Rectangle {
             p0: nalgebra::Point3::new(-0.16, -0.16, 0.0),
             p1: nalgebra::Point3::new(0.16, -0.16, 0.0),
             p2: nalgebra::Point3::new(0.16, 0.16, 0.0),
@@ -67,17 +64,24 @@ fn main() -> io::Result<()> {
             ),
             ..Default::default()
         };
-        rect.apply_transform(nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
-            ((i % 12) as f32 - 5.5) as GMFloat,
-            ((i / 12) as f32 - 3.5) as GMFloat,
-            0.0,
-        )));
-        rect.update_mesh();
-        scene.add(rect);
+        let id = scene.add_rectangle(rect);
+        targets.push(id);
+        scene
+            .world
+            .get_mut(id)
+            .unwrap()
+            .move_by(nalgebra::Vector3::new(
+                ((i % 12) as f32 - 5.5) as GMFloat,
+                ((i / 12) as f32 - 3.5) as GMFloat,
+                0.0,
+            ));
     }
 
-    let mut timeline = Timeline::new(scene, ctx);
-    timeline.play(OrbitRects { frames });
+    let mut timeline_builder = TimelineBuilder::new(scene, ctx);
+    timeline_builder
+        .play(orbit_clip(frames, &targets))
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut timeline = timeline_builder.build();
 
     let video_config = VideoConfig {
         filename: output.to_owned(),
@@ -86,6 +90,7 @@ fn main() -> io::Result<()> {
         output_height: height,
         color_order: ColorOrder::Nv12,
         bitrate: Some(20_000_000),
+        output_color_profile: Default::default(),
     };
     let vk_ctx = gmanim_core::vulkan::context::VulkanContext::new().unwrap();
     let mut backend = AsyncVulkanH264Backend::try_new(vk_ctx.clone(), &video_config)?;
@@ -97,10 +102,14 @@ fn main() -> io::Result<()> {
         gmanim_core::RendererConfig {
             msaa_samples: 16,
             ssaa_factor: 1,
+            output_color_profile: Default::default(),
         },
     );
 
-    while timeline.advance_frame() {
+    while timeline
+        .advance_frame()
+        .map_err(|error| io::Error::other(error.to_string()))?
+    {
         renderer.render_scene_with_outputs(
             &timeline.scene,
             &timeline.ctx.scene_config,

@@ -1,6 +1,6 @@
 use crate::Color;
 use crate::GMFloat;
-use crate::mobjects::{Draw, Mobject, Transform};
+use crate::mobjects::{Draw, Mobject};
 use nalgebra::{Matrix4, Point3, Vector3};
 
 #[repr(C)]
@@ -98,7 +98,6 @@ impl Default for SurfaceMaterial {
 }
 
 pub struct TriangleMesh3D {
-    pub base: super::MobjectBase,
     pub vertices: Vec<Vertex>,
     pub indices: Vec<u32>,
     pub model_matrix: Matrix4<GMFloat>,
@@ -116,7 +115,6 @@ impl TriangleMesh3D {
             AlphaMode3D::Opaque
         };
         Self {
-            base: super::MobjectBase::new("TriangleMesh3D"),
             vertices,
             indices,
             model_matrix: Matrix4::identity(),
@@ -615,27 +613,20 @@ impl Draw for TriangleMesh3D {
 }
 
 impl Mobject for TriangleMesh3D {
+    fn default_name(&self) -> &'static str {
+        "TriangleMesh3D"
+    }
+
     fn submit_to_renderer(
         &self,
         visitor: &mut dyn crate::mobjects::RenderVisitor,
-        parent_mat: nalgebra::Matrix4<crate::GMFloat>,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
             geometry: crate::mobjects::Geometry3DRef::Mesh(self),
             material: self.material,
-            transform: parent_mat * self.base.model_matrix,
+            transform: world_transform,
         });
-        let global_mat = parent_mat * self.base.model_matrix;
-        for child in self.base.children.iter() {
-            child.borrow().submit_to_renderer(visitor, global_mat);
-        }
-    }
-
-    fn base(&self) -> &super::MobjectBase {
-        &self.base
-    }
-    fn base_mut(&mut self) -> &mut super::MobjectBase {
-        &mut self.base
     }
 }
 

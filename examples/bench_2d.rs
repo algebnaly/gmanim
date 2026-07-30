@@ -1,32 +1,29 @@
 use gmanim_core::{
     Color, Context, GMFloat, Scene, SceneConfig,
-    animation::{Animation, Timeline},
+    animation::{AnimationClip, Curve, TimelineBuilder},
     math_utils::constants::PI,
-    mobjects::{Rectangle, Transform},
+    mobjects::{MobjectId, Rectangle},
     video_backend::{ColorOrder, VideoBackend, VideoBackendType, VideoConfig},
 };
 
-struct RotateRectangles {
-    frames: u32,
-}
-
-impl Animation for RotateRectangles {
-    fn update(&mut self, alpha: GMFloat, scene: &mut Scene) {
-        let angle = alpha as f32 * PI * 2.0;
-        for (i, m) in scene.mobjects.iter().enumerate() {
-            let x = (i as f32 % 40.0) - 20.0;
-            let y = ((i / 40) as f32 % 25.0) - 12.5;
-            let matrix = nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
-                x as GMFloat,
-                y as GMFloat,
-                0.0,
-            )) * nalgebra::Matrix4::from_euler_angles(0.0, 0.0, angle + i as f32);
-            m.borrow_mut().set_model_matrix(matrix);
-        }
+fn rotation_clip(frames: u32, targets: &[MobjectId]) -> AnimationClip {
+    let mut clip = AnimationClip::new(frames);
+    for (i, id) in targets.iter().copied().enumerate() {
+        let values: Vec<_> = (0..=frames)
+            .map(|frame| {
+                let angle = frame as GMFloat / frames as GMFloat * PI * 2.0;
+                let x = (i as f32 % 40.0) - 20.0;
+                let y = ((i / 40) as f32 % 25.0) - 12.5;
+                nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
+                    x as GMFloat,
+                    y as GMFloat,
+                    0.0,
+                )) * nalgebra::Matrix4::from_euler_angles(0.0, 0.0, angle + i as f32)
+            })
+            .collect();
+        clip = clip.transform(id, Curve::sampled(values));
     }
-    fn total_frames(&self) -> u32 {
-        self.frames
-    }
+    clip
 }
 
 fn main() {
@@ -40,16 +37,18 @@ fn main() {
             output_width: width,
             output_height: height,
             scale_factor: 1920.0 / 16.0,
+            framerate: 60,
         },
     };
 
     let mut scene = Scene::default();
+    let mut targets = Vec::with_capacity(1000);
 
     // Add 1000 rectangles
     for i in 0..1000 {
         let x = (i as f32 % 40.0) - 20.0;
         let y = ((i / 40) as f32 % 25.0) - 12.5;
-        let mut rect = Rectangle {
+        let rect = Rectangle {
             p0: nalgebra::Point3::new(-0.2, -0.2, 0.0),
             p1: nalgebra::Point3::new(0.2, -0.2, 0.0),
             p2: nalgebra::Point3::new(0.2, 0.2, 0.0),
@@ -57,17 +56,18 @@ fn main() {
             color: Color::new((i % 255) as u8, 100, 200, 255),
             ..Default::default()
         };
-        rect.apply_transform(nalgebra::Matrix4::new_translation(&nalgebra::Vector3::new(
-            x as GMFloat,
-            y as GMFloat,
-            0.0,
-        )));
-        rect.update_mesh();
-        scene.add(rect);
+        let id = scene.add_rectangle(rect);
+        targets.push(id);
+        scene
+            .world
+            .get_mut(id)
+            .unwrap()
+            .move_by(nalgebra::Vector3::new(x as GMFloat, y as GMFloat, 0.0));
     }
 
-    let mut timeline = Timeline::new(scene, ctx);
-    timeline.play(RotateRectangles { frames: 300 });
+    let mut timeline_builder = TimelineBuilder::new(scene, ctx);
+    timeline_builder.play(rotation_clip(300, &targets)).unwrap();
+    let mut timeline = timeline_builder.build();
 
     let video_config = VideoConfig {
         filename: "bench_core_nv12_2d.mp4".to_owned(),
@@ -76,6 +76,7 @@ fn main() {
         output_height: height,
         color_order: ColorOrder::Nv12,
         bitrate: None,
+        output_color_profile: Default::default(),
     };
 
     let mut video_backend = VideoBackend {
@@ -98,12 +99,13 @@ fn main() {
         gmanim_core::RendererConfig {
             msaa_samples: 8,
             ssaa_factor: 2,
+            output_color_profile: Default::default(),
         },
     );
 
     let mut first_frame_stats = None;
     let mut steady_frame_stats = None;
-    while timeline.advance_frame() {
+    while timeline.advance_frame().unwrap() {
         frames_rendered += 1;
         renderer.render_scene_with_outputs(
             &timeline.scene,
