@@ -312,10 +312,13 @@ fn studio_environment(direction: [f32; 3], roughness: f32) -> [f32; 4] {
     let rim_light = dot(rim).powf(sharpness * 0.55) * (3.2 - 2.0 * roughness);
     let ceiling_light = dot(ceiling).powf(4.0 + sharpness * 0.12) * 1.4;
     let horizon = (1.0 - direction[1].abs()).powf(3.0) * 0.18;
+    // Ambient terms must stay channel-uniform: any per-channel gain here leaks into
+    // the diffuse irradiance and tints every surface when no point light dominates.
+    let ambient = 0.04 + horizon * 0.9;
     [
-        0.025 + horizon * 0.75 + key_light * 1.0 + rim_light * 0.32 + ceiling_light * 0.55,
-        0.035 + horizon * 0.9 + key_light * 0.96 + rim_light * 0.62 + ceiling_light * 0.7,
-        0.055 + horizon * 1.1 + key_light * 0.9 + rim_light * 1.0 + ceiling_light * 0.9,
+        ambient + key_light * 1.0 + rim_light * 0.65 + ceiling_light * 0.7,
+        ambient + key_light * 0.96 + rim_light * 0.65 + ceiling_light * 0.7,
+        ambient + key_light * 0.92 + rim_light * 0.65 + ceiling_light * 0.7,
         1.0,
     ]
 }
