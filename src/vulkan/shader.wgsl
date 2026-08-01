@@ -30,6 +30,7 @@ struct CameraUniform {
     environment_intensity: f32,
     environment_color: vec3<f32>,
     environment_rotation: f32,
+    background_color: vec4<f32>,
 }
 @group(0) @binding(1) var<uniform> camera: CameraUniform;
 
@@ -90,6 +91,90 @@ fn sd_capped_cone(p: vec3<f32>, a: vec3<f32>, b: vec3<f32>, ra: f32, rb: f32) ->
     return s * sqrt(min(cax * cax + cay * cay * baba, cbx * cbx + cby * cby * baba));
 }
 
+fn sd_bezier(p: vec3<f32>, A: vec3<f32>, B: vec3<f32>, C: vec3<f32>, radius: f32) -> f32 {
+    let k2 = A - 2.0 * B + C;
+    let k1 = 2.0 * (B - A);
+    let k0 = A - p;
+    
+    let a = dot(k2, k2);
+    // If the curve is basically a straight line (a approx 0)
+    if (a < 1e-6) {
+        let pa = p - A;
+        let ba = C - A;
+        let h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+        return length(pa - ba * h) - radius;
+    }
+    
+    let b = 3.0 * dot(k1, k2) / (2.0 * a);
+    let c = (dot(k1, k1) + 2.0 * dot(k0, k2)) / (2.0 * a);
+    let d = dot(k0, k1) / (2.0 * a);
+    
+    let p_cubic = c - b * b / 3.0;
+    let q_cubic = d - b * c / 3.0 + 2.0 * b * b * b / 27.0;
+    
+    let p3 = p_cubic * p_cubic * p_cubic;
+    let D = q_cubic * q_cubic / 4.0 + p3 / 27.0;
+    
+    var t_min: f32 = 0.0;
+    
+    if (D >= 0.0) {
+        let sqrt_D = sqrt(D);
+        let u = q_cubic / -2.0 + sqrt_D;
+        let v = q_cubic / -2.0 - sqrt_D;
+        
+        let root_u = sign(u) * pow(abs(u), 1.0/3.0);
+        let root_v = sign(v) * pow(abs(v), 1.0/3.0);
+        
+        var t = root_u + root_v - b / 3.0;
+        t_min = clamp(t, 0.0, 1.0);
+        
+        // Check endpoints
+        let pt0 = k0; // t=0
+        let pt1 = k2 + k1 + k0; // t=1
+        let pt_min = k2 * t_min * t_min + k1 * t_min + k0;
+        
+        let dist0 = dot(pt0, pt0);
+        let dist1 = dot(pt1, pt1);
+        let dist_min = dot(pt_min, pt_min);
+        
+        var min_sq_dist = dist_min;
+        if (dist0 < min_sq_dist) { min_sq_dist = dist0; }
+        if (dist1 < min_sq_dist) { min_sq_dist = dist1; }
+        
+        return sqrt(min_sq_dist) - radius;
+    }
+    
+    let u = 2.0 * sqrt(-p_cubic / 3.0);
+    let theta = acos(clamp(q_cubic / (2.0 * sqrt(-(p3 / 27.0))), -1.0, 1.0)) / 3.0;
+    
+    let t1 = u * cos(theta) - b / 3.0;
+    let t2 = u * cos(theta + 2.09439510239) - b / 3.0;
+    let t3 = u * cos(theta + 4.18879020479) - b / 3.0;
+    
+    let ct1 = clamp(t1, 0.0, 1.0);
+    let ct2 = clamp(t2, 0.0, 1.0);
+    let ct3 = clamp(t3, 0.0, 1.0);
+    
+    let p1 = k2 * ct1 * ct1 + k1 * ct1 + k0;
+    let p2 = k2 * ct2 * ct2 + k1 * ct2 + k0;
+    let p3_pt = k2 * ct3 * ct3 + k1 * ct3 + k0;
+    
+    let d1 = dot(p1, p1);
+    let d2 = dot(p2, p2);
+    let d3 = dot(p3_pt, p3_pt);
+    
+    if (d1 < d2 && d1 < d3) {
+        t_min = ct1;
+    } else if (d2 < d1 && d2 < d3) {
+        t_min = ct2;
+    } else {
+        t_min = ct3;
+    }
+    
+    let pt = k2 * t_min * t_min + k1 * t_min + k0;
+    return length(pt) - radius;
+}
+
 // Map function traversing all primitives
 fn map(p: vec3<f32>) -> MapResult {
     var min_dist: f32 = 99999.0;
@@ -138,16 +223,22 @@ fn map(p: vec3<f32>) -> MapResult {
                 d = min(d_shaft, d_cone);
             }
         } else if (prim.shape_type == 3u) { // Box
+            // params: center.x, center.y, center.z, size.x, size.y, size.z,
+            // x_axis.x, x_axis.y, x_axis.z, y_axis.x, y_axis.y, y_axis.z
             let center = vec3<f32>(prim.params[0], prim.params[1], prim.params[2]);
             let size = vec3<f32>(prim.params[3], prim.params[4], prim.params[5]);
             let x_axis = vec3<f32>(prim.params[6], prim.params[7], prim.params[8]);
             let y_axis = vec3<f32>(prim.params[9], prim.params[10], prim.params[11]);
-            let z_axis = cross(x_axis, y_axis);
-            
-            let pt = p - center;
-            let local_p = vec3<f32>(dot(pt, x_axis), dot(pt, y_axis), dot(pt, z_axis));
-            
+            let z_axis = normalize(cross(x_axis, y_axis));
+            let d_p = p - center;
+            let local_p = vec3<f32>(dot(d_p, x_axis), dot(d_p, y_axis), dot(d_p, z_axis));
             d = sd_box(local_p, size);
+        } else if (prim.shape_type == 4u) { // Quadratic Bezier
+            let a = vec3<f32>(prim.params[0], prim.params[1], prim.params[2]);
+            let b = vec3<f32>(prim.params[3], prim.params[4], prim.params[5]);
+            let c = vec3<f32>(prim.params[6], prim.params[7], prim.params[8]);
+            let radius = prim.params[9];
+            d = sd_bezier(p, a, b, c, radius);
         }
         
         if (d < min_dist) {

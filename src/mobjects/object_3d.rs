@@ -143,6 +143,74 @@ impl Mobject for LineSegment3D {
     fn default_name(&self) -> &'static str {
         "LineSegment3D"
     }
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_surface_3d(crate::mobjects::Surface3DSubmission {
+            geometry: crate::mobjects::Geometry3DRef::Sdf(self),
+            material: self.material,
+            transform: world_transform,
+        });
+    }
+}
+
+/// A 3D Quadratic Bezier Curve
+pub struct QuadraticBezier3D {
+    pub a: Point3<GMFloat>,
+    pub b: Point3<GMFloat>,
+    pub c: Point3<GMFloat>,
+    pub radius: GMFloat,
+    pub material: SurfaceMaterial,
+}
+
+impl Object3D for QuadraticBezier3D {
+    fn distance(&self, p: &Point3<GMFloat>) -> GMFloat {
+        let pa = p - self.a;
+        let ca = self.c - self.a;
+        let h = (pa.dot(&ca) / ca.dot(&ca)).clamp(0.0, 1.0);
+        (pa - ca * h).norm() - self.radius
+    }
+    fn material(&self) -> SurfaceMaterial {
+        self.material
+    }
+    fn as_primitive_data(
+        &self,
+        global_mat: nalgebra::Matrix4<GMFloat>,
+        material_index: u32,
+    ) -> crate::vulkan::renderer::PrimitiveData3D {
+        let a = global_mat.transform_point(&self.a);
+        let b = global_mat.transform_point(&self.b);
+        let c = global_mat.transform_point(&self.c);
+        crate::vulkan::renderer::PrimitiveData3D {
+            material_index,
+            shape_type: 4,
+            padding: [0; 2],
+            params: [
+                a.x as f32,
+                a.y as f32,
+                a.z as f32,
+                b.x as f32,
+                b.y as f32,
+                b.z as f32,
+                c.x as f32,
+                c.y as f32,
+                c.z as f32,
+                self.radius as f32,
+                0.0,
+                0.0,
+            ],
+        }
+    }
+}
+impl Draw for QuadraticBezier3D {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
+}
+impl Mobject for QuadraticBezier3D {
+    fn default_name(&self) -> &'static str {
+        "QuadraticBezier3D"
+    }
 
     fn submit_to_renderer(
         &self,

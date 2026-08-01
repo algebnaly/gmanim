@@ -60,6 +60,31 @@ fn environment_brdf(f0: vec3<f32>, roughness: f32, n_dot_v: f32) -> vec3<f32> {
     return f0 * scale_bias.x + scale_bias.y;
 }
 
+fn shade_surface_flat(
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    view_direction: vec3<f32>,
+    albedo: vec3<f32>,
+    emissive: vec3<f32>,
+) -> SurfaceLighting {
+    let light_direction = normalize(camera.light_pos - position);
+    
+    // Manim 3b1b inspired simplified shading
+    let shadow_factor = max(-dot(normal, light_direction), 0.0) * 0.4;
+    let n_dot_l = max(dot(normal, light_direction), 0.0);
+    let bright_factor = n_dot_l * 0.5;
+    
+    let r = reflect(-light_direction, normal);
+    let r_dot_v = max(dot(r, view_direction), 0.0);
+    let shine = 0.2 * exp(-3.0 * pow(1.0 - r_dot_v, 2.0));
+    
+    var color = albedo;
+    color = mix(color, vec3<f32>(0.0), shadow_factor);
+    color = mix(color, vec3<f32>(1.0), bright_factor + shine);
+    
+    return SurfaceLighting(color + emissive, vec3<f32>(1.0));
+}
+
 fn shade_surface(
     position: vec3<f32>,
     normal: vec3<f32>,

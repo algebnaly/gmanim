@@ -1150,6 +1150,7 @@ pub struct CameraUniform {
     pub environment_intensity: f32,
     pub environment_color: [f32; 3],
     pub environment_rotation: f32,
+    pub background_color: [f32; 4],
 }
 
 #[repr(C)]
@@ -1214,7 +1215,12 @@ impl From<SurfaceMaterial> for MaterialData3D {
                     0.0
                 },
             ],
-            grid_backface: [grid.backface_intensity, 0.0, 0.0, 0.0],
+            grid_backface: [
+                grid.backface_intensity,
+                if material.unlit { 1.0 } else { 0.0 },
+                if material.flat_shading { 1.0 } else { 0.0 },
+                0.0,
+            ],
             transmission: transmission
                 .map(|transmission| {
                     [
@@ -3214,6 +3220,9 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         outputs.cpu_rgba |= output.is_some();
         let output_w = scene_config.output_width as f32;
         let output_h = scene_config.output_height as f32;
+        
+        let bg = scene.background_color.to_array();
+        let bg_clear_color = [bg[0] as f32, bg[1] as f32, bg[2] as f32, bg[3] as f32];
 
         let (has_clip, clip_x, clip_y, clip_w, clip_h) = match scene.clip_rect {
             Some(crate::ClipRect::Pixel(x, y, w, h)) => {
@@ -3489,6 +3498,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 scene.environment_light.color.b as f32 / 255.0,
             ],
             environment_rotation: scene.environment_light.rotation_radians as f32,
+            background_color: bg_clear_color,
         };
 
         mesh_draws_3d.sort_by(|left, right| {
@@ -3515,6 +3525,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             &mesh_batches_2d,
             output,
             outputs,
+            bg_clear_color,
         );
     }
 
@@ -3532,6 +3543,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         mesh_batches_2d: &[Mesh2DBatch],
         output: Option<&mut [u8]>,
         outputs: RenderOutputs,
+        background_color: [f32; 4],
     ) {
         let align = 256;
         let unpadded_bytes_per_row = width * 4;
@@ -5269,7 +5281,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     targets.texture.vk_image,
                     vk::ImageLayout::GENERAL,
                     &vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 0.0],
+                        float32: background_color,
                     },
                     &[vk::ImageSubresourceRange {
                         aspect_mask: vk::ImageAspectFlags::COLOR,
@@ -5979,7 +5991,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .clear_value(vk::ClearValue {
                         color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 0.0],
+                            float32: background_color,
                         },
                     });
                 if let Some(msaa_texture) = &cache.msaa_texture {

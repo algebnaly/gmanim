@@ -50,7 +50,7 @@ impl Rectangle {
             fill_tess
                 .tessellate_path(
                     &path,
-                    &FillOptions::default(),
+                    &FillOptions::default().with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -61,7 +61,9 @@ impl Rectangle {
             stroke_tess
                 .tessellate_path(
                     &path,
-                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -98,6 +100,7 @@ pub struct SimpleLine {
     pub p1: Point3<GMFloat>,
     pub draw_config: DrawConfig,
     pub mesh: TriangleMesh2D,
+    pub local_transform: nalgebra::Matrix4<GMFloat>,
 }
 
 impl SimpleLine {
@@ -107,6 +110,7 @@ impl SimpleLine {
             p1,
             draw_config: DrawConfig::default(),
             mesh: TriangleMesh2D::default(),
+            local_transform: nalgebra::Matrix4::identity(),
         };
         sl.update_mesh();
         sl
@@ -115,9 +119,35 @@ impl SimpleLine {
 
 impl SimpleLine {
     pub fn update_mesh(&mut self) {
+        let mut u = self.p1 - self.p0;
+        let u_len = u.norm();
+        if u_len < 1e-6 {
+            u = nalgebra::Vector3::new(1.0, 0.0, 0.0);
+        } else {
+            u /= u_len;
+        }
+
+        let arbitrary = if u.x.abs() > 0.5 {
+            nalgebra::Vector3::new(0.0, 1.0, 0.0)
+        } else {
+            nalgebra::Vector3::new(1.0, 0.0, 0.0)
+        };
+        let n = u.cross(&arbitrary).normalize();
+        let v = n.cross(&u).normalize();
+
+        let mut local_transform = nalgebra::Matrix4::identity();
+        local_transform.set_column(0, &nalgebra::Vector4::new(u.x, u.y, u.z, 0.0));
+        local_transform.set_column(1, &nalgebra::Vector4::new(v.x, v.y, v.z, 0.0));
+        local_transform.set_column(2, &nalgebra::Vector4::new(n.x, n.y, n.z, 0.0));
+        local_transform.set_column(3, &nalgebra::Vector4::new(self.p0.x, self.p0.y, self.p0.z, 1.0));
+        self.local_transform = local_transform;
+
+        let p0_2d = nalgebra::Point2::new(0.0, 0.0);
+        let p1_2d = nalgebra::Point2::new((self.p1 - self.p0).dot(&u), 0.0);
+
         let mut builder = Path::builder();
-        builder.begin(point(self.p0.x as f32, self.p0.y as f32));
-        builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
+        builder.begin(point(p0_2d.x as f32, p0_2d.y as f32));
+        builder.line_to(point(p1_2d.x as f32, p1_2d.y as f32));
         builder.end(false);
         let path = builder.build();
 
@@ -128,7 +158,9 @@ impl SimpleLine {
             stroke_tess
                 .tessellate_path(
                     &path,
-                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -153,7 +185,7 @@ impl Mobject for SimpleLine {
         visitor: &mut dyn crate::mobjects::RenderVisitor,
         world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
-        visitor.push_mesh_2d(&self.mesh, world_transform);
+        visitor.push_mesh_2d(&self.mesh, world_transform * self.local_transform);
     }
 }
 
@@ -255,7 +287,9 @@ impl Arc {
             stroke_tess
                 .tessellate_path(
                     &path,
-                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -309,7 +343,7 @@ impl PolyLine {
             fill_tess
                 .tessellate_path(
                     &path,
-                    &FillOptions::default(),
+                    &FillOptions::default().with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -320,7 +354,9 @@ impl PolyLine {
             stroke_tess
                 .tessellate_path(
                     &path,
-                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -346,5 +382,108 @@ impl Mobject for PolyLine {
         world_transform: nalgebra::Matrix4<crate::GMFloat>,
     ) {
         visitor.push_mesh_2d(&self.mesh, world_transform);
+    }
+}
+
+pub struct QuadraticBezier {
+    pub a: Point3<GMFloat>,
+    pub b: Point3<GMFloat>,
+    pub c: Point3<GMFloat>,
+    pub draw_config: DrawConfig,
+    pub mesh: TriangleMesh2D,
+    pub local_transform: nalgebra::Matrix4<GMFloat>,
+}
+
+impl QuadraticBezier {
+    pub fn new(a: Point3<GMFloat>, b: Point3<GMFloat>, c: Point3<GMFloat>) -> Self {
+        let mut qb = Self {
+            a,
+            b,
+            c,
+            draw_config: DrawConfig::default(),
+            mesh: TriangleMesh2D::default(),
+            local_transform: nalgebra::Matrix4::identity(),
+        };
+        qb.update_mesh();
+        qb
+    }
+
+    pub fn update_mesh(&mut self) {
+        let mut u = self.c - self.a;
+        let u_len = u.norm();
+        if u_len < 1e-6 {
+            u = nalgebra::Vector3::new(1.0, 0.0, 0.0);
+        } else {
+            u /= u_len;
+        }
+
+        let mut n = u.cross(&(self.b - self.a));
+        if n.norm_squared() < 1e-6 {
+            let arbitrary = if u.x.abs() > 0.5 {
+                nalgebra::Vector3::new(0.0, 1.0, 0.0)
+            } else {
+                nalgebra::Vector3::new(1.0, 0.0, 0.0)
+            };
+            n = u.cross(&arbitrary).normalize();
+        } else {
+            n.normalize_mut();
+        }
+        let v = n.cross(&u).normalize();
+
+        let mut local_transform = nalgebra::Matrix4::identity();
+        local_transform.set_column(0, &nalgebra::Vector4::new(u.x, u.y, u.z, 0.0));
+        local_transform.set_column(1, &nalgebra::Vector4::new(v.x, v.y, v.z, 0.0));
+        local_transform.set_column(2, &nalgebra::Vector4::new(n.x, n.y, n.z, 0.0));
+        local_transform.set_column(3, &nalgebra::Vector4::new(self.a.x, self.a.y, self.a.z, 1.0));
+        self.local_transform = local_transform;
+
+        let a_2d = nalgebra::Point2::new(0.0, 0.0);
+        let b_2d = nalgebra::Point2::new((self.b - self.a).dot(&u), (self.b - self.a).dot(&v));
+        let c_2d = nalgebra::Point2::new((self.c - self.a).dot(&u), (self.c - self.a).dot(&v));
+
+        let mut builder = Path::builder();
+        builder.begin(point(a_2d.x as f32, a_2d.y as f32));
+        builder.quadratic_bezier_to(
+            point(b_2d.x as f32, b_2d.y as f32),
+            point(c_2d.x as f32, c_2d.y as f32),
+        );
+        builder.end(false);
+        let path = builder.build();
+
+        let mut geometry: VertexBuffers<Vertex2D, u32> = VertexBuffers::new();
+        let color = self.draw_config.color;
+        if self.draw_config.stoke_width > 0.0 {
+            let mut stroke_tess = StrokeTessellator::new();
+            stroke_tess
+                .tessellate_path(
+                    &path,
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
+                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
+                )
+                .unwrap();
+        }
+
+        self.mesh
+            .replace_geometry(geometry.vertices, geometry.indices, color);
+    }
+}
+
+impl Draw for QuadraticBezier {
+    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
+}
+
+impl Mobject for QuadraticBezier {
+    fn default_name(&self) -> &'static str {
+        "QuadraticBezier"
+    }
+
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.mesh, world_transform * self.local_transform);
     }
 }

@@ -172,6 +172,7 @@ pub struct Scene {
     pub environment_light: EnvironmentLight,
     pub clip_rect: Option<ClipRect>,
     pub aa_level: u32,
+    pub background_color: Color,
 }
 
 #[derive(Clone)]
@@ -182,6 +183,7 @@ pub struct SceneSnapshot {
     environment_light: EnvironmentLight,
     clip_rect: Option<ClipRect>,
     aa_level: u32,
+    pub background_color: Color,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -207,6 +209,7 @@ impl Scene {
             environment_light: self.environment_light,
             clip_rect: self.clip_rect,
             aa_level: self.aa_level,
+            background_color: self.background_color,
         }
     }
 
@@ -217,6 +220,7 @@ impl Scene {
         self.environment_light = snapshot.environment_light;
         self.clip_rect = snapshot.clip_rect;
         self.aa_level = snapshot.aa_level;
+        self.background_color = snapshot.background_color;
     }
 
     pub fn from_snapshot(snapshot: &SceneSnapshot) -> Self {
@@ -227,6 +231,7 @@ impl Scene {
             environment_light: snapshot.environment_light,
             clip_rect: snapshot.clip_rect,
             aa_level: snapshot.aa_level,
+            background_color: snapshot.background_color,
         }
     }
 
@@ -246,6 +251,7 @@ impl Scene {
             },
             clip_rect: None,
             aa_level: 1,
+            background_color: Color::new(0, 0, 0, 0),
         }
     }
 }

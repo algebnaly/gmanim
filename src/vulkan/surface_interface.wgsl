@@ -28,6 +28,7 @@ struct CameraUniform {
     environment_intensity: f32,
     environment_color: vec3<f32>,
     environment_rotation: f32,
+    background_color: vec4<f32>,
 }
 
 struct MaterialData3D {

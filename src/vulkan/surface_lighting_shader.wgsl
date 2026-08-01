@@ -47,21 +47,40 @@ fn shade_resolved_surface(
     let position = reconstruct_position(pixel, normal_depth.w);
     let normal = normalize(normal_depth.xyz);
     let albedo = albedo_coverage.rgb;
-    let roughness = clamp(material.surface.x, 0.04, 1.0);
-    let metallic = clamp(material.surface.y, 0.0, 1.0);
-    let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
-    let f0 = mix(vec3<f32>(reflectance_f0), albedo, metallic);
-    let lighting = shade_surface(
-        position,
-        normal,
-        normalize(camera.pos - position),
-        albedo,
-        roughness,
-        metallic,
-        f0,
-        material.emissive.rgb * material.emissive.a,
-    );
-    return vec4<f32>(lighting.color * albedo_coverage.a, albedo_coverage.a);
+    let is_unlit = material.grid_backface.y > 0.5;
+    let is_flat = material.grid_backface.z > 0.5;
+    var final_color = vec3<f32>(0.0);
+    let emissive_color = material.emissive.rgb * material.emissive.a;
+    if is_unlit {
+        final_color = albedo + emissive_color;
+    } else if is_flat {
+        let view_direction = normalize(camera.pos - position);
+        let lighting = shade_surface_flat(
+            position,
+            normal,
+            view_direction,
+            albedo,
+            emissive_color,
+        );
+        final_color = lighting.color;
+    } else {
+        let roughness = clamp(material.surface.x, 0.04, 1.0);
+        let metallic = clamp(material.surface.y, 0.0, 1.0);
+        let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
+        let f0 = mix(vec3<f32>(reflectance_f0), albedo, metallic);
+        let lighting = shade_surface(
+            position,
+            normal,
+            normalize(camera.pos - position),
+            albedo,
+            roughness,
+            metallic,
+            f0,
+            emissive_color,
+        );
+        final_color = lighting.color;
+    }
+    return vec4<f32>(final_color * albedo_coverage.a, albedo_coverage.a);
 }
 
 @compute @workgroup_size(16, 16)
@@ -86,9 +105,14 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         textureLoad(resolved_secondary_albedo_coverage, position, 0),
         secondary_material_id,
     );
+    let alpha = min(primary.a + secondary.a, 1.0);
+    let bg = camera.background_color;
+    let final_rgb = primary.rgb + secondary.rgb + bg.rgb * (1.0 - alpha);
+    let final_a = alpha + bg.a * (1.0 - alpha);
+
     textureStore(
         output_hdr,
         position,
-        vec4<f32>(primary.rgb + secondary.rgb, min(primary.a + secondary.a, 1.0)),
+        vec4<f32>(final_rgb, final_a),
     );
 }

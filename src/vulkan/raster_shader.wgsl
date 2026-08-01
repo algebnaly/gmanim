@@ -286,25 +286,46 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location
     let normal = select(-geometric_normal, geometric_normal, is_front);
     let view_direction = normalize(camera.pos - in.frag_pos);
 
-    let roughness = clamp(material.surface.x, 0.04, 1.0);
-    let metallic = clamp(material.surface.y, 0.0, 1.0);
     let is_transparent = material.surface.w >= 0.5;
     let albedo = in.color.rgb * material.base_color.rgb;
-    let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
-    let ior_f0 = pow((material.transmission.z - 1.0) / (material.transmission.z + 1.0), 2.0);
-    let dielectric_f0 = select(reflectance_f0, ior_f0, is_transparent);
-    let f0 = mix(vec3<f32>(dielectric_f0), albedo, metallic);
-    let lighting = shade_surface(
-        in.frag_pos,
-        normal,
-        view_direction,
-        albedo,
-        roughness,
-        metallic,
-        f0,
-        material.emissive.rgb * material.emissive.a,
-    );
-    var color = lighting.color;
+    let is_unlit = material.grid_backface.y > 0.5;
+    let is_flat = material.grid_backface.z > 0.5;
+    var color = vec3<f32>(0.0);
+    let emissive_color = material.emissive.rgb * material.emissive.a;
+    var environment_fresnel = vec3<f32>(1.0);
+
+    if is_unlit {
+        color = albedo + emissive_color;
+    } else if is_flat {
+        let lighting = shade_surface_flat(
+            in.frag_pos,
+            normal,
+            view_direction,
+            albedo,
+            emissive_color,
+        );
+        color = lighting.color;
+        environment_fresnel = lighting.environment_fresnel;
+    } else {
+        let roughness = clamp(material.surface.x, 0.04, 1.0);
+        let metallic = clamp(material.surface.y, 0.0, 1.0);
+        let reflectance_f0 = 0.16 * material.surface.z * material.surface.z;
+        let ior_f0 = pow((material.transmission.z - 1.0) / (material.transmission.z + 1.0), 2.0);
+        let dielectric_f0 = select(reflectance_f0, ior_f0, is_transparent);
+        let f0 = mix(vec3<f32>(dielectric_f0), albedo, metallic);
+        let lighting = shade_surface(
+            in.frag_pos,
+            normal,
+            view_direction,
+            albedo,
+            roughness,
+            metallic,
+            f0,
+            emissive_color,
+        );
+        color = lighting.color;
+        environment_fresnel = lighting.environment_fresnel;
+    }
 
     var optical_path = 0.0;
     if is_transparent {
@@ -332,7 +353,7 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location
             max(material.transmission.z, 1.0001),
         );
         let transmitted = refracted * transmittance + medium_scattering;
-        color = mix(transmitted, color, lighting.environment_fresnel);
+        color = mix(transmitted, color, environment_fresnel);
     }
 
     let patch_masks = spherical_patch(in.surface_coord, material);

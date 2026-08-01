@@ -50,7 +50,7 @@ impl Polygon {
             fill_tess
                 .tessellate_path(
                     &path,
-                    &FillOptions::default(),
+                    &FillOptions::default().with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();
@@ -61,7 +61,9 @@ impl Polygon {
             stroke_tess
                 .tessellate_path(
                     &path,
-                    &StrokeOptions::default().with_line_width(self.draw_config.stoke_width as f32),
+                    &StrokeOptions::default()
+                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
                 .unwrap();

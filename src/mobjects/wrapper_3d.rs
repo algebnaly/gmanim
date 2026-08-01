@@ -36,6 +36,7 @@ impl RenderVisitor for InterceptorVisitor<'_> {
             });
         }
         mesh3d.indices = mesh.indices().to_vec();
+        mesh3d.material.unlit = true;
 
         self.real_visitor.push_surface_3d(Surface3DSubmission {
             geometry: Geometry3DRef::Mesh(&mesh3d),

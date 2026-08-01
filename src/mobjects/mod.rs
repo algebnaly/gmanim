@@ -10,7 +10,7 @@ pub mod svg_shape;
 pub mod text;
 pub mod three_d_viewport;
 pub mod wrapper_3d;
-pub use basic::{Arc, PolyLine, Rectangle, SimpleLine};
+pub use basic::{Arc, PolyLine, QuadraticBezier, Rectangle, SimpleLine};
 pub use dot::Dot;
 
 use std::{
