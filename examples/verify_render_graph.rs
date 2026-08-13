@@ -43,6 +43,7 @@ fn main() {
             msaa_samples: 4,
             ssaa_factor: 1,
             output_color_profile: Default::default(),
+            analytic_aa_2d: true,
         },
     );
 
@@ -203,6 +204,7 @@ fn main() {
             msaa_samples: 1,
             ssaa_factor: 1,
             output_color_profile: Default::default(),
+            analytic_aa_2d: true,
         },
     );
     let (stats, non_black) =

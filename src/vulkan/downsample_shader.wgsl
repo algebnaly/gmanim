@@ -2,6 +2,12 @@
 @group(0) @binding(1) var input_image: texture_2d<f32>;
 @group(0) @binding(2) var bloom_image: texture_2d<f32>;
 
+struct ToneMapConstants {
+    factor: u32,
+    _padding: vec3<u32>,
+}
+@group(0) @binding(3) var<uniform> constants: ToneMapConstants;
+
 @compute @workgroup_size(16, 16, 1)
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let output_size = textureDimensions(output_image);
@@ -9,8 +15,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
 
-    let input_size = textureDimensions(input_image).xy;
-    let factor = input_size.x / output_size.x;
+    // The resolved image is normally allocated at ssaa_factor x output, but
+    // analytic-AA 2D frames raster at 1x. The CPU-provided factor reflects
+    // the actual raster scale of this frame.
+    let factor = constants.factor;
     let base = global_id.xy * factor;
     var color = vec4<f32>(0.0);
 

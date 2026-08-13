@@ -679,6 +679,17 @@ pub struct Nv12Constants {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ToneMapConstants {
+    /// Raster-scale factor of the resolved image relative to the output.
+    /// Analytic-AA 2D frames raster at 1x even when `ssaa_factor` is larger,
+    /// so the tone-map downsample loop must use this instead of the image
+    /// dimensions.
+    pub factor: u32,
+    pub _padding: [u32; 3],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraUniform2D {
     pub width: f32,
     pub height: f32,
@@ -694,10 +705,14 @@ pub struct Instance2D {
     pub model_2: [f32; 4],
     pub model_3: [f32; 4],
     pub color: [f32; 4],
+    /// [half_extent_x, half_extent_y, analytic_aa_enabled, unused].
+    /// When `z > 0.5` the fragment shader derives edge coverage from the
+    /// interpolated local coordinates instead of relying on MSAA.
+    pub aa_params: [f32; 4],
 }
 
 impl Instance2D {
-    fn new(transform: nalgebra::Matrix4<crate::GMFloat>, color: [f32; 4]) -> Self {
+    fn new(transform: nalgebra::Matrix4<crate::GMFloat>, color: [f32; 4], aa_params: [f32; 4]) -> Self {
         Self {
             model_0: [
                 transform[(0, 0)] as f32,
@@ -724,6 +739,7 @@ impl Instance2D {
                 transform[(3, 3)] as f32,
             ],
             color,
+            aa_params,
         }
     }
 }
@@ -788,6 +804,7 @@ pub struct RendererStats {
     pub mesh_2d_vertex_bytes_uploaded: u64,
     pub mesh_2d_index_bytes_uploaded: u64,
     pub mesh_2d_arena_rebuilds: u32,
+    pub mesh_2d_analytic_aa: u32,
     pub sdf_dispatches: u32,
     pub surface_lighting_dispatches: u32,
     pub raster_passes: u32,
@@ -954,6 +971,37 @@ unsafe fn write_gpu_timestamp(
             );
         }
     }
+}
+
+/// Returns `[half_extent_x, half_extent_y, enabled, 0]` when the rectangle
+/// qualifies for analytic edge AA: filled, unstroked, with perpendicular
+/// adjacent edges that close the quad. Otherwise returns zeros so the frame
+/// keeps the multisampled supersampled raster path.
+fn rectangle_analytic_aa_params(rectangle: &Rectangle) -> [f32; 4] {
+    use crate::GMFloat;
+    let degenerate = |value: GMFloat| value.abs() <= GMFloat::EPSILON * 4.0;
+    if !rectangle.draw_config.fill || rectangle.draw_config.stoke_width > 0.0 {
+        return [0.0; 4];
+    }
+    let edge_x = rectangle.p1 - rectangle.p0;
+    let edge_y = rectangle.p3 - rectangle.p0;
+    let edge_x_len = edge_x.norm();
+    let edge_y_len = edge_y.norm();
+    if degenerate(edge_x_len) || degenerate(edge_y_len) {
+        return [0.0; 4];
+    }
+    let perpendicular = edge_x.dot(&edge_y).abs() <= edge_x_len * edge_y_len * 1e-4;
+    let closure = (rectangle.p2 - (rectangle.p1 + edge_y)).norm();
+    let closes = closure <= (edge_x_len + edge_y_len) * 1e-4;
+    if !perpendicular || !closes {
+        return [0.0; 4];
+    }
+    [
+        (edge_x_len / 2.0) as f32,
+        (edge_y_len / 2.0) as f32,
+        1.0,
+        0.0,
+    ]
 }
 
 fn build_ordered_mesh_2d_batches(submissions: Vec<Mesh2DSubmission>) -> Vec<Mesh2DBatch> {
@@ -1667,12 +1715,14 @@ pub struct VulkanRenderer {
     raster_pipeline_layout_2d: vk::PipelineLayout,
     raster_pipeline_2d: vk::Pipeline,
     raster_pipeline_2d_depthless: vk::Pipeline,
+    raster_pipeline_2d_analytic: vk::Pipeline,
     vertex_buffer_2d: Buffer,
     index_buffer_2d: Buffer,
     vertex_staging_buffer_2d: Buffer,
     index_staging_buffer_2d: Buffer,
     instance_buffer_2d: Buffer,
     camera_buffer_2d: Buffer,
+    tone_map_factor_buffer: Buffer,
     vertex_buffer_stride: u64,
     index_buffer_stride: u64,
     camera_buffer_stride: u64,
@@ -1682,6 +1732,7 @@ pub struct VulkanRenderer {
     index_staging_buffer_2d_stride: u64,
     instance_buffer_2d_stride: u64,
     camera_buffer_2d_stride: u64,
+    tone_map_factor_stride: u64,
     mesh_cache_2d: HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
     rectangle_cache_2d: HashMap<RectangleId, CachedRectangle2D>,
     static_vertex_buffer_2d_capacity: u64,
@@ -1692,6 +1743,7 @@ pub struct VulkanRenderer {
     gpu_profiling: bool,
     last_gpu_timings: Option<GpuPassTimings>,
     bloom_enabled: bool,
+    analytic_aa_2d: bool,
 
     frame_data: [FrameData; RENDER_FRAME_COUNT],
 
@@ -1702,6 +1754,7 @@ impl VulkanRenderer {
     pub fn new(ctx: Arc<VulkanContext>, config: crate::RendererConfig) -> Self {
         let msaa_samples = config.msaa_samples;
         let ssaa_factor = config.ssaa_factor;
+        let analytic_aa_2d = config.analytic_aa_2d;
         let output_transform = match config.output_color_profile {
             crate::OutputColorProfile::Bt709Sdr => {
                 include_str!("output_transform_bt709.wgsl")
@@ -1781,6 +1834,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let surface_composite_shader =
             compile_wgsl_full(&ctx, include_str!("surface_composite_shader.wgsl"));
         let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("raster_shader_2d.wgsl"));
+        let raster_shader_2d_analytic =
+            compile_wgsl_full(&ctx, include_str!("raster_shader_2d_aa.wgsl"));
         let compile_output_shader = |source| {
             let source = format!("{output_transform}\n{source}");
             compile_wgsl_full(&ctx, &source)
@@ -1811,6 +1866,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             vk::DescriptorSetLayoutBinding {
                 binding: 2,
                 descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                descriptor_count: 1,
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                ..Default::default()
+            },
+            vk::DescriptorSetLayoutBinding {
+                binding: 3,
+                descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
                 descriptor_count: 1,
                 stage_flags: vk::ShaderStageFlags::COMPUTE,
                 ..Default::default()
@@ -2772,6 +2834,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 offset: memoffset::offset_of!(Vertex2D, position) as u32,
             },
             vk::VertexInputAttributeDescription {
+                binding: 0,
+                location: 6,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: memoffset::offset_of!(Vertex2D, local) as u32,
+            },
+            vk::VertexInputAttributeDescription {
                 binding: 1,
                 location: 1,
                 format: vk::Format::R32G32B32A32_SFLOAT,
@@ -2800,6 +2868,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 location: 5,
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: memoffset::offset_of!(Instance2D, color) as u32,
+            },
+            vk::VertexInputAttributeDescription {
+                binding: 1,
+                location: 7,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: memoffset::offset_of!(Instance2D, aa_params) as u32,
             },
         ];
         let vertex_input_info_2d = vk::PipelineVertexInputStateCreateInfo {
@@ -2881,6 +2955,41 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 )
                 .unwrap()[0]
         };
+        // Analytic-AA 2D raster: one sample per pixel at output resolution,
+        // edge coverage derived from rect-local coordinates in the fragment
+        // shader. Same attachment format and blend state as the depthless
+        // pipeline so the tone-map pass is the single shared output path.
+        let analytic_shader_stages_2d = [
+            vk::PipelineShaderStageCreateInfo {
+                module: raster_shader_2d_analytic,
+                ..shader_stages_2d[0]
+            },
+            vk::PipelineShaderStageCreateInfo {
+                module: raster_shader_2d_analytic,
+                ..shader_stages_2d[1]
+            },
+        ];
+        let analytic_multisampling = vk::PipelineMultisampleStateCreateInfo {
+            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            ..multisampling
+        };
+        let raster_pipeline_info_2d_analytic = vk::GraphicsPipelineCreateInfo {
+            p_next: (&depthless_pipeline_rendering_info as *const vk::PipelineRenderingCreateInfo)
+                .cast(),
+            stage_count: analytic_shader_stages_2d.len() as u32,
+            p_stages: analytic_shader_stages_2d.as_ptr(),
+            p_multisample_state: &analytic_multisampling,
+            ..raster_pipeline_info_2d
+        };
+        let raster_pipeline_2d_analytic = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&raster_pipeline_info_2d_analytic),
+                    None,
+                )
+                .unwrap()[0]
+        };
 
         let descriptor_pool_sizes = [
             vk::DescriptorPoolSize {
@@ -2956,7 +3065,18 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             std::mem::size_of::<CameraUniform2D>() as u64,
             uniform_alignment,
         );
+        let tone_map_factor_stride = align_up(
+            std::mem::size_of::<ToneMapConstants>() as u64,
+            uniform_alignment,
+        );
         let frame_count = RENDER_FRAME_COUNT as u64;
+
+        let tone_map_factor_buffer = Buffer::new(
+            &ctx,
+            tone_map_factor_stride * frame_count,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
 
         let vertex_buffer = Buffer::new(
             &ctx,
@@ -3091,6 +3211,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             ctx.device
                 .destroy_shader_module(surface_composite_shader, None);
             ctx.device.destroy_shader_module(raster_shader_2d, None);
+            ctx.device
+                .destroy_shader_module(raster_shader_2d_analytic, None);
             ctx.device.destroy_shader_module(nv12_shader, None);
             ctx.device.destroy_shader_module(video_nv12_shader, None);
             ctx.device
@@ -3150,12 +3272,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             raster_pipeline_layout_2d,
             raster_pipeline_2d,
             raster_pipeline_2d_depthless,
+            raster_pipeline_2d_analytic,
             vertex_buffer_2d,
             index_buffer_2d,
             vertex_staging_buffer_2d,
             index_staging_buffer_2d,
             instance_buffer_2d,
             camera_buffer_2d,
+            tone_map_factor_buffer,
             vertex_buffer_stride,
             index_buffer_stride,
             camera_buffer_stride,
@@ -3165,6 +3289,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             index_staging_buffer_2d_stride,
             instance_buffer_2d_stride,
             camera_buffer_2d_stride,
+            tone_map_factor_stride,
             mesh_cache_2d: HashMap::new(),
             rectangle_cache_2d: HashMap::new(),
             static_vertex_buffer_2d_capacity: static_vertex_buffer_2d_size,
@@ -3175,6 +3300,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             gpu_profiling: false,
             last_gpu_timings: None,
             bloom_enabled: false,
+            analytic_aa_2d,
             frame_data,
             cache: std::sync::Mutex::new(None),
             msaa_samples: sample_count.as_raw(),
@@ -3282,7 +3408,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             ) {
                 self.mesh_submissions_2d.push(Mesh2DSubmission {
                     geometry: mesh.geometry(),
-                    instance: Instance2D::new(transform, mesh.color()),
+                    instance: Instance2D::new(transform, mesh.color(), [0.0; 4]),
                     dynamic: false,
                 });
             }
@@ -3325,6 +3451,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             rectangle.color.b as f32 / 255.0,
                             rectangle.color.a as f32 / 255.0,
                         ],
+                        rectangle_analytic_aa_params(rectangle),
                     ),
                     dynamic,
                 });
@@ -3807,17 +3934,11 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     bloom_descriptor_sets: [vk::DescriptorSet::null(); 3],
                 }
             });
-            let msaa_texture = (raster_sample_count != vk::SampleCountFlags::TYPE_1).then(|| {
-                Image::new(
-                    &self.ctx,
-                    width * self.ssaa_factor,
-                    height * self.ssaa_factor,
-                    vk::Format::R16G16B16A16_SFLOAT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                    vk::ImageAspectFlags::COLOR,
-                    raster_sample_count,
-                )
-            });
+            // The multisampled intermediate is allocated lazily on the first
+            // frame that actually rasterizes with more than one sample.
+            // Analytic-AA 2D frames never touch it, so pure 2D scenes do not
+            // pay for a high-resolution 8x MSAA image.
+            let msaa_texture = None;
             let output_buffer_size = (padded_bytes_per_row * height) as u64;
             let output_buffers = [
                 Buffer::new(
@@ -4278,6 +4399,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 range: self.camera_buffer_2d_stride,
                 ..Default::default()
             };
+            let tone_map_factor_infos: Vec<_> = (0..RENDER_FRAME_COUNT)
+                .map(|index| vk::DescriptorBufferInfo {
+                    buffer: self.tone_map_factor_buffer.vk_buffer,
+                    offset: index as u64 * self.tone_map_factor_stride,
+                    range: self.tone_map_factor_stride,
+                    ..Default::default()
+                })
+                .collect();
 
             let mut write_descriptor_sets = vec![vk::WriteDescriptorSet {
                 s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
@@ -4661,6 +4790,15 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     },
                     vk::WriteDescriptorSet {
                         s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
+                        dst_set: targets.composite_descriptor_set,
+                        dst_binding: 3,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        descriptor_count: 1,
+                        p_buffer_info: &tone_map_factor_infos[index],
+                        ..Default::default()
+                    },
+                    vk::WriteDescriptorSet {
+                        s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                         dst_set: targets.bloom_descriptor_sets[0],
                         dst_binding: 0,
                         descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
@@ -4941,11 +5079,31 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             }
             Err(error) => panic!("2D frame preparation failed: {error:?}"),
         };
-        let frame_plan = FrameExecutionPlan::build(
-            !objects_3d.is_empty(),
-            !mesh_indices.is_empty() || !prepared_mesh_batches_2d.is_empty(),
-            self.ssaa_factor,
-        );
+        let has_sdf = !objects_3d.is_empty();
+        // Analytic AA applies only when every rastered 2D instance is a
+        // filled rectangle: the frame then renders at output resolution with
+        // one sample, and the tone-map downsample factor becomes one.
+        // Bloom is excluded for now because its extract pass still derives
+        // its sampling grid from the resolved image dimensions.
+        let raster_2d_only = objects_3d.is_empty()
+            && mesh_indices.is_empty()
+            && !prepared_mesh_batches_2d.is_empty();
+        let analytic_2d = raster_2d_only
+            && self.analytic_aa_2d
+            && !self.bloom_enabled
+            && instances_2d
+                .iter()
+                .all(|instance| instance.aa_params[2] > 0.5);
+        let frame_plan = if analytic_2d {
+            FrameExecutionPlan::RasterToneMap
+        } else {
+            FrameExecutionPlan::build(
+                has_sdf,
+                !mesh_indices.is_empty() || !prepared_mesh_batches_2d.is_empty(),
+                self.ssaa_factor,
+            )
+        };
+        let raster_scale = if analytic_2d { 1 } else { self.ssaa_factor };
         let fused_video_downsample = frame_plan == FrameExecutionPlan::RasterDownsample
             && self.ssaa_factor == 2
             && !self.bloom_enabled
@@ -4972,6 +5130,23 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             ));
             cache.msaa_depth_texture_state = TrackedImageState::UNDEFINED;
         }
+        let raster_sample_count = msaa_to_vk_sample_count(self.msaa_samples);
+        if frame_plan.runs_raster()
+            && !analytic_2d
+            && cache.msaa_texture.is_none()
+            && raster_sample_count != vk::SampleCountFlags::TYPE_1
+        {
+            cache.msaa_texture = Some(Image::new(
+                &self.ctx,
+                width * self.ssaa_factor,
+                height * self.ssaa_factor,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                raster_sample_count,
+            ));
+            cache.msaa_texture_state = TrackedImageState::UNDEFINED;
+        }
 
         self.last_stats = RendererStats {
             mesh_3d_opaque_draw_calls: mesh_draws_3d
@@ -4995,6 +5170,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .map(|upload| std::mem::size_of_val(upload.geometry.indices()) as u64)
                 .sum(),
             mesh_2d_arena_rebuilds,
+            mesh_2d_analytic_aa: analytic_2d as u32,
             sdf_dispatches: frame_plan.runs_sdf() as u32,
             surface_lighting_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
             raster_passes: frame_plan.runs_raster() as u32 + has_transparent_meshes as u32 * 2,
@@ -5106,6 +5282,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             self.camera_buffer_2d.write_bytes(
                 camera_buffer_2d_offset,
                 bytemuck::bytes_of(camera_uniform_2d),
+            );
+            self.tone_map_factor_buffer.write_bytes(
+                frame_idx as u64 * self.tone_map_factor_stride,
+                bytemuck::bytes_of(&ToneMapConstants {
+                    factor: raster_scale,
+                    _padding: [0; 3],
+                }),
             );
             if !surface_materials.is_empty() {
                 assert!(
@@ -6031,8 +6214,8 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 });
                 let color_attachments = [color_attachment];
                 let raster_extent = vk::Extent2D {
-                    width: width * self.ssaa_factor,
-                    height: height * self.ssaa_factor,
+                    width: width * raster_scale,
+                    height: height * raster_scale,
                 };
                 let mut rendering_info = vk::RenderingInfo::default()
                     .render_area(vk::Rect2D {
@@ -6077,7 +6260,9 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     self.ctx.device.cmd_bind_pipeline(
                         fd.command_buffer,
                         vk::PipelineBindPoint::GRAPHICS,
-                        if raster_uses_depth {
+                        if analytic_2d {
+                            self.raster_pipeline_2d_analytic
+                        } else if raster_uses_depth {
                             self.raster_pipeline_2d
                         } else {
                             self.raster_pipeline_2d_depthless
@@ -7086,12 +7271,15 @@ mod tests {
             vec![
                 Vertex2D {
                     position: [offset, 0.0],
+                    local: [offset, 0.0],
                 },
                 Vertex2D {
                     position: [offset + 1.0, 0.0],
+                    local: [offset + 1.0, 0.0],
                 },
                 Vertex2D {
                     position: [offset, 1.0],
+                    local: [offset, 1.0],
                 },
             ],
             vec![0, 1, 2],
@@ -7099,7 +7287,7 @@ mod tests {
     }
 
     fn instance(color: [f32; 4]) -> Instance2D {
-        Instance2D::new(Matrix4::identity(), color)
+        Instance2D::new(Matrix4::identity(), color, [0.0; 4])
     }
 
     #[test]

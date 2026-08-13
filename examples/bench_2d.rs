@@ -100,6 +100,7 @@ fn main() {
             msaa_samples: 8,
             ssaa_factor: 2,
             output_color_profile: Default::default(),
+            analytic_aa_2d: true,
         },
     );
 

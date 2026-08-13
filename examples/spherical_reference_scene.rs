@@ -26,6 +26,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             msaa_samples: 4,
             ssaa_factor: 1,
             output_color_profile: Default::default(),
+            analytic_aa_2d: true,
         },
     );
     renderer.set_bloom_enabled(true);

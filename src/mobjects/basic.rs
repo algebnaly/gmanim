@@ -4,7 +4,7 @@ use std::f32::consts::PI;
 use crate::{Color, Context, GMFloat, math_utils::k_for_bezier_arc};
 
 use super::{Draw, DrawConfig, Mobject};
-use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
+use crate::mobjects::mesh_2d::{RectVertexBuilder, TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{
@@ -35,7 +35,29 @@ impl Default for Rectangle {
 }
 
 impl Rectangle {
+    /// Tessellates the quad and stores per-vertex local coordinates in the
+    /// rectangle's own frame (x along p0->p1, y along p0->p3, origin at the
+    /// center). These coordinates feed the analytic edge-AA fragment shader;
+    /// they are ignored by the legacy MSAA path.
     pub fn tessellate(&self) -> TriangleMesh2D {
+        let center_x = (self.p0.x + self.p1.x + self.p2.x + self.p3.x) as f32 / 4.0;
+        let center_y = (self.p0.y + self.p1.y + self.p2.y + self.p3.y) as f32 / 4.0;
+        let edge_x = [
+            (self.p1.x - self.p0.x) as f32,
+            (self.p1.y - self.p0.y) as f32,
+        ];
+        let edge_y = [
+            (self.p3.x - self.p0.x) as f32,
+            (self.p3.y - self.p0.y) as f32,
+        ];
+        let edge_x_len = (edge_x[0] * edge_x[0] + edge_x[1] * edge_x[1]).sqrt().max(1e-8);
+        let edge_y_len = (edge_y[0] * edge_y[0] + edge_y[1] * edge_y[1]).sqrt().max(1e-8);
+        let rect_builder = RectVertexBuilder::new(
+            [center_x, center_y],
+            [edge_x[0] / edge_x_len, edge_x[1] / edge_x_len],
+            [edge_y[0] / edge_y_len, edge_y[1] / edge_y_len],
+        );
+
         let mut builder = Path::builder();
         builder.begin(point(self.p0.x as f32, self.p0.y as f32));
         builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
@@ -51,7 +73,7 @@ impl Rectangle {
                 .tessellate_path(
                     &path,
                     &FillOptions::default().with_tolerance(0.001),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
+                    &mut BuffersBuilder::new(&mut geometry, rect_builder),
                 )
                 .unwrap();
         }
@@ -64,7 +86,7 @@ impl Rectangle {
                     &StrokeOptions::default()
                         .with_line_width(self.draw_config.stoke_width as f32)
                         .with_tolerance(0.001),
-                    &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
+                    &mut BuffersBuilder::new(&mut geometry, rect_builder),
                 )
                 .unwrap();
         }

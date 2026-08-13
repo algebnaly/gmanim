@@ -11,6 +11,10 @@ use lyon::tessellation::{
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex2D {
     pub position: [f32; 2],
+    /// Coordinates in the geometry's own local frame. For rectangles this is
+    /// the rect frame (edges at +/- half extents); for generic lyon geometry
+    /// it duplicates `position` and is unused by analytic AA.
+    pub local: [f32; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -113,16 +117,70 @@ pub struct VertexBuilder;
 
 impl FillVertexConstructor<Vertex2D> for VertexBuilder {
     fn new_vertex(&mut self, vertex: FillVertex) -> Vertex2D {
+        let position = [vertex.position().x, vertex.position().y];
         Vertex2D {
-            position: [vertex.position().x, vertex.position().y],
+            position,
+            local: position,
         }
     }
 }
 
 impl StrokeVertexConstructor<Vertex2D> for VertexBuilder {
     fn new_vertex(&mut self, vertex: StrokeVertex) -> Vertex2D {
+        let position = [vertex.position().x, vertex.position().y];
         Vertex2D {
-            position: [vertex.position().x, vertex.position().y],
+            position,
+            local: position,
+        }
+    }
+}
+
+/// Projects tessellated vertices into a rectangle's own frame so the fragment
+/// shader can compute the signed distance to the rect edges analytically.
+///
+/// `x_axis` and `y_axis` are the normalized rect edge directions; `local`
+/// stores `dot(position - origin, axis)` for both axes.
+#[derive(Clone, Copy)]
+pub struct RectVertexBuilder {
+    origin: [f32; 2],
+    x_axis: [f32; 2],
+    y_axis: [f32; 2],
+}
+
+impl RectVertexBuilder {
+    pub fn new(origin: [f32; 2], x_axis: [f32; 2], y_axis: [f32; 2]) -> Self {
+        Self {
+            origin,
+            x_axis,
+            y_axis,
+        }
+    }
+
+    fn local_from_position(&self, position: [f32; 2]) -> [f32; 2] {
+        let relative = [position[0] - self.origin[0], position[1] - self.origin[1]];
+        [
+            relative[0] * self.x_axis[0] + relative[1] * self.x_axis[1],
+            relative[0] * self.y_axis[0] + relative[1] * self.y_axis[1],
+        ]
+    }
+}
+
+impl FillVertexConstructor<Vertex2D> for RectVertexBuilder {
+    fn new_vertex(&mut self, vertex: FillVertex) -> Vertex2D {
+        let position = [vertex.position().x, vertex.position().y];
+        Vertex2D {
+            position,
+            local: self.local_from_position(position),
+        }
+    }
+}
+
+impl StrokeVertexConstructor<Vertex2D> for RectVertexBuilder {
+    fn new_vertex(&mut self, vertex: StrokeVertex) -> Vertex2D {
+        let position = [vertex.position().x, vertex.position().y];
+        Vertex2D {
+            position,
+            local: self.local_from_position(position),
         }
     }
 }
@@ -166,9 +224,11 @@ mod tests {
         let vertices = vec![
             Vertex2D {
                 position: [0.0, 0.0],
+                local: [0.0, 0.0],
             },
             Vertex2D {
                 position: [1.0, 0.0],
+                local: [1.0, 0.0],
             },
         ];
         let first = MeshGeometry2D::new(vertices.clone(), vec![0, 1]);
@@ -183,12 +243,14 @@ mod tests {
         let first = MeshGeometry2D::new(
             vec![Vertex2D {
                 position: [0.0, 0.0],
+                local: [0.0, 0.0],
             }],
             vec![0],
         );
         let second = MeshGeometry2D::new(
             vec![Vertex2D {
                 position: [-0.0, 0.0],
+                local: [-0.0, 0.0],
             }],
             vec![0],
         );

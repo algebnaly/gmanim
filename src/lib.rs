@@ -76,6 +76,11 @@ pub struct RendererConfig {
     pub msaa_samples: u32,
     pub ssaa_factor: u32,
     pub output_color_profile: OutputColorProfile,
+    /// Replaces MSAA/SSAA for 2D-only frames with analytic edge coverage in
+    /// the fragment shader. Rectangle batches render at output resolution
+    /// with one sample; non-rectangle or mixed 3D/SDF frames keep the
+    /// multisampled supersampled path.
+    pub analytic_aa_2d: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -98,6 +103,7 @@ impl Default for RendererConfig {
             msaa_samples: 8,
             ssaa_factor: 1,
             output_color_profile: OutputColorProfile::Bt709Sdr,
+            analytic_aa_2d: true,
         }
     }
 }

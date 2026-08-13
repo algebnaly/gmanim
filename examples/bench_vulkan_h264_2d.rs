@@ -67,6 +67,9 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(300u32);
+    let analytic_aa_2d = std::env::var("GMANIM_2D_ANALYTIC_AA")
+        .map(|value| value != "0")
+        .unwrap_or(true);
     let use_p_frames = std::env::var("GMANIM_H264_P_FRAMES")
         .map(|value| value != "0")
         .unwrap_or(true);
@@ -115,7 +118,13 @@ fn main() -> std::io::Result<()> {
             p2: nalgebra::Point3::new(0.2, 0.2, 0.0),
             p3: nalgebra::Point3::new(-0.2, 0.2, 0.0),
             color: Color::new((i % 255) as u8, 100, 200, 255),
-            ..Default::default()
+            // Fill-only rectangles qualify for analytic edge AA; stroked
+            // rectangles keep the multisampled raster path.
+            draw_config: gmanim_core::mobjects::DrawConfig {
+                stoke_width: 0.0,
+                fill: true,
+                ..Default::default()
+            },
         };
         let id = scene.add_rectangle(rect);
         targets.push(id);
@@ -158,9 +167,13 @@ fn main() -> std::io::Result<()> {
             msaa_samples: 8,
             ssaa_factor: 2,
             output_color_profile: Default::default(),
+            analytic_aa_2d,
         },
     );
     renderer.set_gpu_profiling(true);
+    println!(
+        "Renderer config: 8x MSAA, 2x SSAA, analytic_aa_2d={analytic_aa_2d}"
+    );
 
     let mut first_frame_stats = None;
     let mut steady_frame_stats = None;
@@ -242,10 +255,23 @@ fn main() -> std::io::Result<()> {
     assert_eq!(renderer.last_stats().sdf_dispatches, 0);
     assert_eq!(renderer.last_stats().raster_passes, 1);
     assert_eq!(renderer.last_stats().depth_attachment_raster_passes, 0);
-    assert_eq!(renderer.last_stats().downsample_dispatches, 0);
-    assert_eq!(renderer.last_stats().fused_video_downsample_dispatches, 1);
     assert_eq!(renderer.last_stats().surface_resolve_dispatches, 0);
     assert_eq!(renderer.last_stats().surface_composite_dispatches, 0);
+    if analytic_aa_2d {
+        // Analytic AA rasters at output resolution with one sample; the
+        // output conversion reads the tone-mapped texture directly.
+        assert_eq!(renderer.last_stats().mesh_2d_analytic_aa, 1);
+        assert_eq!(renderer.last_stats().downsample_dispatches, 0);
+        assert_eq!(renderer.last_stats().fused_video_downsample_dispatches, 0);
+        assert_eq!(renderer.last_stats().tone_map_dispatches, 1);
+        assert_eq!(renderer.last_stats().output_conversion_dispatches, 1);
+    } else {
+        assert_eq!(renderer.last_stats().mesh_2d_analytic_aa, 0);
+        assert_eq!(renderer.last_stats().downsample_dispatches, 0);
+        assert_eq!(renderer.last_stats().fused_video_downsample_dispatches, 1);
+        assert_eq!(renderer.last_stats().tone_map_dispatches, 0);
+        assert_eq!(renderer.last_stats().output_conversion_dispatches, 1);
+    }
     println!("Total time: {:?}", start_time.elapsed());
     Ok(())
 }

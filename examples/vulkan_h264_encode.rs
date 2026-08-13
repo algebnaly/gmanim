@@ -103,6 +103,7 @@ fn main() -> io::Result<()> {
             msaa_samples: 16,
             ssaa_factor: 1,
             output_color_profile: Default::default(),
+            analytic_aa_2d: true,
         },
     );
 
