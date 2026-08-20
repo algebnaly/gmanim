@@ -105,6 +105,7 @@ fn main() -> std::io::Result<()> {
             scale_factor: 1920.0 / 16.0,
             framerate: 60,
         },
+        textures: Vec::new(),
     };
 
     let mut scene = Scene::default();
@@ -125,6 +126,7 @@ fn main() -> std::io::Result<()> {
                 fill: true,
                 ..Default::default()
             },
+            ..Default::default()
         };
         let id = scene.add_rectangle(rect);
         targets.push(id);

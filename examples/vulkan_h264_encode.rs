@@ -46,6 +46,7 @@ fn main() -> io::Result<()> {
             scale_factor: 1920.0 / 16.0,
             framerate: 120,
         },
+        textures: Vec::new(),
     };
 
     let mut scene = Scene::default();
