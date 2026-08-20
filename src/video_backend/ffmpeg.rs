@@ -65,6 +65,12 @@ impl FfmpegBackend {
         v_enc.set_gop(12);
         v_enc.set_colorspace(color::Space::BT709);
         v_enc.set_color_range(color::Range::MPEG);
+        unsafe {
+            (*v_enc.as_mut_ptr()).color_primaries =
+                ffmpeg_next::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*v_enc.as_mut_ptr()).color_trc =
+                ffmpeg_next::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        }
         if let Some(br) = video_config.bitrate {
             v_enc.set_bit_rate(br as usize);
         }
@@ -85,6 +91,12 @@ impl FfmpegBackend {
             .open_as_with(v_codec, v_opts)
             .expect("Failed to open libx264");
         v_stream.set_parameters(&v_enc);
+        unsafe {
+            (*(*v_stream.as_mut_ptr()).codecpar).color_primaries =
+                ffmpeg_next::ffi::AVColorPrimaries::AVCOL_PRI_BT709;
+            (*(*v_stream.as_mut_ptr()).codecpar).color_trc =
+                ffmpeg_next::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
+        }
 
         // audio codec settings
         let a_codec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::AAC).unwrap();

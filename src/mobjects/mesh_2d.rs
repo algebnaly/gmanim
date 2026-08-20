@@ -72,6 +72,7 @@ impl MeshGeometry2D {
 pub struct TriangleMesh2D {
     geometry: Arc<MeshGeometry2D>,
     color: [f32; 4],
+    pub aa_mode: f32,
 }
 
 impl Default for TriangleMesh2D {
@@ -79,6 +80,7 @@ impl Default for TriangleMesh2D {
         Self {
             geometry: Arc::new(MeshGeometry2D::new(Vec::new(), Vec::new())),
             color: color_to_f32(Color::default()),
+            aa_mode: 0.0,
         }
     }
 }
@@ -88,6 +90,7 @@ impl TriangleMesh2D {
         Self {
             geometry: Arc::new(MeshGeometry2D::new(vertices, indices)),
             color: color_to_f32(color),
+            aa_mode: 0.0,
         }
     }
 
@@ -208,9 +211,9 @@ fn geometry_fingerprint(vertices: &[Vertex2D], indices: &[u32]) -> GeometryFinge
 
 fn color_to_f32(color: Color) -> [f32; 4] {
     [
-        color.r as f32 / 255.0,
-        color.g as f32 / 255.0,
-        color.b as f32 / 255.0,
+        crate::srgb_to_linear(color.r),
+        crate::srgb_to_linear(color.g),
+        crate::srgb_to_linear(color.b),
         color.a as f32 / 255.0,
     ]
 }

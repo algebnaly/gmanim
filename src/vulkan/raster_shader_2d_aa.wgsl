@@ -18,6 +18,8 @@ struct CameraUniform2D {
     _pad: f32,
 }
 @group(0) @binding(0) var<uniform> camera: CameraUniform2D;
+@group(1) @binding(0) var scene_textures: binding_array<texture_2d<f32>>;
+@group(1) @binding(1) var scene_sampler: sampler;
 
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -65,17 +67,22 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var alpha = in.color.a;
-    if (in.aa_mode > 0.5) {
-        // Signed distance to each rect edge in local units, converted to
-        // pixels through the screen-space gradient of the interpolated local
-        // coordinates. `distance + 0.5` approximates box-filtered pixel
-        // coverage: fully covered pixels keep alpha, edge pixels fade.
+    if (in.half_extents.x > 1e-5 && in.half_extents.y > 1e-5) {
         let distance_x = in.half_extents.x - abs(in.local.x);
         let distance_y = in.half_extents.y - abs(in.local.y);
         let pixel_distance_x = distance_x / max(fwidth(in.local.x), 1e-5);
         let pixel_distance_y = distance_y / max(fwidth(in.local.y), 1e-5);
         let coverage = clamp(min(pixel_distance_x, pixel_distance_y) + 0.5, 0.0, 1.0);
         alpha *= coverage;
+    }
+    
+    if (in.aa_mode >= 2.0 && in.aa_mode < 18.0) {
+        let tex_idx = i32(in.aa_mode) - 2;
+        let u = (in.local.y / max(in.half_extents.y, 1e-5)) * 0.5 + 0.5;
+        let v = (in.local.x / max(in.half_extents.x, 1e-5)) * 0.5 + 0.5;
+        let uv = clamp(vec2<f32>(u, v), vec2<f32>(0.0), vec2<f32>(1.0));
+        let tex_color = textureSample(scene_textures[tex_idx], scene_sampler, uv);
+        return vec4<f32>(tex_color.rgb, alpha);
     }
     return vec4<f32>(in.color.rgb, alpha);
 }

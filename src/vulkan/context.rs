@@ -31,6 +31,7 @@ pub enum VulkanContextError {
     Vulkan(vk::Result),
     NoPhysicalDevice,
     NoGraphicsComputeQueue,
+    DescriptorIndexingUnsupported,
     TimelineSemaphoreUnsupported,
     Synchronization2Unsupported,
     DynamicRenderingUnsupported,
@@ -46,6 +47,9 @@ impl fmt::Display for VulkanContextError {
             Self::NoPhysicalDevice => formatter.write_str("no Vulkan physical device is available"),
             Self::NoGraphicsComputeQueue => {
                 formatter.write_str("no Vulkan queue supports both graphics and compute")
+            }
+            Self::DescriptorIndexingUnsupported => {
+                write!(formatter, "descriptor indexing unsupported")
             }
             Self::TimelineSemaphoreUnsupported => {
                 formatter.write_str("timeline semaphores are required but unsupported")
@@ -194,6 +198,8 @@ impl VulkanContext {
             .map(|extension_name| extension_name.as_ptr())
             .collect();
 
+        let mut supported_descriptor_indexing =
+            vk::PhysicalDeviceDescriptorIndexingFeatures::default();
         let mut supported_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
         let mut supported_synchronization2_features =
@@ -201,11 +207,17 @@ impl VulkanContext {
         let mut supported_dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default();
         let mut physical_device_features = vk::PhysicalDeviceFeatures2::default()
+            .push_next(&mut supported_descriptor_indexing)
             .push_next(&mut supported_timeline_features)
             .push_next(&mut supported_synchronization2_features)
             .push_next(&mut supported_dynamic_rendering_features);
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_device_features);
+        }
+        if supported_descriptor_indexing.descriptor_binding_partially_bound != vk::TRUE
+            || supported_descriptor_indexing.runtime_descriptor_array != vk::TRUE
+        {
+            return Err(VulkanContextError::DescriptorIndexingUnsupported);
         }
         if supported_timeline_features.timeline_semaphore != vk::TRUE {
             return Err(VulkanContextError::TimelineSemaphoreUnsupported);
@@ -217,6 +229,10 @@ impl VulkanContext {
             return Err(VulkanContextError::DynamicRenderingUnsupported);
         }
 
+        let mut enabled_descriptor_indexing =
+            vk::PhysicalDeviceDescriptorIndexingFeatures::default()
+                .descriptor_binding_partially_bound(true)
+                .runtime_descriptor_array(true);
         let mut enabled_timeline_features =
             vk::PhysicalDeviceTimelineSemaphoreFeatures::default().timeline_semaphore(true);
         let mut enabled_synchronization2_features =
@@ -228,7 +244,8 @@ impl VulkanContext {
             .enabled_extension_names(&enabled_extension_ptrs)
             .push_next(&mut enabled_timeline_features)
             .push_next(&mut enabled_synchronization2_features)
-            .push_next(&mut enabled_dynamic_rendering_features);
+            .push_next(&mut enabled_dynamic_rendering_features)
+            .push_next(&mut enabled_descriptor_indexing);
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
 

@@ -19,6 +19,7 @@ pub struct Rectangle {
     pub p3: Point3<GMFloat>, // Top right
     pub color: Color,
     pub draw_config: DrawConfig,
+    pub aa_mode: f32,
 }
 
 impl Default for Rectangle {
@@ -30,6 +31,7 @@ impl Default for Rectangle {
             p3: Point3::new(0.0, 1.0, 0.0),
             color: Color::default(),
             draw_config: DrawConfig::default(),
+            aa_mode: 0.0,
         }
     }
 }
@@ -50,8 +52,12 @@ impl Rectangle {
             (self.p3.x - self.p0.x) as f32,
             (self.p3.y - self.p0.y) as f32,
         ];
-        let edge_x_len = (edge_x[0] * edge_x[0] + edge_x[1] * edge_x[1]).sqrt().max(1e-8);
-        let edge_y_len = (edge_y[0] * edge_y[0] + edge_y[1] * edge_y[1]).sqrt().max(1e-8);
+        let edge_x_len = (edge_x[0] * edge_x[0] + edge_x[1] * edge_x[1])
+            .sqrt()
+            .max(1e-8);
+        let edge_y_len = (edge_y[0] * edge_y[0] + edge_y[1] * edge_y[1])
+            .sqrt()
+            .max(1e-8);
         let rect_builder = RectVertexBuilder::new(
             [center_x, center_y],
             [edge_x[0] / edge_x_len, edge_x[1] / edge_x_len],
@@ -161,7 +167,10 @@ impl SimpleLine {
         local_transform.set_column(0, &nalgebra::Vector4::new(u.x, u.y, u.z, 0.0));
         local_transform.set_column(1, &nalgebra::Vector4::new(v.x, v.y, v.z, 0.0));
         local_transform.set_column(2, &nalgebra::Vector4::new(n.x, n.y, n.z, 0.0));
-        local_transform.set_column(3, &nalgebra::Vector4::new(self.p0.x, self.p0.y, self.p0.z, 1.0));
+        local_transform.set_column(
+            3,
+            &nalgebra::Vector4::new(self.p0.x, self.p0.y, self.p0.z, 1.0),
+        );
         self.local_transform = local_transform;
 
         let p0_2d = nalgebra::Point2::new(0.0, 0.0);
@@ -456,7 +465,10 @@ impl QuadraticBezier {
         local_transform.set_column(0, &nalgebra::Vector4::new(u.x, u.y, u.z, 0.0));
         local_transform.set_column(1, &nalgebra::Vector4::new(v.x, v.y, v.z, 0.0));
         local_transform.set_column(2, &nalgebra::Vector4::new(n.x, n.y, n.z, 0.0));
-        local_transform.set_column(3, &nalgebra::Vector4::new(self.a.x, self.a.y, self.a.z, 1.0));
+        local_transform.set_column(
+            3,
+            &nalgebra::Vector4::new(self.a.x, self.a.y, self.a.z, 1.0),
+        );
         self.local_transform = local_transform;
 
         let a_2d = nalgebra::Point2::new(0.0, 0.0);

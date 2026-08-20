@@ -470,6 +470,10 @@ impl TimelineBuilder {
         &self.ctx.scene_config
     }
 
+    pub fn ctx_mut(&mut self) -> &mut crate::Context {
+        &mut self.ctx
+    }
+
     pub fn set_background_color(&mut self, color: crate::Color) {
         self.initial_scene.background_color = color;
         self.build_scene.background_color = color;

@@ -171,9 +171,7 @@ fn main() -> std::io::Result<()> {
         },
     );
     renderer.set_gpu_profiling(true);
-    println!(
-        "Renderer config: 8x MSAA, 2x SSAA, analytic_aa_2d={analytic_aa_2d}"
-    );
+    println!("Renderer config: 8x MSAA, 2x SSAA, analytic_aa_2d={analytic_aa_2d}");
 
     let mut first_frame_stats = None;
     let mut steady_frame_stats = None;

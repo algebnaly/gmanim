@@ -33,6 +33,18 @@ pub struct Color {
     pub a: u8,
 }
 
+pub fn srgb_to_linear(c: u8) -> f32 {
+    srgb_f32_to_linear(c as f32 / 255.0)
+}
+
+pub fn srgb_f32_to_linear(f: f32) -> f32 {
+    if f <= 0.04045 {
+        f / 12.92
+    } else {
+        f32::powf((f + 0.055) / 1.055, 2.4)
+    }
+}
+
 impl Color {
     pub fn new(r: u8, g: u8, b: u8, a: u8) -> Self {
         Self { r, g, b, a }
@@ -42,9 +54,9 @@ impl Color {
     }
     pub fn to_array(&self) -> [GMFloat; 4] {
         [
-            self.r as GMFloat / 255.0,
-            self.g as GMFloat / 255.0,
-            self.b as GMFloat / 255.0,
+            srgb_to_linear(self.r) as GMFloat,
+            srgb_to_linear(self.g) as GMFloat,
+            srgb_to_linear(self.b) as GMFloat,
             self.a as GMFloat / 255.0,
         ]
     }
@@ -111,6 +123,7 @@ impl Default for RendererConfig {
 #[derive(Clone)]
 pub struct Context {
     pub scene_config: SceneConfig,
+    pub textures: Vec<(u32, u32, u32, Vec<u8>)>,
 }
 
 impl Context {
@@ -131,6 +144,7 @@ impl Context {
                 scale_factor,
                 framerate,
             },
+            textures: Vec::new(),
         }
     }
 }
@@ -160,7 +174,10 @@ impl Default for SceneConfig {
 impl Default for Context {
     fn default() -> Self {
         let scene_config = SceneConfig::default();
-        Self { scene_config }
+        Self {
+            scene_config,
+            textures: Vec::new(),
+        }
     }
 }
 

@@ -230,6 +230,14 @@ impl FfmpegPipeOutputOptionBuilder {
                 quality_options.extend(["-pix_fmt", "yuv420p"]);
             }
         }
+        quality_options.extend([
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
+            "-colorspace",
+            "bt709",
+        ]);
         args.extend(quality_options.iter().map(|x| x.to_string()))
     }
 }

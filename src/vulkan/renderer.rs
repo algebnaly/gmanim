@@ -712,7 +712,11 @@ pub struct Instance2D {
 }
 
 impl Instance2D {
-    fn new(transform: nalgebra::Matrix4<crate::GMFloat>, color: [f32; 4], aa_params: [f32; 4]) -> Self {
+    fn new(
+        transform: nalgebra::Matrix4<crate::GMFloat>,
+        color: [f32; 4],
+        aa_params: [f32; 4],
+    ) -> Self {
         Self {
             model_0: [
                 transform[(0, 0)] as f32,
@@ -996,10 +1000,15 @@ fn rectangle_analytic_aa_params(rectangle: &Rectangle) -> [f32; 4] {
     if !perpendicular || !closes {
         return [0.0; 4];
     }
+    let aa_mode = if rectangle.aa_mode >= 2.0 {
+        rectangle.aa_mode
+    } else {
+        1.0
+    };
     [
         (edge_x_len / 2.0) as f32,
         (edge_y_len / 2.0) as f32,
-        1.0,
+        aa_mode,
         0.0,
     ]
 }
@@ -1345,12 +1354,6 @@ struct RenderTargetSet {
     sdf_material_id_state: TrackedImageState,
     sdf_depth: Image,
     sdf_depth_state: TrackedImageState,
-    raster_normal_depth: Image,
-    raster_normal_depth_state: TrackedImageState,
-    raster_albedo: Image,
-    raster_albedo_state: TrackedImageState,
-    raster_material_id: Image,
-    raster_material_id_state: TrackedImageState,
     resolved_primary_normal_depth: Image,
     resolved_primary_normal_depth_state: TrackedImageState,
     resolved_primary_albedo_coverage: Image,
@@ -1391,9 +1394,6 @@ impl RenderTargetSet {
         self.sdf_normal_coverage.destroy(ctx);
         self.sdf_material_id.destroy(ctx);
         self.sdf_depth.destroy(ctx);
-        self.raster_normal_depth.destroy(ctx);
-        self.raster_albedo.destroy(ctx);
-        self.raster_material_id.destroy(ctx);
         self.resolved_primary_normal_depth.destroy(ctx);
         self.resolved_primary_albedo_coverage.destroy(ctx);
         self.resolved_secondary_normal_depth.destroy(ctx);
@@ -1537,6 +1537,12 @@ pub struct RenderCache {
     has_raster_gbuffer: bool,
     has_overlay_hdr: bool,
     render_targets: [RenderTargetSet; RENDER_FRAME_COUNT],
+    pub raster_normal_depth: Image,
+    raster_normal_depth_state: TrackedImageState,
+    pub raster_albedo: Image,
+    raster_albedo_state: TrackedImageState,
+    pub raster_material_id: Image,
+    raster_material_id_state: TrackedImageState,
     pub msaa_texture: Option<Image>,
     msaa_texture_state: TrackedImageState,
     pub msaa_depth_texture: Option<Image>,
@@ -1580,6 +1586,9 @@ impl RenderCache {
         for targets in &mut self.render_targets {
             targets.destroy(ctx);
         }
+        self.raster_normal_depth.destroy(ctx);
+        self.raster_albedo.destroy(ctx);
+        self.raster_material_id.destroy(ctx);
         if let Some(texture) = &mut self.msaa_texture {
             texture.destroy(ctx);
         }
@@ -1656,6 +1665,13 @@ impl RenderOutputs {
         cpu_rgba: true,
         cpu_yuv444p: true,
     };
+
+    pub const NONE: Self = Self {
+        cpu_nv12: false,
+        vulkan_video: false,
+        cpu_rgba: false,
+        cpu_yuv444p: false,
+    };
 }
 
 pub struct VulkanRenderer {
@@ -1700,6 +1716,10 @@ pub struct VulkanRenderer {
     yuv444p_pipeline: vk::Pipeline,
 
     raster_pipeline_layout: vk::PipelineLayout,
+    raster_texture_layout: vk::DescriptorSetLayout,
+    raster_texture_set: vk::DescriptorSet,
+    pub active_textures: Vec<Image>,
+    texture_sampler: vk::Sampler,
     raster_pipeline: vk::Pipeline,
     raster_pipeline_transparent_depth: vk::Pipeline,
     raster_pipeline_transparent_back: vk::Pipeline,
@@ -2500,6 +2520,36 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             p_immutable_samplers: std::ptr::null(),
             ..Default::default()
         }];
+
+        let texture_layout_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(16)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::SAMPLER)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let mut binding_flags = [
+            vk::DescriptorBindingFlags::PARTIALLY_BOUND,
+            vk::DescriptorBindingFlags::empty(),
+        ];
+        let mut layout_binding_flags =
+            vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&binding_flags);
+
+        let texture_layout_info = vk::DescriptorSetLayoutCreateInfo::default()
+            .bindings(&texture_layout_bindings)
+            .push_next(&mut layout_binding_flags);
+
+        let raster_texture_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(&texture_layout_info, None)
+                .unwrap()
+        };
+
         let raster_descriptor_set_layout_info_2d = vk::DescriptorSetLayoutCreateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
             binding_count: raster_descriptor_set_layout_bindings_2d.len() as u32,
@@ -2512,12 +2562,9 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .unwrap()
         };
 
-        let raster_pipeline_layout_info_2d = vk::PipelineLayoutCreateInfo {
-            s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
-            set_layout_count: 1,
-            p_set_layouts: &raster_descriptor_set_layout_2d,
-            ..Default::default()
-        };
+        let set_layouts_2d = [raster_descriptor_set_layout_2d, raster_texture_layout];
+        let raster_pipeline_layout_info_2d =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&set_layouts_2d);
         let raster_pipeline_layout_2d = unsafe {
             ctx.device
                 .create_pipeline_layout(&raster_pipeline_layout_info_2d, None)
@@ -3035,6 +3082,117 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .unwrap()
         };
 
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
+        let texture_sampler = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
+
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(descriptor_pool)
+            .set_layouts(std::slice::from_ref(&raster_texture_layout));
+        let raster_texture_set =
+            unsafe { ctx.device.allocate_descriptor_sets(&alloc_info).unwrap()[0] };
+
+        let dummy_texture = Image::new(
+            &ctx,
+            1,
+            1,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            vk::ImageAspectFlags::COLOR,
+            vk::SampleCountFlags::TYPE_1,
+        );
+        let command_pool = unsafe {
+            ctx.device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(ctx.queue_family_index)
+                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                    None,
+                )
+                .unwrap()
+        };
+        let command_buffer = unsafe {
+            ctx.device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0]
+        };
+        unsafe {
+            ctx.device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+            let barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(dummy_texture.vk_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::SHADER_READ);
+            ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+            ctx.device.end_command_buffer(command_buffer).unwrap();
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+            ctx.device
+                .queue_submit(ctx.queue, &[submit_info], vk::Fence::null())
+                .unwrap();
+            ctx.device.queue_wait_idle(ctx.queue).unwrap();
+            ctx.device.destroy_command_pool(command_pool, None);
+        }
+
+        let dummy_image_infos: Vec<_> = (0..16)
+            .map(|_| {
+                vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(dummy_texture.view)
+            })
+            .collect();
+        let images_write = vk::WriteDescriptorSet::default()
+            .dst_set(raster_texture_set)
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&dummy_image_infos);
+
+        let sampler_image_info = [vk::DescriptorImageInfo::default().sampler(texture_sampler)];
+        let sampler_write = vk::WriteDescriptorSet::default()
+            .dst_set(raster_texture_set)
+            .dst_binding(1)
+            .descriptor_type(vk::DescriptorType::SAMPLER)
+            .image_info(&sampler_image_info);
+        unsafe {
+            ctx.device
+                .update_descriptor_sets(&[images_write, sampler_write], &[]);
+        }
+
         let limits = unsafe {
             ctx.instance
                 .get_physical_device_properties(ctx.physical_device)
@@ -3269,6 +3427,10 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             material_buffer_3d,
             buffer_3d,
             nv12_constants_buffer,
+            raster_texture_layout,
+            raster_texture_set,
+            active_textures: vec![dummy_texture],
+            texture_sampler,
             raster_pipeline_layout_2d,
             raster_pipeline_2d,
             raster_pipeline_2d_depthless,
@@ -3346,7 +3508,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         outputs.cpu_rgba |= output.is_some();
         let output_w = scene_config.output_width as f32;
         let output_h = scene_config.output_height as f32;
-        
+
         let bg = scene.background_color.to_array();
         let bg_clear_color = [bg[0] as f32, bg[1] as f32, bg[2] as f32, bg[3] as f32];
 
@@ -3408,7 +3570,11 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             ) {
                 self.mesh_submissions_2d.push(Mesh2DSubmission {
                     geometry: mesh.geometry(),
-                    instance: Instance2D::new(transform, mesh.color(), [0.0; 4]),
+                    instance: Instance2D::new(
+                        transform,
+                        mesh.color(),
+                        [0.0, 0.0, mesh.aa_mode, 0.0],
+                    ),
                     dynamic: false,
                 });
             }
@@ -3656,6 +3822,184 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         );
     }
 
+    pub fn update_texture(&mut self, index: u32, width: u32, height: u32, data: &[u8]) {
+        assert!(index < 16, "Texture index out of bounds");
+
+        let byte_offset = (width * height * 4) as u64;
+        let mut staging = Buffer::new(
+            &self.ctx,
+            byte_offset,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            gpu_allocator::MemoryLocation::CpuToGpu,
+        );
+        staging.write_bytes(0, data);
+
+        let image = Image::new(
+            &self.ctx,
+            width,
+            height,
+            vk::Format::R8G8B8A8_UNORM,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::ImageAspectFlags::COLOR,
+            vk::SampleCountFlags::TYPE_1,
+        );
+
+        let command_pool = unsafe {
+            self.ctx
+                .device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(self.ctx.queue_family_index)
+                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
+                    None,
+                )
+                .unwrap()
+        };
+        let command_buffer = unsafe {
+            self.ctx
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0]
+        };
+
+        unsafe {
+            self.ctx
+                .device
+                .begin_command_buffer(
+                    command_buffer,
+                    &vk::CommandBufferBeginInfo::default()
+                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
+                )
+                .unwrap();
+
+            let mut barrier = vk::ImageMemoryBarrier::default()
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image.vk_image)
+                .subresource_range(vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: 1,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .src_access_mask(vk::AccessFlags::empty())
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+
+            self.ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset(0)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    mip_level: 0,
+                    base_array_layer: 0,
+                    layer_count: 1,
+                })
+                .image_extent(vk::Extent3D {
+                    width,
+                    height,
+                    depth: 1,
+                });
+
+            self.ctx.device.cmd_copy_buffer_to_image(
+                command_buffer,
+                staging.vk_buffer,
+                image.vk_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+
+            barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
+            barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+            barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
+            barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
+
+            self.ctx.device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+
+            self.ctx.device.end_command_buffer(command_buffer).unwrap();
+
+            let submit_info =
+                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
+            self.ctx
+                .device
+                .queue_submit(self.ctx.queue, &[submit_info], vk::Fence::null())
+                .unwrap();
+            self.ctx.device.queue_wait_idle(self.ctx.queue).unwrap();
+            self.ctx.device.destroy_command_pool(command_pool, None);
+
+            let image_info = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(image.view)];
+
+            let write = vk::WriteDescriptorSet::default()
+                .dst_set(self.raster_texture_set)
+                .dst_binding(0)
+                .dst_array_element(index)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .image_info(&image_info);
+
+            self.ctx.device.update_descriptor_sets(&[write], &[]);
+        }
+
+        self.active_textures.push(image);
+    }
+
+    pub fn current_output_image_view(&self) -> Option<vk::ImageView> {
+        let cache_guard = self.cache.lock().unwrap();
+        let cache = cache_guard.as_ref()?;
+        if cache.current_frame == 0 {
+            return None;
+        }
+        let frame_idx = (cache.current_frame - 1) % RENDER_FRAME_COUNT;
+        Some(cache.render_targets[frame_idx].texture.view)
+    }
+
+    pub fn bind_texture_view(&mut self, index: u32, view: vk::ImageView) {
+        assert!(index < 16, "Texture index out of bounds");
+        let image_info = [vk::DescriptorImageInfo::default()
+            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            .image_view(view)];
+        let write = vk::WriteDescriptorSet::default()
+            .dst_set(self.raster_texture_set)
+            .dst_binding(0)
+            .dst_array_element(index)
+            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+            .image_info(&image_info);
+        unsafe {
+            self.ctx.device.update_descriptor_sets(&[write], &[]);
+        }
+    }
+
+    pub fn wait_idle(&self) {
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
+        }
+    }
+
     fn render(
         &mut self,
         width: u32,
@@ -3715,6 +4059,34 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             } else {
                 1
             };
+
+            let raster_normal_depth = Image::new(
+                &self.ctx,
+                raster_gbuffer_width,
+                raster_gbuffer_height,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                raster_sample_count,
+            );
+            let raster_albedo = Image::new(
+                &self.ctx,
+                raster_gbuffer_width,
+                raster_gbuffer_height,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                raster_sample_count,
+            );
+            let raster_material_id = Image::new(
+                &self.ctx,
+                raster_gbuffer_width,
+                raster_gbuffer_height,
+                vk::Format::R16_UINT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                vk::ImageAspectFlags::COLOR,
+                raster_sample_count,
+            );
             let mut render_targets = std::array::from_fn(|_| {
                 let texture = Image::new(
                     &self.ctx,
@@ -3755,33 +4127,6 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
                     vk::ImageAspectFlags::COLOR,
                     vk::SampleCountFlags::TYPE_1,
-                );
-                let raster_normal_depth = Image::new(
-                    &self.ctx,
-                    raster_gbuffer_width,
-                    raster_gbuffer_height,
-                    vk::Format::R16G16B16A16_SFLOAT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::COLOR,
-                    raster_sample_count,
-                );
-                let raster_albedo = Image::new(
-                    &self.ctx,
-                    raster_gbuffer_width,
-                    raster_gbuffer_height,
-                    vk::Format::R16G16B16A16_SFLOAT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::COLOR,
-                    raster_sample_count,
-                );
-                let raster_material_id = Image::new(
-                    &self.ctx,
-                    raster_gbuffer_width,
-                    raster_gbuffer_height,
-                    vk::Format::R16_UINT,
-                    vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
-                    vk::ImageAspectFlags::COLOR,
-                    raster_sample_count,
                 );
                 let resolved_surface_image = |format| {
                     Image::new(
@@ -3894,12 +4239,6 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     sdf_material_id_state: TrackedImageState::UNDEFINED,
                     sdf_depth,
                     sdf_depth_state: TrackedImageState::UNDEFINED,
-                    raster_normal_depth,
-                    raster_normal_depth_state: TrackedImageState::UNDEFINED,
-                    raster_albedo,
-                    raster_albedo_state: TrackedImageState::UNDEFINED,
-                    raster_material_id,
-                    raster_material_id_state: TrackedImageState::UNDEFINED,
                     resolved_primary_normal_depth,
                     resolved_primary_normal_depth_state: TrackedImageState::UNDEFINED,
                     resolved_primary_albedo_coverage,
@@ -4296,7 +4635,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             let raster_normal_depth_infos: Vec<_> = render_targets
                 .iter()
                 .map(|targets| vk::DescriptorImageInfo {
-                    image_view: targets.raster_normal_depth.view,
+                    image_view: raster_normal_depth.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 })
@@ -4304,7 +4643,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             let raster_albedo_infos: Vec<_> = render_targets
                 .iter()
                 .map(|targets| vk::DescriptorImageInfo {
-                    image_view: targets.raster_albedo.view,
+                    image_view: raster_albedo.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 })
@@ -4312,7 +4651,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             let raster_material_id_infos: Vec<_> = render_targets
                 .iter()
                 .map(|targets| vk::DescriptorImageInfo {
-                    image_view: targets.raster_material_id.view,
+                    image_view: raster_material_id.view,
                     image_layout: vk::ImageLayout::GENERAL,
                     ..Default::default()
                 })
@@ -5002,6 +5341,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 has_raster_gbuffer: needs_raster_gbuffer,
                 has_overlay_hdr: needs_overlay_hdr,
                 render_targets,
+                raster_normal_depth,
+                raster_normal_depth_state: TrackedImageState::UNDEFINED,
+                raster_albedo,
+                raster_albedo_state: TrackedImageState::UNDEFINED,
+                raster_material_id,
+                raster_material_id_state: TrackedImageState::UNDEFINED,
                 msaa_texture,
                 msaa_texture_state: TrackedImageState::UNDEFINED,
                 msaa_depth_texture: None,
@@ -5556,16 +5901,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             if uses_deferred_raster {
                 for (image, state) in [
                     (
-                        targets.raster_normal_depth.vk_image,
-                        &mut targets.raster_normal_depth_state,
+                        cache.raster_normal_depth.vk_image,
+                        &mut cache.raster_normal_depth_state,
                     ),
+                    (cache.raster_albedo.vk_image, &mut cache.raster_albedo_state),
                     (
-                        targets.raster_albedo.vk_image,
-                        &mut targets.raster_albedo_state,
-                    ),
-                    (
-                        targets.raster_material_id.vk_image,
-                        &mut targets.raster_material_id_state,
+                        cache.raster_material_id.vk_image,
+                        &mut cache.raster_material_id_state,
                     ),
                 ] {
                     transition_image(
@@ -5601,7 +5943,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 };
                 let gbuffer_attachments = [
                     vk::RenderingAttachmentInfo::default()
-                        .image_view(targets.raster_normal_depth.view)
+                        .image_view(cache.raster_normal_depth.view)
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::STORE)
@@ -5609,7 +5951,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             color: vk::ClearColorValue { float32: [0.0; 4] },
                         }),
                     vk::RenderingAttachmentInfo::default()
-                        .image_view(targets.raster_albedo.view)
+                        .image_view(cache.raster_albedo.view)
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::STORE)
@@ -5617,7 +5959,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             color: vk::ClearColorValue { float32: [0.0; 4] },
                         }),
                     vk::RenderingAttachmentInfo::default()
-                        .image_view(targets.raster_material_id.view)
+                        .image_view(cache.raster_material_id.view)
                         .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                         .load_op(vk::AttachmentLoadOp::CLEAR)
                         .store_op(vk::AttachmentStoreOp::STORE)
@@ -5651,14 +5993,29 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         .color_attachments(&gbuffer_attachments)
                         .depth_attachment(&depth_attachment),
                 );
+                let (vp_x, vp_y, vp_w, vp_h) = if camera_uniform.has_clip != 0 {
+                    (
+                        camera_uniform.clip_x * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_y * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_w * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_h * camera_uniform.raster_scale as f32,
+                    )
+                } else {
+                    (
+                        0.0,
+                        0.0,
+                        raster_extent.width as f32,
+                        raster_extent.height as f32,
+                    )
+                };
                 self.ctx.device.cmd_set_viewport(
                     fd.command_buffer,
                     0,
                     &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: raster_extent.width as f32,
-                        height: raster_extent.height as f32,
+                        x: vp_x,
+                        y: vp_y,
+                        width: vp_w,
+                        height: vp_h,
                         min_depth: 0.0,
                         max_depth: 1.0,
                     }],
@@ -5667,8 +6024,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     fd.command_buffer,
                     0,
                     &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: raster_extent,
+                        offset: vk::Offset2D {
+                            x: vp_x as i32,
+                            y: vp_y as i32,
+                        },
+                        extent: vk::Extent2D {
+                            width: vp_w as u32,
+                            height: vp_h as u32,
+                        },
                     }],
                 );
                 self.ctx.device.cmd_bind_pipeline(
@@ -5710,16 +6073,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
 
                 for (image, state) in [
                     (
-                        targets.raster_normal_depth.vk_image,
-                        &mut targets.raster_normal_depth_state,
+                        cache.raster_normal_depth.vk_image,
+                        &mut cache.raster_normal_depth_state,
                     ),
+                    (cache.raster_albedo.vk_image, &mut cache.raster_albedo_state),
                     (
-                        targets.raster_albedo.vk_image,
-                        &mut targets.raster_albedo_state,
-                    ),
-                    (
-                        targets.raster_material_id.vk_image,
-                        &mut targets.raster_material_id_state,
+                        cache.raster_material_id.vk_image,
+                        &mut cache.raster_material_id_state,
                     ),
                 ] {
                     transition_image(
@@ -5981,6 +6341,26 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             .color_attachments(std::slice::from_ref(&overlay_attachment))
                             .depth_attachment(&overlay_depth_attachment),
                     );
+                    self.ctx.device.cmd_set_viewport(
+                        fd.command_buffer,
+                        0,
+                        &[vk::Viewport {
+                            x: 0.0,
+                            y: 0.0,
+                            width: raster_extent.width as f32,
+                            height: raster_extent.height as f32,
+                            min_depth: 0.0,
+                            max_depth: 1.0,
+                        }],
+                    );
+                    self.ctx.device.cmd_set_scissor(
+                        fd.command_buffer,
+                        0,
+                        &[vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: raster_extent,
+                        }],
+                    );
                     if has_transparent_meshes {
                         self.ctx.device.cmd_bind_descriptor_sets(
                             fd.command_buffer,
@@ -6037,6 +6417,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             std::slice::from_ref(&cache.raster_descriptor_set_2d),
                             &raster_2d_dynamic_offsets,
                         );
+                        self.ctx.device.cmd_bind_descriptor_sets(
+                            fd.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.raster_pipeline_layout_2d,
+                            1,
+                            std::slice::from_ref(&self.raster_texture_set),
+                            &[],
+                        );
                         let vertex_buffers = [
                             self.vertex_buffer_2d.vk_buffer,
                             self.instance_buffer_2d.vk_buffer,
@@ -6071,16 +6459,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             if frame_plan.runs_sdf() && !uses_deferred_raster {
                 for (image, state) in [
                     (
-                        targets.raster_normal_depth.vk_image,
-                        &mut targets.raster_normal_depth_state,
+                        cache.raster_normal_depth.vk_image,
+                        &mut cache.raster_normal_depth_state,
                     ),
+                    (cache.raster_albedo.vk_image, &mut cache.raster_albedo_state),
                     (
-                        targets.raster_albedo.vk_image,
-                        &mut targets.raster_albedo_state,
-                    ),
-                    (
-                        targets.raster_material_id.vk_image,
-                        &mut targets.raster_material_id_state,
+                        cache.raster_material_id.vk_image,
+                        &mut cache.raster_material_id_state,
                     ),
                 ] {
                     transition_image(
@@ -6235,14 +6620,29 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     .device
                     .cmd_begin_rendering(fd.command_buffer, &rendering_info);
 
+                let (vp_x, vp_y, vp_w, vp_h) = if camera_uniform.has_clip != 0 {
+                    (
+                        camera_uniform.clip_x * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_y * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_w * camera_uniform.raster_scale as f32,
+                        camera_uniform.clip_h * camera_uniform.raster_scale as f32,
+                    )
+                } else {
+                    (
+                        0.0,
+                        0.0,
+                        raster_extent.width as f32,
+                        raster_extent.height as f32,
+                    )
+                };
                 self.ctx.device.cmd_set_viewport(
                     fd.command_buffer,
                     0,
                     &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: raster_extent.width as f32,
-                        height: raster_extent.height as f32,
+                        x: vp_x,
+                        y: vp_y,
+                        width: vp_w,
+                        height: vp_h,
                         min_depth: 0.0,
                         max_depth: 1.0,
                     }],
@@ -6251,8 +6651,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                     fd.command_buffer,
                     0,
                     &[vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: raster_extent,
+                        offset: vk::Offset2D {
+                            x: vp_x as i32,
+                            y: vp_y as i32,
+                        },
+                        extent: vk::Extent2D {
+                            width: vp_w as u32,
+                            height: vp_h as u32,
+                        },
                     }],
                 );
 
@@ -6275,6 +6681,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                         0,
                         std::slice::from_ref(&cache.raster_descriptor_set_2d),
                         &raster_2d_dynamic_offsets,
+                    );
+                    self.ctx.device.cmd_bind_descriptor_sets(
+                        fd.command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.raster_pipeline_layout_2d,
+                        1,
+                        std::slice::from_ref(&self.raster_texture_set),
+                        &[],
                     );
                     let vertex_buffers = [
                         self.vertex_buffer_2d.vk_buffer,
@@ -6560,6 +6974,14 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                             0,
                             std::slice::from_ref(&cache.raster_descriptor_set_2d),
                             &raster_2d_dynamic_offsets,
+                        );
+                        self.ctx.device.cmd_bind_descriptor_sets(
+                            fd.command_buffer,
+                            vk::PipelineBindPoint::GRAPHICS,
+                            self.raster_pipeline_layout_2d,
+                            1,
+                            std::slice::from_ref(&self.raster_texture_set),
+                            &[],
                         );
                         let vertex_buffers = [
                             self.vertex_buffer_2d.vk_buffer,
@@ -7031,6 +7453,21 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 5,
                 gpu_profiling,
             );
+
+            if !has_compute_output && !outputs.cpu_rgba {
+                transition_image(
+                    &self.ctx.device,
+                    fd.command_buffer,
+                    targets.texture.vk_image,
+                    vk::ImageAspectFlags::COLOR,
+                    &mut targets.texture_state,
+                    TrackedImageState {
+                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                        access: vk::AccessFlags2::SHADER_READ,
+                    },
+                );
+            }
 
             self.ctx
                 .device

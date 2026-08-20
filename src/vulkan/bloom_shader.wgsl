@@ -22,7 +22,7 @@ fn extract(@builtin(global_invocation_id) id: vec3<u32>) {
         + load_clamped(base + vec2<i32>(1, 1))
     ) * 0.25;
     let brightness = max(color.r, max(color.g, color.b));
-    let contribution = max(brightness - 0.8, 0.0) / max(brightness, 1e-4);
+    let contribution = max(brightness - 1.0, 0.0) / max(brightness, 1e-4);
     textureStore(output_image, vec2<i32>(id.xy), vec4<f32>(color * contribution, 1.0));
 }
 
