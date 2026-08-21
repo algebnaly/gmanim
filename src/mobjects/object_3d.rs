@@ -7,9 +7,37 @@ use crate::mobjects::mesh_3d::SurfaceMaterial;
 use crate::mobjects::{Draw, Mobject};
 use crate::{Context, GMFloat};
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 3D Object Trait
-// ═══════════════════════════════════════════════════════════════════════════
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SdfPrimitive {
+    Sphere {
+        center: Point3<GMFloat>,
+        radius: GMFloat,
+    },
+    Capsule {
+        start: Point3<GMFloat>,
+        end: Point3<GMFloat>,
+        radius: GMFloat,
+    },
+    Arrow {
+        start: Point3<GMFloat>,
+        end: Point3<GMFloat>,
+        shaft_radius: GMFloat,
+        head_radius: GMFloat,
+        head_length: GMFloat,
+    },
+    OrientedBox {
+        center: Point3<GMFloat>,
+        half_extents: Vector3<GMFloat>,
+        x_axis: Vector3<GMFloat>,
+        y_axis: Vector3<GMFloat>,
+    },
+    QuadraticBezier {
+        start: Point3<GMFloat>,
+        control: Point3<GMFloat>,
+        end: Point3<GMFloat>,
+        radius: GMFloat,
+    },
+}
 
 /// Represents an object defined by a Signed Distance Function.
 pub trait Object3D: Send + Sync {
@@ -17,12 +45,7 @@ pub trait Object3D: Send + Sync {
     fn distance(&self, p: &Point3<GMFloat>) -> GMFloat;
     fn material(&self) -> SurfaceMaterial;
 
-    /// Returns the GPU-compatible primitive data
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D;
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -42,30 +65,11 @@ impl Object3D for Sphere3D {
     fn material(&self) -> SurfaceMaterial {
         self.material
     }
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D {
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive {
         let center = global_mat.transform_point(&Point3::origin());
-        crate::vulkan::renderer::PrimitiveData3D {
-            material_index,
-            shape_type: 0,
-            padding: [0; 2],
-            params: [
-                center.x as f32,
-                center.y as f32,
-                center.z as f32,
-                self.radius as f32,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ],
+        SdfPrimitive::Sphere {
+            center,
+            radius: self.radius,
         }
     }
 }
@@ -108,31 +112,11 @@ impl Object3D for LineSegment3D {
     fn material(&self) -> SurfaceMaterial {
         self.material
     }
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D {
-        let a = global_mat.transform_point(&self.a);
-        let b = global_mat.transform_point(&self.b);
-        crate::vulkan::renderer::PrimitiveData3D {
-            material_index,
-            shape_type: 1,
-            padding: [0; 2],
-            params: [
-                a.x as f32,
-                a.y as f32,
-                a.z as f32,
-                b.x as f32,
-                b.y as f32,
-                b.z as f32,
-                self.radius as f32,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-            ],
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive {
+        SdfPrimitive::Capsule {
+            start: global_mat.transform_point(&self.a),
+            end: global_mat.transform_point(&self.b),
+            radius: self.radius,
         }
     }
 }
@@ -175,32 +159,12 @@ impl Object3D for QuadraticBezier3D {
     fn material(&self) -> SurfaceMaterial {
         self.material
     }
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D {
-        let a = global_mat.transform_point(&self.a);
-        let b = global_mat.transform_point(&self.b);
-        let c = global_mat.transform_point(&self.c);
-        crate::vulkan::renderer::PrimitiveData3D {
-            material_index,
-            shape_type: 4,
-            padding: [0; 2],
-            params: [
-                a.x as f32,
-                a.y as f32,
-                a.z as f32,
-                b.x as f32,
-                b.y as f32,
-                b.z as f32,
-                c.x as f32,
-                c.y as f32,
-                c.z as f32,
-                self.radius as f32,
-                0.0,
-                0.0,
-            ],
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive {
+        SdfPrimitive::QuadraticBezier {
+            start: global_mat.transform_point(&self.a),
+            control: global_mat.transform_point(&self.b),
+            end: global_mat.transform_point(&self.c),
+            radius: self.radius,
         }
     }
 }
@@ -278,31 +242,13 @@ impl Object3D for Arrow3D {
         self.material
     }
 
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D {
-        let start = global_mat.transform_point(&self.start);
-        let end = global_mat.transform_point(&self.end);
-        crate::vulkan::renderer::PrimitiveData3D {
-            material_index,
-            shape_type: 2,
-            padding: [0; 2],
-            params: [
-                start.x as f32,
-                start.y as f32,
-                start.z as f32,
-                end.x as f32,
-                end.y as f32,
-                end.z as f32,
-                self.shaft_radius as f32,
-                self.head_radius as f32,
-                self.head_length as f32,
-                0.0,
-                0.0,
-                0.0,
-            ],
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive {
+        SdfPrimitive::Arrow {
+            start: global_mat.transform_point(&self.start),
+            end: global_mat.transform_point(&self.end),
+            shaft_radius: self.shaft_radius,
+            head_radius: self.head_radius,
+            head_length: self.head_length,
         }
     }
 }
@@ -358,33 +304,15 @@ impl Object3D for Box3DSdf {
         self.material
     }
 
-    fn as_primitive_data(
-        &self,
-        global_mat: nalgebra::Matrix4<GMFloat>,
-        material_index: u32,
-    ) -> crate::vulkan::renderer::PrimitiveData3D {
+    fn transformed_primitive(&self, global_mat: nalgebra::Matrix4<GMFloat>) -> SdfPrimitive {
         let center = global_mat.transform_point(&Point3::origin());
         let x_axis = global_mat.transform_vector(&self.x_axis);
         let y_axis = global_mat.transform_vector(&self.y_axis);
-        let z_axis = global_mat.transform_vector(&self.z_axis);
-        crate::vulkan::renderer::PrimitiveData3D {
-            material_index,
-            shape_type: 3,
-            padding: [0; 2],
-            params: [
-                center.x as f32,
-                center.y as f32,
-                center.z as f32,
-                self.size.x as f32,
-                self.size.y as f32,
-                self.size.z as f32,
-                x_axis.x as f32,
-                x_axis.y as f32,
-                x_axis.z as f32,
-                y_axis.x as f32,
-                y_axis.y as f32,
-                y_axis.z as f32,
-            ],
+        SdfPrimitive::OrientedBox {
+            center,
+            half_extents: self.size,
+            x_axis,
+            y_axis,
         }
     }
 }

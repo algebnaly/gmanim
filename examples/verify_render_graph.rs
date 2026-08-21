@@ -179,7 +179,9 @@ fn main() {
         None,
         RenderOutputs::CPU_RGBA_ONLY,
     );
-    let behind_pixel = &renderer.get_rgba_bytes().unwrap()[center * 4..center * 4 + 4];
+    let behind_pixel: [u8; 4] = renderer.get_rgba_bytes().unwrap()[center * 4..center * 4 + 4]
+        .try_into()
+        .unwrap();
     assert_eq!(renderer.last_stats().surface_lighting_dispatches, 1);
     assert!(
         behind_pixel[0] > behind_pixel[1],
