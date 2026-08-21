@@ -260,44 +260,75 @@ fn calc_normal(p: vec3<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
+fn get_pixel_radius(t: f32) -> f32 {
+    if (camera.proj_type == 0u) {
+        let fov_scale = tan(camera.fov * 0.5);
+        return max(0.0001, (2.0 * t * fov_scale) / max(camera.height, 1.0));
+    } else {
+        return max(0.0001, (camera.ortho_top - camera.ortho_bottom) / max(camera.height * 2.0, 1.0));
+    }
+}
+
 struct RayResult {
     normal: vec3<f32>,
     material_index: u32,
     linear_depth: f32,
-    hit: u32,
+    coverage: f32,
 }
 
 fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     var t: f32 = 0.0;
     let max_dist: f32 = 100.0;
     let surf_dist: f32 = 0.001;
-    let max_steps: i32 = 100;
+    let max_steps: i32 = 128;
     
-    var material_index = 0u;
+    var min_norm_dist: f32 = 1e20;
+    var best_t: f32 = 0.0;
+    var best_material_index: u32 = 0u;
     var hit = false;
     
     for (var i: i32 = 0; i < max_steps; i = i + 1) {
         let p = ro + rd * t;
         let res = map(p);
-        if (res.dist < surf_dist) {
+        let d = res.dist;
+        let pr = get_pixel_radius(t);
+        
+        if (d < surf_dist) {
             hit = true;
-            material_index = res.material_index;
+            best_t = t;
+            best_material_index = res.material_index;
             break;
         }
-        t = t + res.dist;
+        
+        let norm_d = d / pr;
+        if (norm_d < min_norm_dist) {
+            min_norm_dist = norm_d;
+            best_t = t;
+            best_material_index = res.material_index;
+        }
+        
+        t = t + max(d, surf_dist);
         if (t > max_dist) {
             break;
         }
     }
     
-    if (!hit) {
-        return RayResult(vec3<f32>(0.0), 0u, 1e20, 0u);
+    var coverage: f32 = 0.0;
+    if (hit) {
+        coverage = 1.0;
+    } else if (min_norm_dist < 1.0) {
+        // Analytic distance feathering across the 1-pixel boundary
+        coverage = clamp(1.0 - min_norm_dist, 0.0, 1.0);
+    }
+    
+    if (coverage <= 0.0) {
+        return RayResult(vec3<f32>(0.0), 0u, 1e20, 0.0);
     }
 
-    let p = ro + rd * t;
+    let p = ro + rd * best_t;
     let normal = calc_normal(p);
     let linear_depth = dot(p - camera.pos, normalize(camera.look_at));
-    return RayResult(normal, material_index, linear_depth, 1u);
+    return RayResult(normal, best_material_index, linear_depth, coverage);
 }
 
 @compute @workgroup_size(16, 16)
@@ -329,7 +360,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let ro = camera.pos;
 
     let aa = max(camera.aa_level, 1u);
-    var hit_count = 0u;
+    var total_coverage: f32 = 0.0;
     var nearest_depth = 1e20;
     var nearest_material = 0u;
     var nearest_normal = vec3<f32>(0.0);
@@ -358,8 +389,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
             
             let sample_result = render_ray(ro_sample, rd_sample);
-            if (sample_result.hit != 0u) {
-                hit_count += 1u;
+            if (sample_result.coverage > 0.0) {
+                total_coverage += sample_result.coverage;
                 if (sample_result.linear_depth < nearest_depth) {
                     nearest_depth = sample_result.linear_depth;
                     nearest_material = sample_result.material_index;
@@ -370,7 +401,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let sample_count = aa * aa;
-    let coverage = f32(hit_count) / f32(sample_count);
+    let coverage = clamp(total_coverage / f32(sample_count), 0.0, 1.0);
     textureStore(
         normal_coverage_tex,
         vec2<i32>(i32(x), i32(y)),
