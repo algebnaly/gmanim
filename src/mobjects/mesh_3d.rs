@@ -532,23 +532,13 @@ impl TriangleMesh3D {
         let axis_f = [axis.x as f32, axis.y as f32, axis.z as f32];
         let height = (tip - base_center).norm() as f32;
 
-        // Side vertices
-        let tip_idx = vertices.len() as u32;
-        vertices.push(Vertex {
-            position: tip_f,
-            normal: axis_f,
-            color: c,
-            surface_coord: axis_f,
-        });
-
+        // 1. Base ring vertices for the cone side
         let base_start_idx = vertices.len() as u32;
         for i in 0..segments {
             let theta = i as f32 * std::f32::consts::PI * 2.0 / segments as f32;
             let p = u1 * (theta.cos() as GMFloat) + u2 * (theta.sin() as GMFloat);
 
-            // Calculate normal for cone side
-            // Normal points outwards and slightly upwards.
-            // Component along radius is H, component along axis is R.
+            // Calculate normal for cone side (points outward and slightly upward)
             let mut normal_vec = p * (height as GMFloat) + axis * (radius as GMFloat);
             normal_vec.normalize_mut();
             let normal = [
@@ -569,9 +559,37 @@ impl TriangleMesh3D {
             });
         }
 
+        // 2. Split apex vertices (Blender-style loop normals)
+        // Each sector gets its own apex vertex with normal pointing outward along the sector slope
+        let tip_start_idx = vertices.len() as u32;
+        for i in 0..segments {
+            let theta_mid = (i as f32 + 0.5) * std::f32::consts::PI * 2.0 / segments as f32;
+            let p_mid = u1 * (theta_mid.cos() as GMFloat) + u2 * (theta_mid.sin() as GMFloat);
+
+            let mut normal_vec = p_mid * (height as GMFloat) + axis * (radius as GMFloat);
+            normal_vec.normalize_mut();
+            let normal = [
+                normal_vec.x as f32,
+                normal_vec.y as f32,
+                normal_vec.z as f32,
+            ];
+
+            vertices.push(Vertex {
+                position: tip_f,
+                normal,
+                color: c,
+                surface_coord: normal,
+            });
+        }
+
+        // 3. Side Triangles
         for i in 0..segments {
             let next_i = (i + 1) % segments;
-            indices.extend_from_slice(&[tip_idx, base_start_idx + next_i, base_start_idx + i]);
+            indices.extend_from_slice(&[
+                tip_start_idx + i,
+                base_start_idx + next_i,
+                base_start_idx + i,
+            ]);
         }
 
         // Base cap
