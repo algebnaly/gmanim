@@ -1,14 +1,12 @@
+use crate::GMPoint;
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
 use lyon::path::Path;
 use lyon::tessellation::{
     BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
 };
-use nalgebra::Point3;
 
-use crate::{Color, Context, GMFloat, GMPoint};
-
-use super::{Draw, DrawConfig, Mobject};
+use super::{DrawConfig, Mobject};
 
 pub struct Polygon {
     pub vertices: Vec<GMPoint>,
@@ -72,10 +70,6 @@ impl Polygon {
         self.mesh
             .replace_geometry(geometry.vertices, geometry.indices, c);
     }
-}
-
-impl Draw for Polygon {
-    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {}
 }
 
 impl Mobject for Polygon {

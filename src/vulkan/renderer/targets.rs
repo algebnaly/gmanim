@@ -4,14 +4,15 @@ use std::sync::Arc;
 
 use crate::vulkan::context::VulkanContext;
 
-use super::{
-    Buffer, Image, Nv12Constants, PipelineSet, RENDER_FRAME_COUNT, TrackedImageState,
-    VIDEO_NV12_IMAGE_COUNT, VideoNv12Slot, msaa_to_vk_sample_count,
-};
+use super::frame::{RENDER_FRAME_COUNT, TrackedImageState};
+use super::prepared_frame::FrameRequirements;
+use super::record::RecordingPlan;
+use super::video_output::{VIDEO_NV12_IMAGE_COUNT, VideoNv12Slot};
+use super::{Buffer, DescriptorPool, Image, Nv12Constants, PipelineSet, msaa_to_vk_sample_count};
 
 pub(super) struct TargetCacheResources<'a> {
     pub(super) ctx: &'a Arc<VulkanContext>,
-    pub(super) descriptor_pool: vk::DescriptorPool,
+    pub(super) descriptor_pool: &'a Arc<DescriptorPool>,
     pub(super) pipelines: &'a PipelineSet,
     pub(super) msaa_samples: u32,
     pub(super) ssaa_factor: u32,
@@ -73,28 +74,8 @@ pub(super) struct RenderTargetSet {
     pub(super) bloom_descriptor_sets: [vk::DescriptorSet; 3],
 }
 
-impl RenderTargetSet {
-    fn destroy(&mut self, ctx: &VulkanContext) {
-        self.texture.destroy(ctx);
-        self.sdf_normal_coverage.destroy(ctx);
-        self.sdf_material_id.destroy(ctx);
-        self.sdf_depth.destroy(ctx);
-        self.resolved_primary_normal_depth.destroy(ctx);
-        self.resolved_primary_albedo_coverage.destroy(ctx);
-        self.resolved_secondary_normal_depth.destroy(ctx);
-        self.resolved_secondary_albedo_coverage.destroy(ctx);
-        self.resolved_material_ids.destroy(ctx);
-        self.surface_hdr.destroy(ctx);
-        self.overlay_hdr.destroy(ctx);
-        self.resolved_texture.destroy(ctx);
-        self.scene_color.destroy(ctx);
-        self.transparent_back_depth.destroy(ctx);
-        self.bloom_ping.destroy(ctx);
-        self.bloom_pong.destroy(ctx);
-    }
-}
-
 pub(super) struct TargetCache {
+    descriptor_pool: Arc<DescriptorPool>,
     pub width: u32,
     pub height: u32,
     pub(super) has_raster_gbuffer: bool,
@@ -119,18 +100,25 @@ pub(super) struct TargetCache {
     pub current_frame: usize,
     pub raster_descriptor_set_2d: vk::DescriptorSet,
     pub padded_bytes_per_row: u32,
-    pub rgba_preview_buffer: Vec<u8>,
 }
 
 impl TargetCache {
+    pub(super) fn satisfies(&self, requirements: FrameRequirements) -> bool {
+        self.width == requirements.width
+            && self.height == requirements.height
+            && (!requirements.raster_gbuffer || self.has_raster_gbuffer)
+            && (!requirements.overlay_hdr || self.has_overlay_hdr)
+    }
+
     pub(super) fn new(
-        width: u32,
-        height: u32,
-        padded_bytes_per_row: u32,
-        needs_raster_gbuffer: bool,
-        needs_overlay_hdr: bool,
+        requirements: FrameRequirements,
         resources: &TargetCacheResources<'_>,
     ) -> Self {
+        let width = requirements.width;
+        let height = requirements.height;
+        let padded_bytes_per_row = requirements.padded_rgba_row_bytes;
+        let needs_raster_gbuffer = requirements.raster_gbuffer;
+        let needs_overlay_hdr = requirements.overlay_hdr;
         resources.nv12_constants_buffer.write_bytes(
             0,
             bytemuck::bytes_of(&Nv12Constants {
@@ -440,7 +428,7 @@ impl TargetCache {
             [resources.pipelines.compute_descriptor_set_layout; RENDER_FRAME_COUNT];
         let alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: RENDER_FRAME_COUNT as u32,
             p_set_layouts: compute_layouts.as_ptr(),
             ..Default::default()
@@ -466,7 +454,7 @@ impl TargetCache {
                 .device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(resources.descriptor_pool)
+                        .descriptor_pool(resources.descriptor_pool.handle())
                         .set_layouts(&surface_resolve_layouts),
                 )
                 .unwrap()
@@ -485,7 +473,7 @@ impl TargetCache {
                 .device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(resources.descriptor_pool)
+                        .descriptor_pool(resources.descriptor_pool.handle())
                         .set_layouts(&surface_lighting_layouts),
                 )
                 .unwrap()
@@ -504,7 +492,7 @@ impl TargetCache {
                 .device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(resources.descriptor_pool)
+                        .descriptor_pool(resources.descriptor_pool.handle())
                         .set_layouts(&surface_composite_layouts),
                 )
                 .unwrap()
@@ -519,7 +507,7 @@ impl TargetCache {
         let raster_layouts = [resources.pipelines.raster_descriptor_set_layout; RENDER_FRAME_COUNT];
         let alloc_info_raster = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: RENDER_FRAME_COUNT as u32,
             p_set_layouts: raster_layouts.as_ptr(),
             ..Default::default()
@@ -540,7 +528,7 @@ impl TargetCache {
 
         let alloc_info_raster_2d = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: 1,
             p_set_layouts: &resources.pipelines.raster_descriptor_set_layout_2d,
             ..Default::default()
@@ -557,7 +545,7 @@ impl TargetCache {
             [resources.pipelines.composite_descriptor_set_layout; RENDER_FRAME_COUNT];
         let alloc_info_composite = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: RENDER_FRAME_COUNT as u32,
             p_set_layouts: composite_layouts.as_ptr(),
             ..Default::default()
@@ -579,7 +567,7 @@ impl TargetCache {
             [resources.pipelines.bloom_descriptor_set_layout; RENDER_FRAME_COUNT * 3];
         let bloom_alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: bloom_layouts.len() as u32,
             p_set_layouts: bloom_layouts.as_ptr(),
             ..Default::default()
@@ -601,7 +589,7 @@ impl TargetCache {
         let nv12_layouts = [resources.pipelines.nv12_descriptor_set_layout; 3];
         let nv12_alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: 3,
             p_set_layouts: nv12_layouts.as_ptr(),
             ..Default::default()
@@ -618,7 +606,7 @@ impl TargetCache {
 
         let yuv444p_alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: 3,
             p_set_layouts: nv12_layouts.as_ptr(),
             ..Default::default()
@@ -640,7 +628,7 @@ impl TargetCache {
             vec![resources.pipelines.video_nv12_descriptor_set_layout; VIDEO_NV12_IMAGE_COUNT];
         let video_nv12_alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
-            descriptor_pool: resources.descriptor_pool,
+            descriptor_pool: resources.descriptor_pool.handle(),
             descriptor_set_count: VIDEO_NV12_IMAGE_COUNT as u32,
             p_set_layouts: video_nv12_set_layouts.as_ptr(),
             ..Default::default()
@@ -738,7 +726,7 @@ impl TargetCache {
             .collect();
         let raster_normal_depth_infos: Vec<_> = render_targets
             .iter()
-            .map(|targets| vk::DescriptorImageInfo {
+            .map(|_| vk::DescriptorImageInfo {
                 image_view: raster_normal_depth.view,
                 image_layout: vk::ImageLayout::GENERAL,
                 ..Default::default()
@@ -746,7 +734,7 @@ impl TargetCache {
             .collect();
         let raster_albedo_infos: Vec<_> = render_targets
             .iter()
-            .map(|targets| vk::DescriptorImageInfo {
+            .map(|_| vk::DescriptorImageInfo {
                 image_view: raster_albedo.view,
                 image_layout: vk::ImageLayout::GENERAL,
                 ..Default::default()
@@ -754,7 +742,7 @@ impl TargetCache {
             .collect();
         let raster_material_id_infos: Vec<_> = render_targets
             .iter()
-            .map(|targets| vk::DescriptorImageInfo {
+            .map(|_| vk::DescriptorImageInfo {
                 image_view: raster_material_id.view,
                 image_layout: vk::ImageLayout::GENERAL,
                 ..Default::default()
@@ -1441,6 +1429,7 @@ impl TargetCache {
         }
 
         Self {
+            descriptor_pool: Arc::clone(resources.descriptor_pool),
             width,
             height,
             has_raster_gbuffer: needs_raster_gbuffer,
@@ -1465,13 +1454,50 @@ impl TargetCache {
             current_frame: 0,
             raster_descriptor_set_2d,
             padded_bytes_per_row,
-            rgba_preview_buffer: vec![0; (width * height * 4) as usize],
+        }
+    }
+
+    pub(super) fn ensure_frame_attachments(
+        &mut self,
+        ctx: &Arc<VulkanContext>,
+        plan: RecordingPlan,
+        msaa_samples: u32,
+    ) {
+        if plan.raster_uses_depth && self.msaa_depth_texture.is_none() {
+            self.msaa_depth_texture = Some(Image::new(
+                ctx,
+                plan.width * plan.ssaa_factor,
+                plan.height * plan.ssaa_factor,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                vk::ImageAspectFlags::DEPTH,
+                msaa_to_vk_sample_count(msaa_samples),
+            ));
+            self.msaa_depth_texture_state = TrackedImageState::UNDEFINED;
+        }
+
+        let raster_sample_count = msaa_to_vk_sample_count(msaa_samples);
+        if plan.execution.runs_raster()
+            && !plan.analytic_2d
+            && self.msaa_texture.is_none()
+            && raster_sample_count != vk::SampleCountFlags::TYPE_1
+        {
+            self.msaa_texture = Some(Image::new(
+                ctx,
+                plan.width * plan.ssaa_factor,
+                plan.height * plan.ssaa_factor,
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::ImageUsageFlags::COLOR_ATTACHMENT,
+                vk::ImageAspectFlags::COLOR,
+                raster_sample_count,
+            ));
+            self.msaa_texture_state = TrackedImageState::UNDEFINED;
         }
     }
 }
 
-impl TargetCache {
-    pub(super) fn destroy(&mut self, ctx: &VulkanContext, descriptor_pool: vk::DescriptorPool) {
+impl Drop for TargetCache {
+    fn drop(&mut self) {
         let mut descriptor_sets = Vec::with_capacity(40);
         for targets in &self.render_targets {
             descriptor_sets.extend([
@@ -1488,35 +1514,6 @@ impl TargetCache {
         descriptor_sets.extend(self.nv12_descriptor_sets);
         descriptor_sets.extend(self.yuv444p_descriptor_sets);
         descriptor_sets.extend(self.video_nv12_slots.iter().map(|slot| slot.descriptor_set));
-        unsafe {
-            ctx.device
-                .free_descriptor_sets(descriptor_pool, &descriptor_sets)
-                .unwrap();
-        }
-
-        for targets in &mut self.render_targets {
-            targets.destroy(ctx);
-        }
-        self.raster_normal_depth.destroy(ctx);
-        self.raster_albedo.destroy(ctx);
-        self.raster_material_id.destroy(ctx);
-        if let Some(texture) = &mut self.msaa_texture {
-            texture.destroy(ctx);
-        }
-        if let Some(texture) = &mut self.msaa_depth_texture {
-            texture.destroy(ctx);
-        }
-        for buf in &mut self.output_buffers {
-            buf.destroy(ctx);
-        }
-        for buf in &mut self.nv12_output_buffers {
-            buf.destroy(ctx);
-        }
-        for buf in &mut self.yuv444p_output_buffers {
-            buf.destroy(ctx);
-        }
-        for slot in &mut self.video_nv12_slots {
-            slot.image.destroy(ctx);
-        }
+        self.descriptor_pool.free(&descriptor_sets);
     }
 }

@@ -1,9 +1,6 @@
 use nalgebra::Vector2;
 
-use crate::{
-    Color, Context, GMFloat,
-    mobjects::{coordinate_change_x, coordinate_change_y},
-};
+use crate::GMFloat;
 
 pub mod constants;
 

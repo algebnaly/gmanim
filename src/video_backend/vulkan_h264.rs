@@ -8,7 +8,6 @@ use std::time::{Duration, Instant};
 
 use ash::khr;
 use ash::vk;
-use ash::vk::Handle;
 use ash::vk::native::{
     StdVideoEncodeH264PictureInfo, StdVideoEncodeH264PictureInfoFlags,
     StdVideoEncodeH264ReferenceInfo, StdVideoEncodeH264ReferenceListsInfo,
@@ -262,7 +261,6 @@ struct VideoSessionResources {
     session_memory: Vec<vk::DeviceMemory>,
     sps: StdVideoH264SequenceParameterSet,
     pps: StdVideoH264PictureParameterSet,
-    picture_format: vk::Format,
     dpb_format: vk::Format,
     max_dpb_slots: u32,
     bitstream_buffer: vk::Buffer,
@@ -899,7 +897,6 @@ fn create_video_session(
         session_memory: Vec::new(),
         sps: make_h264_sps(config.output_width, config.output_height, None),
         pps: make_h264_pps(),
-        picture_format,
         dpb_format,
         max_dpb_slots,
         bitstream_buffer: vk::Buffer::null(),
@@ -2291,6 +2288,7 @@ fn make_h264_reference_info(
 mod tests {
     use super::*;
     use crate::video_backend::ColorOrder;
+    use ash::vk::Handle;
 
     fn config(width: u32, height: u32) -> VideoConfig {
         VideoConfig {
@@ -2383,7 +2381,7 @@ mod tests {
 
     #[test]
     fn default_rate_control_settings_are_valid_for_h264() {
-        let mut settings = default_h264_rate_control_settings(
+        let settings = default_h264_rate_control_settings(
             vk::VideoEncodeRateControlModeFlagsKHR::VBR,
             60,
             None,

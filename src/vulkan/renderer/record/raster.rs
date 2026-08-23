@@ -67,7 +67,7 @@ impl<'a> CommandRecorder<'a> {
         let depth_info = unsafe {
             match depth {
                 Some(DepthAttachment {
-                    mut attachment,
+                    attachment,
                     load,
                     preserve,
                 }) => {

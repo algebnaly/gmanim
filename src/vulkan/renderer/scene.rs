@@ -16,6 +16,8 @@ pub(super) struct PreparedSdfPrimitive {
 }
 
 pub(super) struct PreparedScene {
+    pub(super) width: u32,
+    pub(super) height: u32,
     pub(super) camera_uniform: CameraUniform,
     pub(super) camera_uniform_2d: CameraUniform2D,
     pub(super) sdf_primitives: Vec<PreparedSdfPrimitive>,
@@ -294,7 +296,6 @@ impl ScenePreparer {
                         scene.camera.perspective_params().1 as f32,
                     )
                 } else {
-                    let aspect = output_w / output_h;
                     let ortho_params = scene.camera.ortho_params();
                     // ortho_params returns (left, right, bottom, top, near, far) where left/right are often without aspect ratio applied
                     // Actually, let's just use the exact params from the camera
@@ -341,6 +342,8 @@ impl ScenePreparer {
         });
 
         PreparedScene {
+            width: scene_config.output_width,
+            height: scene_config.output_height,
             camera_uniform,
             camera_uniform_2d,
             sdf_primitives,

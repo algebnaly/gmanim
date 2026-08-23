@@ -1,15 +1,9 @@
-use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
-use lyon::math::point;
-use lyon::path::Path;
-use lyon::tessellation::{
-    BuffersBuilder, FillOptions, FillTessellator, StrokeOptions, StrokeTessellator, VertexBuffers,
-};
+use crate::mobjects::mesh_2d::TriangleMesh2D;
 use nalgebra::Point3;
-use std::f32::consts::PI;
 
 use crate::{
-    Color, Context, GMFloat,
-    mobjects::{Draw, DrawConfig, Mobject},
+    Color, GMFloat,
+    mobjects::{DrawConfig, Mobject},
 };
 
 pub struct Dot {
@@ -47,10 +41,6 @@ impl Dot {
             mesh: TriangleMesh2D::default(),
         }
     }
-}
-
-impl Draw for Dot {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for Dot {

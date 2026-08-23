@@ -74,9 +74,6 @@ fn check(context: &'static str, code: i32) -> io::Result<()> {
 // Encoder — synchronous, single-threaded H.264 encoder (private)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Number of pre-allocated// 0 means dynamic allocation. This avoids deadlocks when the encoder holds many frames.
-const HW_FRAME_POOL_SIZE: usize = 0;
-
 /// Synchronous VAAPI H.264 encoder (internal implementation detail).
 ///
 /// Used internally by [`FfmpegVaapiBackend`]'s worker thread.
@@ -111,11 +108,6 @@ unsafe impl Send for Encoder {}
 // --- Construction ---
 
 impl Encoder {
-    /// Create a new encoder, panicking on failure.
-    fn new(config: &VideoConfig) -> Self {
-        Self::try_new(config, "/dev/dri/renderD128").expect("failed to create VAAPI H.264 encoder")
-    }
-
     /// Create a new encoder with an explicit VAAPI device path.
     fn try_new(config: &VideoConfig, vaapi_device: &str) -> io::Result<Self> {
         if config.output_color_profile != crate::OutputColorProfile::Bt709Sdr {
@@ -524,11 +516,9 @@ impl FfmpegVaapiBackend {
 
         let worker = thread::spawn(move || {
             let mut encoder = encoder;
-            let mut frames_processed = 0;
             while let Ok(msg) = receiver.recv() {
                 match msg {
                     WorkerMessage::Frame(buf) => {
-                        frames_processed += 1;
                         encoder.write_frame(&buf);
                         let _ = recycle_tx.try_send(buf); // recycle to pool if space, otherwise drop
                     }

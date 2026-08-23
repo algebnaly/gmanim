@@ -65,12 +65,6 @@ impl RenderVisitor for InterceptorVisitor<'_> {
     }
 }
 
-impl crate::mobjects::Draw for Wrapper2DIn3D {
-    fn draw(&self, ctx: &mut crate::Context, world_transform: Matrix4<crate::GMFloat>) {
-        self.inner.draw(ctx, world_transform);
-    }
-}
-
 impl Mobject for Wrapper2DIn3D {
     fn default_name(&self) -> &'static str {
         "Wrapper2DIn3D"

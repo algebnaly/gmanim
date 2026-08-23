@@ -1,8 +1,10 @@
 use ash::vk;
+use std::sync::Arc;
 
 use crate::vulkan::context::VulkanContext;
 
 pub struct Buffer {
+    ctx: Arc<VulkanContext>,
     pub vk_buffer: vk::Buffer,
     pub allocation: Option<gpu_allocator::vulkan::Allocation>,
     pub size: u64,
@@ -10,7 +12,7 @@ pub struct Buffer {
 
 impl Buffer {
     pub fn new(
-        ctx: &VulkanContext,
+        ctx: &Arc<VulkanContext>,
         size: u64,
         usage: vk::BufferUsageFlags,
         memory_location: gpu_allocator::MemoryLocation,
@@ -46,6 +48,7 @@ impl Buffer {
         }
 
         Self {
+            ctx: Arc::clone(ctx),
             vk_buffer,
             allocation: Some(allocation),
             size,
@@ -65,17 +68,27 @@ impl Buffer {
         }
     }
 
-    pub fn destroy(&mut self, ctx: &VulkanContext) {
-        unsafe {
-            ctx.device.destroy_buffer(self.vk_buffer, None);
+    fn release(&mut self) {
+        if self.vk_buffer != vk::Buffer::null() {
+            unsafe {
+                self.ctx.device.destroy_buffer(self.vk_buffer, None);
+            }
+            self.vk_buffer = vk::Buffer::null();
         }
         if let Some(allocation) = self.allocation.take() {
-            ctx.allocator.lock().unwrap().free(allocation).unwrap();
+            self.ctx.allocator.lock().unwrap().free(allocation).unwrap();
         }
     }
 }
 
+impl Drop for Buffer {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 pub struct Image {
+    ctx: Arc<VulkanContext>,
     pub vk_image: vk::Image,
     pub allocation: Option<gpu_allocator::vulkan::Allocation>,
     pub view: vk::ImageView,
@@ -87,7 +100,7 @@ pub struct Image {
 
 impl Image {
     pub fn new(
-        ctx: &VulkanContext,
+        ctx: &Arc<VulkanContext>,
         width: u32,
         height: u32,
         format: vk::Format,
@@ -99,7 +112,7 @@ impl Image {
     }
 
     pub fn new_with_mip_levels(
-        ctx: &VulkanContext,
+        ctx: &Arc<VulkanContext>,
         width: u32,
         height: u32,
         format: vk::Format,
@@ -167,6 +180,7 @@ impl Image {
         let view = unsafe { ctx.device.create_image_view(&view_info, None).unwrap() };
 
         Self {
+            ctx: Arc::clone(ctx),
             vk_image,
             allocation: Some(allocation),
             view,
@@ -177,13 +191,74 @@ impl Image {
         }
     }
 
-    pub fn destroy(&mut self, ctx: &VulkanContext) {
-        unsafe {
-            ctx.device.destroy_image_view(self.view, None);
-            ctx.device.destroy_image(self.vk_image, None);
+    fn release(&mut self) {
+        if self.view != vk::ImageView::null() {
+            unsafe {
+                self.ctx.device.destroy_image_view(self.view, None);
+            }
+            self.view = vk::ImageView::null();
+        }
+        if self.vk_image != vk::Image::null() {
+            unsafe {
+                self.ctx.device.destroy_image(self.vk_image, None);
+            }
+            self.vk_image = vk::Image::null();
         }
         if let Some(allocation) = self.allocation.take() {
-            ctx.allocator.lock().unwrap().free(allocation).unwrap();
+            self.ctx.allocator.lock().unwrap().free(allocation).unwrap();
+        }
+    }
+}
+
+impl Drop for Image {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub(super) struct DescriptorPool {
+    device: Arc<ash::Device>,
+    handle: vk::DescriptorPool,
+}
+
+impl DescriptorPool {
+    pub(super) fn new(
+        ctx: &Arc<VulkanContext>,
+        sizes: &[vk::DescriptorPoolSize],
+        max_sets: u32,
+    ) -> Self {
+        let handle = unsafe {
+            ctx.device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .pool_sizes(sizes)
+                        .max_sets(max_sets)
+                        .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET),
+                    None,
+                )
+                .unwrap()
+        };
+        Self {
+            device: Arc::clone(&ctx.device),
+            handle,
+        }
+    }
+
+    pub(super) fn handle(&self) -> vk::DescriptorPool {
+        self.handle
+    }
+
+    pub(super) fn free(&self, sets: &[vk::DescriptorSet]) {
+        unsafe {
+            let _ = self.device.free_descriptor_sets(self.handle, sets);
+        }
+    }
+}
+
+impl Drop for DescriptorPool {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.destroy_descriptor_pool(self.handle, None);
         }
     }
 }

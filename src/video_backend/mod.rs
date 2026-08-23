@@ -1,9 +1,5 @@
-use std::collections::VecDeque;
 use std::fmt::Display;
 use std::io;
-use std::sync::mpsc::{self, Receiver, Sender, channel};
-use std::sync::{Arc, Condvar, Mutex};
-use std::thread::{self, JoinHandle};
 
 use crate::video_backend::ffmpeg::FfmpegBackend;
 use crate::video_backend::vaapi::FfmpegVaapiBackend;
@@ -11,7 +7,6 @@ pub mod ffmpeg;
 pub mod vaapi;
 pub mod vulkan_h264;
 
-const BLOCK_SIZE: usize = 240;
 pub enum VideoBackendType {
     FfmpegPipe(FfmpegPipeBackend),
     Ffmpeg(FfmpegBackend),
@@ -253,8 +248,6 @@ impl FfmpegPipeBackend {
             crate::OutputColorProfile::Bt709Sdr,
             "FFmpeg pipe currently supports only 8-bit BT.709 SDR output"
         );
-        let encoder_name = encoder_config.get_encoder_name();
-
         let mut args = vec![
             "-y".to_string(),
             "-f".to_string(),

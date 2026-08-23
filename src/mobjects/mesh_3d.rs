@@ -1,6 +1,6 @@
 use crate::Color;
 use crate::GMFloat;
-use crate::mobjects::{Draw, Mobject};
+use crate::mobjects::Mobject;
 use nalgebra::{Matrix4, Point3, Vector3};
 
 #[repr(C)]
@@ -684,7 +684,8 @@ impl TriangleMesh3D {
                 [cx, cy + half, cz + half],
                 [cx, cy + half, cz - half],
             ),
-            _ => ( // "xy" or "yx" (default front plane)
+            _ => (
+                // "xy" or "yx" (default front plane)
                 [0.0, 0.0, 1.0],
                 [cx - half, cy - half, cz],
                 [cx + half, cy - half, cz],
@@ -738,10 +739,6 @@ impl TriangleMesh3D {
         mesh.material.planar_grid = Some(planar_grid);
         mesh
     }
-}
-
-impl Draw for TriangleMesh3D {
-    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {}
 }
 
 impl Mobject for TriangleMesh3D {

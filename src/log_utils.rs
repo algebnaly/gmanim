@@ -1,4 +1,3 @@
-use log::{debug, error, info, trace, warn};
 use std::time::SystemTime;
 
 pub fn setup_logger() -> Result<(), fern::InitError> {

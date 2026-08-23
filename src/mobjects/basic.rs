@@ -1,9 +1,9 @@
 use nalgebra::Point3;
 use std::f32::consts::PI;
 
-use crate::{Color, Context, GMFloat, math_utils::k_for_bezier_arc};
+use crate::{Color, GMFloat, math_utils::k_for_bezier_arc};
 
-use super::{Draw, DrawConfig, Mobject};
+use super::{DrawConfig, Mobject};
 use crate::mobjects::mesh_2d::{RectVertexBuilder, TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
 use lyon::path::Path;
@@ -202,10 +202,6 @@ impl SimpleLine {
     }
 }
 
-impl Draw for SimpleLine {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
-}
-
 impl Mobject for SimpleLine {
     fn default_name(&self) -> &'static str {
         "SimpleLine"
@@ -331,10 +327,6 @@ impl Arc {
     }
 }
 
-impl Draw for Arc {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
-}
-
 impl Mobject for Arc {
     fn default_name(&self) -> &'static str {
         "Arc"
@@ -396,10 +388,6 @@ impl PolyLine {
         self.mesh
             .replace_geometry(geometry.vertices, geometry.indices, c);
     }
-}
-
-impl Draw for PolyLine {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for PolyLine {
@@ -502,10 +490,6 @@ impl QuadraticBezier {
         self.mesh
             .replace_geometry(geometry.vertices, geometry.indices, color);
     }
-}
-
-impl Draw for QuadraticBezier {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for QuadraticBezier {

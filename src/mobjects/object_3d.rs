@@ -1,11 +1,8 @@
 use nalgebra::{Point3, Vector3};
-use rayon::prelude::*;
-use std::sync::Arc;
 
-use crate::camera::Camera;
+use crate::GMFloat;
+use crate::mobjects::Mobject;
 use crate::mobjects::mesh_3d::SurfaceMaterial;
-use crate::mobjects::{Draw, Mobject};
-use crate::{Context, GMFloat};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum SdfPrimitive {
@@ -73,9 +70,6 @@ impl Object3D for Sphere3D {
         }
     }
 }
-impl Draw for Sphere3D {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
-}
 impl Mobject for Sphere3D {
     fn default_name(&self) -> &'static str {
         "Sphere3D"
@@ -119,9 +113,6 @@ impl Object3D for LineSegment3D {
             radius: self.radius,
         }
     }
-}
-impl Draw for LineSegment3D {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for LineSegment3D {
     fn default_name(&self) -> &'static str {
@@ -167,9 +158,6 @@ impl Object3D for QuadraticBezier3D {
             radius: self.radius,
         }
     }
-}
-impl Draw for QuadraticBezier3D {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 impl Mobject for QuadraticBezier3D {
     fn default_name(&self) -> &'static str {
@@ -252,9 +240,6 @@ impl Object3D for Arrow3D {
         }
     }
 }
-impl Draw for Arrow3D {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
-}
 impl Mobject for Arrow3D {
     fn default_name(&self) -> &'static str {
         "Arrow3D"
@@ -315,10 +300,6 @@ impl Object3D for Box3DSdf {
             y_axis,
         }
     }
-}
-
-impl Draw for Box3DSdf {
-    fn draw(&self, _ctx: &mut Context, _parent_matrix: nalgebra::Matrix4<GMFloat>) {}
 }
 
 impl Mobject for Box3DSdf {

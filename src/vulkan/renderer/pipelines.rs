@@ -2,10 +2,12 @@ use crate::mobjects::mesh_2d::Vertex2D;
 use crate::mobjects::mesh_3d::Vertex;
 use crate::vulkan::context::VulkanContext;
 use ash::vk;
+use std::sync::Arc;
 
 use super::mesh_2d::Instance2D;
 
 pub(super) struct PipelineSet {
+    device: Arc<ash::Device>,
     pub(super) compute_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) surface_resolve_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) surface_lighting_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -802,7 +804,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .descriptor_count(1)
                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
         ];
-        let mut binding_flags = [
+        let binding_flags = [
             vk::DescriptorBindingFlags::PARTIALLY_BOUND,
             vk::DescriptorBindingFlags::empty(),
         ];
@@ -1329,6 +1331,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         }
 
         Self {
+            device: Arc::clone(&ctx.device),
             compute_descriptor_set_layout,
             surface_resolve_descriptor_set_layout,
             surface_lighting_descriptor_set_layout,
@@ -1370,6 +1373,66 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             raster_pipeline_2d,
             raster_pipeline_2d_depthless,
             raster_pipeline_2d_analytic,
+        }
+    }
+}
+
+impl Drop for PipelineSet {
+    fn drop(&mut self) {
+        unsafe {
+            for pipeline in [
+                self.compute_pipeline,
+                self.surface_resolve_pipeline,
+                self.surface_lighting_pipeline,
+                self.surface_copy_pipeline,
+                self.surface_overlay_pipeline,
+                self.downsample_pipeline,
+                self.bloom_extract_pipeline,
+                self.bloom_horizontal_pipeline,
+                self.bloom_vertical_pipeline,
+                self.nv12_pipeline,
+                self.video_nv12_pipeline,
+                self.video_nv12_downsample_pipeline,
+                self.yuv444p_pipeline,
+                self.raster_pipeline,
+                self.raster_pipeline_transparent_depth,
+                self.raster_pipeline_transparent_back,
+                self.raster_pipeline_transparent_front,
+                self.raster_pipeline_2d,
+                self.raster_pipeline_2d_depthless,
+                self.raster_pipeline_2d_analytic,
+            ] {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            for layout in [
+                self.compute_pipeline_layout,
+                self.surface_resolve_pipeline_layout,
+                self.surface_lighting_pipeline_layout,
+                self.surface_composite_pipeline_layout,
+                self.composite_pipeline_layout,
+                self.bloom_pipeline_layout,
+                self.nv12_pipeline_layout,
+                self.video_nv12_pipeline_layout,
+                self.raster_pipeline_layout,
+                self.raster_pipeline_layout_2d,
+            ] {
+                self.device.destroy_pipeline_layout(layout, None);
+            }
+            for layout in [
+                self.compute_descriptor_set_layout,
+                self.surface_resolve_descriptor_set_layout,
+                self.surface_lighting_descriptor_set_layout,
+                self.surface_composite_descriptor_set_layout,
+                self.raster_descriptor_set_layout,
+                self.raster_descriptor_set_layout_2d,
+                self.composite_descriptor_set_layout,
+                self.bloom_descriptor_set_layout,
+                self.nv12_descriptor_set_layout,
+                self.video_nv12_descriptor_set_layout,
+                self.raster_texture_layout,
+            ] {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
         }
     }
 }

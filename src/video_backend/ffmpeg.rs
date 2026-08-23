@@ -1,27 +1,19 @@
-use std::hint::black_box;
-use std::io::{self, Write};
-use std::time::Instant;
+use std::io;
 
-use ffmpeg_next::format::{Pixel, pixel};
+use ffmpeg_next::format::Pixel;
 use ffmpeg_next::util::color;
 
 use ffmpeg_next::Dictionary;
-use ffmpeg_next::{ChannelLayout, StreamMut};
 
-use ffmpeg_next::codec::encoder::{Audio, Video};
+use ffmpeg_next::codec::encoder::Video;
 use ffmpeg_next::format::context::Output;
-use ffmpeg_next::software::scaling;
-use yuv::rgba_to_yuv420;
 
 use crate::video_backend::VideoConfig;
 
 pub struct FfmpegBackend {
     v_enc: Video,
-    a_enc: Audio,
     octx: Output,
     v_stream_idx: usize,
-    a_stream_idx: usize,
-    // scaler: scaling::context::Context,
     frame_count: u64,
     pub frame_size: usize,
     color_order: crate::video_backend::ColorOrder,
@@ -52,7 +44,7 @@ impl FfmpegBackend {
         let mut v_stream = octx.add_stream(v_codec).unwrap();
         let v_stream_idx = v_stream.index();
 
-        let mut v_enc_ctx = ffmpeg_next::codec::context::Context::new_with_codec(v_codec);
+        let v_enc_ctx = ffmpeg_next::codec::context::Context::new_with_codec(v_codec);
         let mut v_enc = v_enc_ctx.encoder().video().unwrap();
 
         v_enc.set_width(video_config.output_width);
@@ -98,36 +90,12 @@ impl FfmpegBackend {
                 ffmpeg_next::ffi::AVColorTransferCharacteristic::AVCOL_TRC_BT709;
         }
 
-        // audio codec settings
-        let a_codec = ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::AAC).unwrap();
-        let mut a_stream = octx.add_stream(a_codec).unwrap();
-        let a_stream_idx = a_stream.index();
-
-        let mut a_enc_ctx = ffmpeg_next::codec::context::Context::new();
-        let mut a_enc = a_enc_ctx.encoder().audio().unwrap();
-
-        a_enc.set_format(ffmpeg_next::format::Sample::F32(
-            ffmpeg_next::format::sample::Type::Planar,
-        ));
-        a_enc.set_rate(44100);
-        a_enc.set_channel_layout(ChannelLayout::STEREO);
-        a_enc.set_time_base((1, 44100));
-
-        if global_header {
-            a_enc.set_flags(ffmpeg_next::codec::Flags::GLOBAL_HEADER);
-        }
-
-        let a_enc = a_enc.open_as(a_codec).unwrap();
-        a_stream.set_parameters(&a_enc);
-
         octx.write_header().unwrap();
 
         Self {
             octx,
             v_enc,
-            a_enc,
             v_stream_idx,
-            a_stream_idx,
             frame_count: 0,
             frame_size: match video_config.color_order {
                 crate::video_backend::ColorOrder::Yuv444p => {
@@ -264,243 +232,10 @@ impl FfmpegBackend {
                     );
                     packet.write_interleaved(&mut self.octx).unwrap();
                 }
-                Err(e) => {
+                Err(_) => {
                     break;
                 } // EAGAIN or EOF
             }
         }
     }
-}
-
-fn do_scale(
-    input_frame: &ffmpeg_next::util::frame::Video,
-    output_frame: &mut ffmpeg_next::util::frame::Video,
-) {
-    use yuv::BufferStoreMut;
-    use yuv::YuvConversionMode;
-    use yuv::YuvPlanarImageMut;
-    use yuv::YuvRange;
-    use yuv::YuvStandardMatrix;
-    use yuv::rgba_to_yuv420;
-
-    let y_stride = output_frame.plane_width(0);
-    let u_stride = output_frame.plane_width(1);
-    let v_stride = output_frame.plane_width(2);
-    let width = output_frame.width();
-    let height = output_frame.height();
-
-    // 用 unsafe 分别获取各平面的可变指针
-    let (y_plane, u_plane, v_plane) = unsafe {
-        let ptr = output_frame.as_mut_ptr();
-        let y = std::slice::from_raw_parts_mut((*ptr).data[0], (y_stride * height) as usize);
-        let u = std::slice::from_raw_parts_mut((*ptr).data[1], (u_stride * height / 2) as usize);
-        let v = std::slice::from_raw_parts_mut((*ptr).data[2], (v_stride * height / 2) as usize);
-        (y, u, v)
-    };
-
-    let mut image = YuvPlanarImageMut {
-        y_plane: BufferStoreMut::Borrowed(y_plane),
-        y_stride,
-        u_plane: BufferStoreMut::Borrowed(u_plane),
-        u_stride,
-        v_plane: BufferStoreMut::Borrowed(v_plane),
-        v_stride,
-        width,
-        height,
-    };
-
-    rgba_to_yuv420(
-        &mut image,
-        input_frame.data(0),
-        width * 4,
-        YuvRange::Limited,
-        YuvStandardMatrix::Bt709,
-        YuvConversionMode::Fast,
-    );
-}
-
-#[test]
-fn test_bench_ffmpeg_alloc() {
-    const S: usize = 1000_0;
-    let mut v = Vec::with_capacity(S);
-    let now = Instant::now();
-    for i in 0..S {
-        let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
-        unsafe {
-            input_frame.alloc(pixel::Pixel::RGBA, 3840, 2160);
-        }
-        v.push(input_frame.data(0)[0] as usize);
-    }
-
-    println!("{:?}ms", now.elapsed().as_millis());
-
-    let mut sum: usize = 0;
-    for i in 0..v.len() {
-        sum.wrapping_add(v[i]);
-    }
-
-    println!("Sum: {}", sum);
-}
-
-#[test]
-fn test_bench_frame_memcpy() {
-    const S: usize = 1000;
-    let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        input_frame.alloc(pixel::Pixel::RGBA, 1920, 1080);
-    }
-    let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        output_frame.alloc(pixel::Pixel::RGBA, 1920, 1080);
-    }
-    let now = Instant::now();
-    for i in 0..S {
-        unsafe {
-            let mut data_in = input_frame.data_mut(0);
-            let mut data_out = output_frame.data_mut(0);
-
-            data_out.copy_from_slice(data_in);
-        }
-    }
-
-    println!("{:?}ms", now.elapsed().as_millis());
-}
-
-#[test]
-fn bench_encode_video() {
-    let width = 1920;
-    let height = 1080;
-    const S: usize = 100;
-    // video codec settings
-    let v_codec =
-        ffmpeg_next::encoder::find(ffmpeg_next::codec::Id::H264).expect("H.264 encoder not found");
-
-    let mut v_enc_ctx = ffmpeg_next::codec::context::Context::new_with_codec(v_codec);
-    let mut v_enc = v_enc_ctx.encoder().video().unwrap();
-    v_enc.set_width(width);
-    v_enc.set_height(height);
-    v_enc.set_format(Pixel::YUV420P);
-    v_enc.set_time_base((1, 30));
-    v_enc.set_gop(10);
-
-    let mut v_opts = Dictionary::new();
-
-    v_opts.set("preset", "ultrafast");
-    v_opts.set("crf", "23");
-    v_opts.set("tune", "zerolatency");
-
-    let mut v_enc = v_enc
-        .open_as_with(v_codec, v_opts)
-        .expect("Failed to open encoder");
-    let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        input_frame.alloc(pixel::Pixel::RGBA, width, height);
-    }
-
-    let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        output_frame.alloc(Pixel::YUV420P, width, height);
-    }
-    let mut packet = ffmpeg_next::Packet::empty();
-    let mut i = 0;
-    let now = Instant::now();
-    for _ in 0..S {
-        output_frame.set_pts(Some(i as i64));
-        v_enc.send_frame(&output_frame);
-        loop {
-            let mut packet = ffmpeg_next::Packet::empty();
-            match v_enc.receive_packet(&mut packet) {
-                Ok(_) => {}
-                Err(e) => {
-                    break;
-                } // EAGAIN or EOF
-            }
-        }
-        i += 1;
-    }
-    v_enc.send_eof();
-    loop {
-        let mut packet = ffmpeg_next::Packet::empty();
-        match v_enc.receive_packet(&mut packet) {
-            Ok(_) => {}
-            Err(e) => {
-                break;
-            } // EAGAIN or EOF
-        }
-    }
-
-    let elapsed = now.elapsed();
-    println!("Encoding time: {:?}", elapsed);
-}
-
-#[test]
-fn test_bench_scaler() {
-    let width = 1920;
-    let height = 1080;
-    let mut scaler = scaling::context::Context::get(
-        Pixel::RGBA,
-        width,
-        height,
-        Pixel::YUV420P,
-        width,
-        height,
-        scaling::flag::Flags::POINT,
-    )
-    .unwrap();
-    const S: usize = 1000;
-    let mut input_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        input_frame.alloc(pixel::Pixel::RGBA, 1920, 1080);
-    }
-    let mut output_frame = ffmpeg_next::util::frame::video::Video::empty();
-    unsafe {
-        output_frame.alloc(pixel::Pixel::YUV420P, 1920, 1080);
-    }
-
-    let now = Instant::now();
-
-    use yuv::BufferStoreMut;
-    use yuv::YuvConversionMode;
-    use yuv::YuvPlanarImageMut;
-    use yuv::YuvRange;
-    use yuv::YuvStandardMatrix;
-    use yuv::rgba_to_yuv420;
-
-    let y_stride = output_frame.plane_width(0);
-    let u_stride = output_frame.plane_width(1);
-    let v_stride = output_frame.plane_width(2);
-    let width = output_frame.width();
-    let height = output_frame.height();
-
-    let (y_plane, u_plane, v_plane) = unsafe {
-        let ptr = output_frame.as_mut_ptr();
-        let y = std::slice::from_raw_parts_mut((*ptr).data[0], (y_stride * height) as usize);
-        let u = std::slice::from_raw_parts_mut((*ptr).data[1], (u_stride * height / 2) as usize);
-        let v = std::slice::from_raw_parts_mut((*ptr).data[2], (v_stride * height / 2) as usize);
-        (y, u, v)
-    };
-
-    let mut image = YuvPlanarImageMut {
-        y_plane: BufferStoreMut::Borrowed(y_plane),
-        y_stride,
-        u_plane: BufferStoreMut::Borrowed(u_plane),
-        u_stride,
-        v_plane: BufferStoreMut::Borrowed(v_plane),
-        v_stride,
-        width,
-        height,
-    };
-
-    for i in 0..S {
-        scaler.run(&input_frame, &mut output_frame).unwrap();
-        // rgba_to_yuv420(
-        //     &mut image,
-        //     input_frame.data(0),
-        //     width * 4,
-        //     YuvRange::Limited,
-        //     YuvStandardMatrix::Bt709,
-        //     YuvConversionMode::Balanced,
-        // );
-    }
-    println!("{:?}ms", now.elapsed().as_millis());
 }

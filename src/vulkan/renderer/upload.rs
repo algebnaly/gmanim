@@ -1,21 +1,36 @@
+use ash::vk;
+use std::sync::Arc;
+
+use crate::mobjects::mesh_2d::Vertex2D;
+use crate::mobjects::mesh_3d::{SurfaceMaterial, Vertex};
+use crate::vulkan::context::VulkanContext;
+
+use super::frame::RENDER_FRAME_COUNT;
 use super::mesh_2d::{GeometryUpload2D, Instance2D};
+use super::prepared_frame::GpuSdfPrimitive;
 use super::{
-    Buffer, CameraUniform, CameraUniform2D, GpuSdfPrimitive, MAX_SURFACE_MATERIALS, MaterialData3D,
-    SurfaceMaterial, ToneMapConstants, Vertex,
+    Buffer, CameraUniform, CameraUniform2D, MAX_SURFACE_MATERIALS, MaterialData3D, Nv12Constants,
+    ToneMapConstants, align_up,
 };
 
-pub(super) struct FrameUploader<'a> {
-    pub(super) vertex: &'a Buffer,
-    pub(super) index: &'a Buffer,
-    pub(super) camera: &'a Buffer,
-    pub(super) material_3d: &'a Buffer,
-    pub(super) primitive: &'a Buffer,
-    pub(super) vertex_staging_2d: &'a Buffer,
-    pub(super) index_staging_2d: &'a Buffer,
-    pub(super) instance_2d: &'a Buffer,
-    pub(super) camera_2d: &'a Buffer,
-    pub(super) tone_map_factor: &'a Buffer,
+pub(super) struct FrameBuffers {
+    pub(super) vertex: Buffer,
+    pub(super) index: Buffer,
+    pub(super) camera: Buffer,
+    pub(super) material_3d: Buffer,
+    pub(super) primitive: Buffer,
+    pub(super) nv12_constants: Buffer,
+    pub(super) vertex_2d: Buffer,
+    pub(super) index_2d: Buffer,
+    pub(super) vertex_staging_2d: Buffer,
+    pub(super) index_staging_2d: Buffer,
+    pub(super) instance_2d: Buffer,
+    pub(super) camera_2d: Buffer,
+    pub(super) tone_map_factor: Buffer,
     pub(super) strides: FrameBufferStrides,
+    static_vertex_2d_capacity: u64,
+    static_index_2d_capacity: u64,
+    material_scratch: Vec<MaterialData3D>,
 }
 
 #[derive(Clone, Copy)]
@@ -57,8 +72,139 @@ pub(super) struct UploadedFrame {
     pub(super) raster_2d_dynamic_offsets: [u32; 1],
 }
 
-impl FrameUploader<'_> {
-    pub(super) fn upload(&self, frame_index: usize, upload: FrameUpload<'_>) -> UploadedFrame {
+impl FrameBuffers {
+    pub(super) fn new(ctx: &Arc<VulkanContext>) -> Self {
+        let limits = unsafe {
+            ctx.instance
+                .get_physical_device_properties(ctx.physical_device)
+                .limits
+        };
+        let uniform_alignment = limits.min_uniform_buffer_offset_alignment.max(1);
+        let storage_alignment = limits.min_storage_buffer_offset_alignment.max(1);
+        let static_vertex_2d_capacity = (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64;
+        let static_index_2d_capacity = (std::mem::size_of::<u32>() * 3_000_000) as u64;
+        let strides = FrameBufferStrides {
+            vertex: (std::mem::size_of::<Vertex>() * 1_000_000) as u64,
+            index: (std::mem::size_of::<u32>() * 3_000_000) as u64,
+            camera: align_up(
+                std::mem::size_of::<CameraUniform>() as u64,
+                uniform_alignment,
+            ),
+            material_3d: align_up(
+                (std::mem::size_of::<MaterialData3D>() * MAX_SURFACE_MATERIALS) as u64,
+                storage_alignment,
+            ),
+            primitive: align_up(
+                (std::mem::size_of::<GpuSdfPrimitive>() * 10_000) as u64,
+                storage_alignment,
+            ),
+            vertex_staging_2d: static_vertex_2d_capacity,
+            index_staging_2d: static_index_2d_capacity,
+            instance_2d: (std::mem::size_of::<Instance2D>() * 100_000) as u64,
+            camera_2d: align_up(
+                std::mem::size_of::<CameraUniform2D>() as u64,
+                uniform_alignment,
+            ),
+            tone_map_factor: align_up(
+                std::mem::size_of::<ToneMapConstants>() as u64,
+                uniform_alignment,
+            ),
+        };
+        let frame_count = RENDER_FRAME_COUNT as u64;
+        Self {
+            vertex: Buffer::new(
+                ctx,
+                strides.vertex * frame_count,
+                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            index: Buffer::new(
+                ctx,
+                strides.index * frame_count,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            camera: Buffer::new(
+                ctx,
+                strides.camera * frame_count,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            material_3d: Buffer::new(
+                ctx,
+                strides.material_3d * frame_count,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            primitive: Buffer::new(
+                ctx,
+                strides.primitive * frame_count,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            nv12_constants: Buffer::new(
+                ctx,
+                std::mem::size_of::<Nv12Constants>() as u64,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            vertex_2d: Buffer::new(
+                ctx,
+                static_vertex_2d_capacity + strides.vertex_staging_2d * frame_count,
+                vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::GpuOnly,
+            ),
+            index_2d: Buffer::new(
+                ctx,
+                static_index_2d_capacity + strides.index_staging_2d * frame_count,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::GpuOnly,
+            ),
+            vertex_staging_2d: Buffer::new(
+                ctx,
+                strides.vertex_staging_2d * frame_count,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            index_staging_2d: Buffer::new(
+                ctx,
+                strides.index_staging_2d * frame_count,
+                vk::BufferUsageFlags::TRANSFER_SRC,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            instance_2d: Buffer::new(
+                ctx,
+                strides.instance_2d * frame_count,
+                vk::BufferUsageFlags::VERTEX_BUFFER,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            camera_2d: Buffer::new(
+                ctx,
+                strides.camera_2d * frame_count,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            tone_map_factor: Buffer::new(
+                ctx,
+                strides.tone_map_factor * frame_count,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            strides,
+            static_vertex_2d_capacity,
+            static_index_2d_capacity,
+            material_scratch: Vec::with_capacity(MAX_SURFACE_MATERIALS),
+        }
+    }
+
+    pub(super) fn static_mesh_2d_capacities(&self) -> (u64, u64) {
+        (
+            self.static_vertex_2d_capacity,
+            self.static_index_2d_capacity,
+        )
+    }
+
+    pub(super) fn upload(&mut self, frame_index: usize, upload: FrameUpload<'_>) -> UploadedFrame {
         let frame_index = frame_index as u64;
         let vertex_offset = self.strides.vertex * frame_index;
         let index_offset = self.strides.index * frame_index;
@@ -86,29 +232,28 @@ impl FrameUploader<'_> {
                 upload.materials.len() <= MAX_SURFACE_MATERIALS,
                 "3D material count exceeds {MAX_SURFACE_MATERIALS}"
             );
-            let materials: Vec<_> = upload
-                .materials
-                .iter()
-                .copied()
-                .map(MaterialData3D::from)
-                .collect();
-            self.material_3d
-                .write_bytes(material_offset, bytemuck::cast_slice(&materials));
+            self.material_scratch.clear();
+            self.material_scratch
+                .extend(upload.materials.iter().copied().map(MaterialData3D::from));
+            self.material_3d.write_bytes(
+                material_offset,
+                bytemuck::cast_slice(&self.material_scratch),
+            );
         }
         Self::write_slice(
-            self.primitive,
+            &self.primitive,
             primitive_offset,
             self.strides.primitive,
             upload.primitives,
         );
         Self::write_slice(
-            self.vertex,
+            &self.vertex,
             vertex_offset,
             self.strides.vertex,
             upload.mesh_vertices,
         );
         Self::write_slice(
-            self.index,
+            &self.index,
             index_offset,
             self.strides.index,
             upload.mesh_indices,

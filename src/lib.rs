@@ -1,5 +1,3 @@
-#![allow(unused)]
-
 use mobjects::{coordinate_change_x, coordinate_change_y};
 
 pub mod camera;

@@ -1,16 +1,20 @@
 use ash::vk;
 
 use super::Mesh3DDraw;
-use super::frame::{TrackedImageState, transition_image};
-use super::mesh_2d::{GeometryUpload2D, PreparedMesh2DBatch};
+use super::frame::TrackedImageState;
+use super::mesh_2d::PreparedMesh2DBatch;
 use super::pipelines::PipelineSet;
-use super::targets::RenderTargetSet;
 
+mod frame;
 mod output;
+mod plan;
 mod postprocess;
 mod raster;
 mod sdf;
 mod upload;
+
+pub(super) use frame::FrameRecord;
+pub(super) use plan::{RecordingPlan, RecordingPlanInput};
 
 pub(super) struct CommandRecorder<'a> {
     device: &'a ash::Device,
@@ -54,6 +58,7 @@ pub(super) enum Mesh3DPass {
     TransparentColor,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Mesh3DBindings<'a> {
     pub(super) draws: &'a [Mesh3DDraw],
     pub(super) descriptor_set: vk::DescriptorSet,
@@ -71,6 +76,7 @@ pub(super) enum Mesh2DPass {
     Analytic,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Mesh2DBindings<'a> {
     pub(super) batches: &'a [PreparedMesh2DBatch],
     pub(super) camera_descriptor_set: vk::DescriptorSet,

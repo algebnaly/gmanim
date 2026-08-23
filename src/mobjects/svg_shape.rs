@@ -1,17 +1,8 @@
 use std::{fs, io::Read};
 
-use nalgebra::Vector2;
-use usvg::{Group, Node, tiny_skia_path::PathSegment};
+use usvg::{Node, tiny_skia_path::PathSegment};
 
-use crate::{
-    Context, GMFloat,
-    math_utils::{point2d_to_point3d, point3d_to_point2d},
-};
-
-use super::{
-    Draw, DrawConfig, Mobject, NodeBundle, coordinate_change_x, coordinate_change_y,
-    path::PathElement,
-};
+use super::{DrawConfig, Mobject, NodeBundle, path::PathElement};
 use crate::mobjects::mesh_2d::{TriangleMesh2D, Vertex2D, VertexBuilder};
 use lyon::math::point;
 use lyon::path::Path;
@@ -34,39 +25,6 @@ impl SVGPath {
             is_closed: false,
             draw_config: Default::default(),
             mesh: TriangleMesh2D::default(),
-        }
-    }
-    fn move_to_origin(&mut self) {
-        if self.elements.len() == 0 {
-            return;
-        }
-        let start = self.elements.first().unwrap();
-        let start_pos;
-        if let PathElement::MoveTo(p) = start {
-            start_pos = p.clone();
-        } else {
-            return;
-        }
-        let start_displacement = nalgebra::Vector3::new(start_pos.x, start_pos.y, 0.0);
-        for e in &mut self.elements {
-            match e {
-                PathElement::MoveTo(p) => {
-                    *p -= start_displacement;
-                }
-                PathElement::LineTo(p) => {
-                    *p -= start_displacement;
-                }
-                PathElement::QuadTo(p1, p2) => {
-                    *p1 -= start_displacement;
-                    *p2 -= start_displacement;
-                }
-                PathElement::CubicTo(p1, p2, p3) => {
-                    *p1 -= start_displacement;
-                    *p2 -= start_displacement;
-                    *p3 -= start_displacement;
-                }
-                PathElement::Close => {}
-            }
         }
     }
     pub fn update_mesh(&mut self) {
@@ -160,10 +118,6 @@ impl SVGPath {
     }
 }
 
-impl Draw for SVGPath {
-    fn draw(&self, _ctx: &mut crate::Context, _parent_matrix: nalgebra::Matrix4<crate::GMFloat>) {}
-}
-
 impl Mobject for SVGPath {
     fn default_name(&self) -> &'static str {
         "SVGPath"
@@ -184,7 +138,9 @@ pub fn open_svg_file(svg_filepath: &str) -> NodeBundle {
         .open(svg_filepath)
         .expect("can't open svg file");
     let mut svg_str_buf = String::new();
-    svg_file.read_to_string(&mut svg_str_buf);
+    svg_file
+        .read_to_string(&mut svg_str_buf)
+        .expect("can't read svg file");
     let tree = usvg::Tree::from_str(&svg_str_buf, &Default::default()).unwrap();
     let mut paths: Vec<SVGPath> = vec![];
 
@@ -222,11 +178,7 @@ pub fn open_svg_file(svg_filepath: &str) -> NodeBundle {
     root
 }
 
-fn map_point(
-    transform: usvg::Transform,
-    mut x: f32,
-    mut y: f32,
-) -> nalgebra::Point3<crate::GMFloat> {
+fn map_point(transform: usvg::Transform, x: f32, y: f32) -> nalgebra::Point3<crate::GMFloat> {
     let tx = transform.sx * x + transform.kx * y + transform.tx;
     let ty = transform.ky * x + transform.sy * y + transform.ty;
     nalgebra::Point3::new(tx as crate::GMFloat, ty as crate::GMFloat, 0.0)

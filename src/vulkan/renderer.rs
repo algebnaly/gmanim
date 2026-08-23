@@ -1,53 +1,37 @@
-use crate::mobjects::mesh_2d::Vertex2D;
-use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial, Vertex};
-use crate::mobjects::object_3d::SdfPrimitive;
+use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial};
 use crate::video_backend::vulkan_h264::VulkanVideoFrame;
-use crate::vulkan::context::{TimelineSemaphore, VulkanContext};
+use crate::vulkan::context::VulkanContext;
 use ash::vk;
-use ash::vk::Handle;
-use ash::vk::native::StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN;
 use std::sync::Arc;
 
 mod frame;
 mod mesh_2d;
 mod output;
 mod pipelines;
+mod prepared_frame;
 mod profiling;
 mod record;
 mod resource;
 mod scene;
 mod targets;
+mod textures;
 mod upload;
-use frame::{
-    FrameExecutionPlan, FrameProfile, FrameSet, RENDER_FRAME_COUNT, TrackedImageState,
-    transition_image, write_gpu_timestamp,
-};
-use mesh_2d::{
-    GeometryUpload2D, Instance2D, Mesh2DBatch, Mesh2DUploadPlanner, PrepareMesh2DError,
-    PreparedMesh2D, PreparedMesh2DBatch,
-};
+mod video_output;
+use frame::{FrameProfile, FrameSet, RENDER_FRAME_COUNT};
+use mesh_2d::{Mesh2DBatch, Mesh2DUploadPlanner, PrepareMesh2DError, PreparedMesh2D};
+use output::OutputRetirement;
 pub use output::RenderOutputs;
 use pipelines::PipelineSet;
-use profiling::timestamp_delta;
+use prepared_frame::{FrameOptions, FrameRequirements, PreparedFrame};
 pub use profiling::{GpuPassTimings, RendererStats};
-use record::{
-    ColorAttachment, ColorLoad, ColorRasterPass, CommandRecorder, DeferredOpaquePass,
-    DepthAttachment, DepthLoad, GeometryUploadBuffers2D, Mesh2DBindings, Mesh2DPass,
-    Mesh3DBindings, Mesh3DPass, OutputPasses, RasterAttachment, RasterRegion, TransparentDepthPass,
-    VideoOutputPass,
-};
+use record::{CommandRecorder, FrameRecord, GeometryUploadBuffers2D};
+use resource::DescriptorPool;
 pub use resource::{Buffer, Image};
-use scene::ScenePreparer;
+use scene::{PreparedScene, ScenePreparer};
 use targets::{TargetCache, TargetCacheResources};
-use upload::{FrameBufferStrides, FrameUpload, FrameUploader};
+use textures::{StudioEnvironment, TextureRegistry};
+use upload::{FrameBuffers, FrameUpload};
 
-// The encoder keeps 8 frames in flight; one extra image prevents the renderer
-// from overwriting an image before submit-side backpressure can release a slot.
-const VIDEO_NV12_IMAGE_COUNT: usize = 9;
-const VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW: i32 = 1_000_156_003;
-const VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW: u32 = 0x0000_4000;
-const VK_IMAGE_ASPECT_PLANE_0_BIT_RAW: u32 = 0x0000_0010;
-const VK_IMAGE_ASPECT_PLANE_1_BIT_RAW: u32 = 0x0000_0020;
 const MAX_SURFACE_MATERIALS: usize = 10_000;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
@@ -56,18 +40,6 @@ fn align_up(value: u64, alignment: u64) -> u64 {
     } else {
         (value + alignment - 1) & !(alignment - 1)
     }
-}
-
-fn video_timeline_values(next_ready_value: u64) -> (Option<u64>, u64, u64) {
-    assert!(
-        next_ready_value % 2 == 1,
-        "video ready timeline values must be odd"
-    );
-    (
-        (next_ready_value > 1).then_some(next_ready_value - 1),
-        next_ready_value,
-        next_ready_value + 1,
-    )
 }
 
 fn msaa_to_vk_sample_count(msaa_samples: u32) -> vk::SampleCountFlags {
@@ -115,386 +87,6 @@ fn get_max_usable_sample_count(
         }
     }
     vk::SampleCountFlags::TYPE_1
-}
-
-fn normalized(direction: [f32; 3]) -> [f32; 3] {
-    let inverse_length = 1.0
-        / (direction[0] * direction[0] + direction[1] * direction[1] + direction[2] * direction[2])
-            .sqrt();
-    [
-        direction[0] * inverse_length,
-        direction[1] * inverse_length,
-        direction[2] * inverse_length,
-    ]
-}
-
-fn studio_environment(direction: [f32; 3], roughness: f32) -> [f32; 4] {
-    let key = normalized([-0.55, 0.65, 0.52]);
-    let rim = normalized([0.72, 0.2, -0.66]);
-    let ceiling = normalized([0.0, 1.0, 0.08]);
-    let dot = |axis: [f32; 3]| {
-        (direction[0] * axis[0] + direction[1] * axis[1] + direction[2] * axis[2]).max(0.0)
-    };
-    let sharpness = 2.0 + 126.0 * (1.0 - roughness).powi(4);
-    let key_light = dot(key).powf(sharpness) * (7.5 - 5.5 * roughness);
-    let rim_light = dot(rim).powf(sharpness * 0.55) * (3.2 - 2.0 * roughness);
-    let ceiling_light = dot(ceiling).powf(4.0 + sharpness * 0.12) * 1.4;
-    let horizon = (1.0 - direction[1].abs()).powf(3.0) * 0.18;
-    // Ambient terms must stay channel-uniform: any per-channel gain here leaks into
-    // the diffuse irradiance and tints every surface when no point light dominates.
-    let ambient = 0.04 + horizon * 0.9;
-    [
-        ambient + key_light * 1.0 + rim_light * 0.65 + ceiling_light * 0.7,
-        ambient + key_light * 0.96 + rim_light * 0.65 + ceiling_light * 0.7,
-        ambient + key_light * 0.92 + rim_light * 0.65 + ceiling_light * 0.7,
-        1.0,
-    ]
-}
-
-fn create_studio_environment(ctx: &VulkanContext) -> (Image, vk::Sampler) {
-    const WIDTH: u32 = 256;
-    const HEIGHT: u32 = 128;
-    const MIP_LEVELS: u32 = 9;
-
-    let mut pixels = Vec::<f32>::new();
-    let mut regions = Vec::with_capacity(MIP_LEVELS as usize);
-    let mut byte_offset = 0_u64;
-    for mip_level in 0..MIP_LEVELS {
-        let width = (WIDTH >> mip_level).max(1);
-        let height = (HEIGHT >> mip_level).max(1);
-        let roughness = mip_level as f32 / (MIP_LEVELS - 1) as f32;
-        regions.push(
-            vk::BufferImageCopy::default()
-                .buffer_offset(byte_offset)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                }),
-        );
-        for y in 0..height {
-            let theta = (y as f32 + 0.5) / height as f32 * std::f32::consts::PI;
-            let sin_theta = theta.sin();
-            for x in 0..width {
-                let phi = ((x as f32 + 0.5) / width as f32 - 0.5) * 2.0 * std::f32::consts::PI;
-                pixels.extend(studio_environment(
-                    [sin_theta * phi.cos(), theta.cos(), sin_theta * phi.sin()],
-                    roughness,
-                ));
-            }
-        }
-        byte_offset += (width * height * 4 * std::mem::size_of::<f32>() as u32) as u64;
-    }
-
-    let mut staging = Buffer::new(
-        ctx,
-        byte_offset,
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        gpu_allocator::MemoryLocation::CpuToGpu,
-    );
-    staging.write_bytes(0, bytemuck::cast_slice(&pixels));
-    let image = Image::new_with_mip_levels(
-        ctx,
-        WIDTH,
-        HEIGHT,
-        vk::Format::R32G32B32A32_SFLOAT,
-        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-        vk::ImageAspectFlags::COLOR,
-        vk::SampleCountFlags::TYPE_1,
-        MIP_LEVELS,
-    );
-
-    let command_pool = unsafe {
-        ctx.device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(ctx.queue_family_index)
-                    .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                None,
-            )
-            .unwrap()
-    };
-    let command_buffer = unsafe {
-        ctx.device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(command_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-            .unwrap()[0]
-    };
-    unsafe {
-        ctx.device
-            .begin_command_buffer(
-                command_buffer,
-                &vk::CommandBufferBeginInfo::default()
-                    .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-            )
-            .unwrap();
-        let upload_barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::NONE)
-            .dst_stage_mask(vk::PipelineStageFlags2::COPY)
-            .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .old_layout(vk::ImageLayout::UNDEFINED)
-            .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .image(image.vk_image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: MIP_LEVELS,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        ctx.device.cmd_pipeline_barrier2(
-            command_buffer,
-            &vk::DependencyInfo::default()
-                .image_memory_barriers(std::slice::from_ref(&upload_barrier)),
-        );
-        ctx.device.cmd_copy_buffer_to_image(
-            command_buffer,
-            staging.vk_buffer,
-            image.vk_image,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            &regions,
-        );
-        let sample_barrier = vk::ImageMemoryBarrier2::default()
-            .src_stage_mask(vk::PipelineStageFlags2::COPY)
-            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-            .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
-            .dst_access_mask(vk::AccessFlags2::SHADER_READ)
-            .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image(image.vk_image)
-            .subresource_range(vk::ImageSubresourceRange {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                base_mip_level: 0,
-                level_count: MIP_LEVELS,
-                base_array_layer: 0,
-                layer_count: 1,
-            });
-        ctx.device.cmd_pipeline_barrier2(
-            command_buffer,
-            &vk::DependencyInfo::default()
-                .image_memory_barriers(std::slice::from_ref(&sample_barrier)),
-        );
-        ctx.device.end_command_buffer(command_buffer).unwrap();
-        let command_buffers = [command_buffer];
-        ctx.device
-            .queue_submit(
-                ctx.queue,
-                &[vk::SubmitInfo::default().command_buffers(&command_buffers)],
-                vk::Fence::null(),
-            )
-            .unwrap();
-        ctx.device.queue_wait_idle(ctx.queue).unwrap();
-        ctx.device.destroy_command_pool(command_pool, None);
-    }
-    staging.destroy(ctx);
-
-    let sampler = unsafe {
-        ctx.device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::REPEAT)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .min_lod(0.0)
-                    .max_lod((MIP_LEVELS - 1) as f32),
-                None,
-            )
-            .unwrap()
-    };
-    (image, sampler)
-}
-
-pub struct VideoNv12Image {
-    pub vk_image: vk::Image,
-    pub allocation: Option<gpu_allocator::vulkan::Allocation>,
-    pub color_view: vk::ImageView,
-    pub y_view: vk::ImageView,
-    pub uv_view: vk::ImageView,
-    pub format: vk::Format,
-    pub width: u32,
-    pub height: u32,
-}
-
-impl VideoNv12Image {
-    pub fn new(ctx: &VulkanContext, width: u32, height: u32) -> Self {
-        let format = vk::Format::from_raw(VK_FORMAT_G8_B8R8_2PLANE_420_UNORM_RAW);
-        let usage = vk::ImageUsageFlags::STORAGE
-            | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW);
-        let mut queue_family_indices = Vec::new();
-        queue_family_indices.push(ctx.queue_family_index);
-        if let Some(video_queue_family_index) = ctx.video_encode_queue_family_index {
-            if video_queue_family_index != ctx.queue_family_index {
-                queue_family_indices.push(video_queue_family_index);
-            }
-        }
-        let sharing_mode = if queue_family_indices.len() > 1 {
-            vk::SharingMode::CONCURRENT
-        } else {
-            vk::SharingMode::EXCLUSIVE
-        };
-        let mut h264_profile = vk::VideoEncodeH264ProfileInfoKHR::default()
-            .std_profile_idc(StdVideoH264ProfileIdc_STD_VIDEO_H264_PROFILE_IDC_MAIN);
-        let profile = vk::VideoProfileInfoKHR::default()
-            .video_codec_operation(vk::VideoCodecOperationFlagsKHR::ENCODE_H264)
-            .chroma_subsampling(vk::VideoChromaSubsamplingFlagsKHR::TYPE_420)
-            .luma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .chroma_bit_depth(vk::VideoComponentBitDepthFlagsKHR::TYPE_8)
-            .push_next(&mut h264_profile);
-        let profiles = [profile];
-        let mut profile_list = vk::VideoProfileListInfoKHR::default().profiles(&profiles);
-        let image_info = vk::ImageCreateInfo {
-            s_type: vk::StructureType::IMAGE_CREATE_INFO,
-            p_next: (&mut profile_list as *mut vk::VideoProfileListInfoKHR).cast(),
-            flags: vk::ImageCreateFlags::MUTABLE_FORMAT | vk::ImageCreateFlags::EXTENDED_USAGE,
-            image_type: vk::ImageType::TYPE_2D,
-            format,
-            extent: vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            },
-            mip_levels: 1,
-            array_layers: 1,
-            samples: vk::SampleCountFlags::TYPE_1,
-            tiling: vk::ImageTiling::OPTIMAL,
-            usage,
-            sharing_mode,
-            queue_family_index_count: queue_family_indices.len() as u32,
-            p_queue_family_indices: queue_family_indices.as_ptr(),
-            initial_layout: vk::ImageLayout::UNDEFINED,
-            ..Default::default()
-        };
-
-        let vk_image = unsafe { ctx.device.create_image(&image_info, None).unwrap() };
-        let requirements = unsafe { ctx.device.get_image_memory_requirements(vk_image) };
-        let allocation = ctx
-            .allocator
-            .lock()
-            .unwrap()
-            .allocate(&gpu_allocator::vulkan::AllocationCreateDesc {
-                name: "video-nv12-image",
-                requirements,
-                location: gpu_allocator::MemoryLocation::GpuOnly,
-                linear: false,
-                allocation_scheme: gpu_allocator::vulkan::AllocationScheme::GpuAllocatorManaged,
-            })
-            .unwrap();
-
-        unsafe {
-            ctx.device
-                .bind_image_memory(vk_image, allocation.memory(), allocation.offset())
-                .unwrap();
-        }
-
-        let color_view = Self::create_view(
-            ctx,
-            vk_image,
-            format,
-            vk::ImageAspectFlags::COLOR,
-            vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW),
-        );
-        let y_view = Self::create_view(
-            ctx,
-            vk_image,
-            vk::Format::R8_UNORM,
-            vk::ImageAspectFlags::from_raw(VK_IMAGE_ASPECT_PLANE_0_BIT_RAW),
-            vk::ImageUsageFlags::STORAGE,
-        );
-        let uv_view = Self::create_view(
-            ctx,
-            vk_image,
-            vk::Format::R8G8_UNORM,
-            vk::ImageAspectFlags::from_raw(VK_IMAGE_ASPECT_PLANE_1_BIT_RAW),
-            vk::ImageUsageFlags::STORAGE,
-        );
-
-        Self {
-            vk_image,
-            allocation: Some(allocation),
-            color_view,
-            y_view,
-            uv_view,
-            format,
-            width,
-            height,
-        }
-    }
-
-    fn create_view(
-        ctx: &VulkanContext,
-        image: vk::Image,
-        format: vk::Format,
-        aspect_mask: vk::ImageAspectFlags,
-        usage: vk::ImageUsageFlags,
-    ) -> vk::ImageView {
-        let mut usage_info = vk::ImageViewUsageCreateInfo::default().usage(usage);
-        let view_info = vk::ImageViewCreateInfo {
-            s_type: vk::StructureType::IMAGE_VIEW_CREATE_INFO,
-            p_next: (&mut usage_info as *mut vk::ImageViewUsageCreateInfo).cast(),
-            image,
-            view_type: vk::ImageViewType::TYPE_2D,
-            format,
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask,
-                base_mip_level: 0,
-                level_count: 1,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            ..Default::default()
-        };
-        unsafe { ctx.device.create_image_view(&view_info, None).unwrap() }
-    }
-
-    pub fn destroy(&mut self, ctx: &VulkanContext) {
-        unsafe {
-            ctx.device.destroy_image_view(self.uv_view, None);
-            ctx.device.destroy_image_view(self.y_view, None);
-            ctx.device.destroy_image_view(self.color_view, None);
-            ctx.device.destroy_image(self.vk_image, None);
-        }
-        if let Some(allocation) = self.allocation.take() {
-            ctx.allocator.lock().unwrap().free(allocation).unwrap();
-        }
-    }
-}
-
-pub struct VideoNv12Slot {
-    pub image: VideoNv12Image,
-    pub descriptor_set: vk::DescriptorSet,
-    pub layout: vk::ImageLayout,
-    pub timeline: Arc<TimelineSemaphore>,
-    pub next_ready_value: u64,
-    pub last_ready_value: Option<u64>,
-    pub frame_available: bool,
-}
-
-impl VideoNv12Slot {
-    fn new(ctx: &Arc<VulkanContext>, width: u32, height: u32) -> Self {
-        Self {
-            image: VideoNv12Image::new(ctx, width, height),
-            descriptor_set: vk::DescriptorSet::null(),
-            layout: vk::ImageLayout::UNDEFINED,
-            timeline: TimelineSemaphore::new(ctx, 0)
-                .expect("failed to create video frame timeline semaphore"),
-            next_ready_value: 1,
-            last_ready_value: None,
-            frame_available: false,
-        }
-    }
 }
 
 #[repr(C)]
@@ -561,129 +153,6 @@ pub struct CameraUniform {
 }
 
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-struct GpuSdfPrimitive {
-    material_index: u32,
-    shape_type: u32,
-    padding: [u32; 2],
-    params: [f32; 12],
-}
-
-impl GpuSdfPrimitive {
-    fn encode(primitive: SdfPrimitive, material_index: u32) -> Self {
-        let (shape_type, params) = match primitive {
-            SdfPrimitive::Sphere { center, radius } => (
-                0,
-                [
-                    center.x as f32,
-                    center.y as f32,
-                    center.z as f32,
-                    radius as f32,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-            ),
-            SdfPrimitive::Capsule { start, end, radius } => (
-                1,
-                [
-                    start.x as f32,
-                    start.y as f32,
-                    start.z as f32,
-                    end.x as f32,
-                    end.y as f32,
-                    end.z as f32,
-                    radius as f32,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-            ),
-            SdfPrimitive::Arrow {
-                start,
-                end,
-                shaft_radius,
-                head_radius,
-                head_length,
-            } => (
-                2,
-                [
-                    start.x as f32,
-                    start.y as f32,
-                    start.z as f32,
-                    end.x as f32,
-                    end.y as f32,
-                    end.z as f32,
-                    shaft_radius as f32,
-                    head_radius as f32,
-                    head_length as f32,
-                    0.0,
-                    0.0,
-                    0.0,
-                ],
-            ),
-            SdfPrimitive::OrientedBox {
-                center,
-                half_extents,
-                x_axis,
-                y_axis,
-            } => (
-                3,
-                [
-                    center.x as f32,
-                    center.y as f32,
-                    center.z as f32,
-                    half_extents.x as f32,
-                    half_extents.y as f32,
-                    half_extents.z as f32,
-                    x_axis.x as f32,
-                    x_axis.y as f32,
-                    x_axis.z as f32,
-                    y_axis.x as f32,
-                    y_axis.y as f32,
-                    y_axis.z as f32,
-                ],
-            ),
-            SdfPrimitive::QuadraticBezier {
-                start,
-                control,
-                end,
-                radius,
-            } => (
-                4,
-                [
-                    start.x as f32,
-                    start.y as f32,
-                    start.z as f32,
-                    control.x as f32,
-                    control.y as f32,
-                    control.z as f32,
-                    end.x as f32,
-                    end.y as f32,
-                    end.z as f32,
-                    radius as f32,
-                    0.0,
-                    0.0,
-                ],
-            ),
-        };
-        Self {
-            material_index,
-            shape_type,
-            padding: [0; 2],
-            params,
-        }
-    }
-}
-
-#[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialData3D {
     base_color: [f32; 4],
@@ -712,8 +181,8 @@ impl From<SurfaceMaterial> for MaterialData3D {
             AlphaMode3D::Blend(transmission) => Some(transmission),
         };
         let patch_directions = patch.map(|patch| patch.directions).unwrap_or([[0.0; 3]; 3]);
-        
-        let (grid_color, patch_color, patch_edge_color, patch_corner_0, patch_params, grid_mode) = 
+
+        let (grid_color, patch_color, patch_edge_color, patch_corner_0, patch_params, grid_mode) =
             if let Some(planar) = planar {
                 (
                     planar.minor_color,
@@ -771,13 +240,29 @@ impl From<SurfaceMaterial> for MaterialData3D {
                 if transmission.is_some() { 1.0 } else { 0.0 },
             ],
             grid: [
-                if let Some(planar) = planar { planar.cell_size } else { grid.longitude_count },
-                if let Some(planar) = planar { planar.subdivisions } else { grid.latitude_count },
-                if let Some(planar) = planar { planar.line_width_pixels } else { grid.line_width_pixels },
+                if let Some(planar) = planar {
+                    planar.cell_size
+                } else {
+                    grid.longitude_count
+                },
+                if let Some(planar) = planar {
+                    planar.subdivisions
+                } else {
+                    grid.latitude_count
+                },
+                if let Some(planar) = planar {
+                    planar.line_width_pixels
+                } else {
+                    grid.line_width_pixels
+                },
                 grid_mode,
             ],
             grid_backface: [
-                if planar.is_some() { 1.0 } else { grid.backface_intensity },
+                if planar.is_some() {
+                    1.0
+                } else {
+                    grid.backface_intensity
+                },
                 if material.unlit { 1.0 } else { 0.0 },
                 if material.flat_shading { 1.0 } else { 0.0 },
                 0.0,
@@ -838,42 +323,18 @@ impl Mesh3DDraw {
 }
 
 pub struct VulkanRenderer {
-    ctx: Arc<VulkanContext>,
-    msaa_samples: u32,
-    ssaa_factor: u32,
-    environment_map: Image,
-    environment_sampler: vk::Sampler,
-
-    descriptor_pool: vk::DescriptorPool,
+    // Fields with Vulkan handles are declared in teardown order. Rust drops fields
+    // top-to-bottom after `Drop::drop`; `cache` is taken explicitly there first.
+    cache: Option<TargetCache>,
+    frames: FrameSet,
+    output_retirement: OutputRetirement,
+    textures: TextureRegistry,
+    environment: StudioEnvironment,
+    frame_buffers: FrameBuffers,
     pipelines: PipelineSet,
-    raster_texture_set: vk::DescriptorSet,
-    pub active_textures: Vec<Image>,
-    texture_sampler: vk::Sampler,
+    descriptor_pool: Arc<DescriptorPool>,
+    ctx: Arc<VulkanContext>,
 
-    vertex_buffer: Buffer,
-    index_buffer: Buffer,
-    camera_buffer: Buffer,
-    material_buffer_3d: Buffer,
-    buffer_3d: Buffer,
-    nv12_constants_buffer: Buffer,
-
-    vertex_buffer_2d: Buffer,
-    index_buffer_2d: Buffer,
-    vertex_staging_buffer_2d: Buffer,
-    index_staging_buffer_2d: Buffer,
-    instance_buffer_2d: Buffer,
-    camera_buffer_2d: Buffer,
-    tone_map_factor_buffer: Buffer,
-    vertex_buffer_stride: u64,
-    index_buffer_stride: u64,
-    camera_buffer_stride: u64,
-    material_buffer_3d_stride: u64,
-    primitive_buffer_stride: u64,
-    vertex_staging_buffer_2d_stride: u64,
-    index_staging_buffer_2d_stride: u64,
-    instance_buffer_2d_stride: u64,
-    camera_buffer_2d_stride: u64,
-    tone_map_factor_stride: u64,
     mesh_upload_planner_2d: Mesh2DUploadPlanner,
     scene_preparer: ScenePreparer,
     last_stats: RendererStats,
@@ -881,10 +342,8 @@ pub struct VulkanRenderer {
     last_gpu_timings: Option<GpuPassTimings>,
     bloom_enabled: bool,
     analytic_aa_2d: bool,
-
-    frames: FrameSet,
-
-    cache: Option<TargetCache>,
+    msaa_samples: u32,
+    ssaa_factor: u32,
 }
 
 impl VulkanRenderer {
@@ -905,8 +364,6 @@ impl VulkanRenderer {
         };
         let requested_sample_count = msaa_to_vk_sample_count(msaa_samples);
         let sample_count = get_max_usable_sample_count(&ctx, requested_sample_count);
-        let (environment_map, environment_sampler) = create_studio_environment(&ctx);
-
         let pipelines = PipelineSet::new(&ctx, output_transform, sample_count);
 
         let descriptor_pool_sizes = [
@@ -939,282 +396,24 @@ impl VulkanRenderer {
                 descriptor_count: 20,
             },
         ];
-        let descriptor_pool_info = vk::DescriptorPoolCreateInfo {
-            s_type: vk::StructureType::DESCRIPTOR_POOL_CREATE_INFO,
-            pool_size_count: descriptor_pool_sizes.len() as u32,
-            p_pool_sizes: descriptor_pool_sizes.as_ptr(),
-            max_sets: 48,
-            flags: vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET,
-            ..Default::default()
-        };
-        let descriptor_pool = unsafe {
-            ctx.device
-                .create_descriptor_pool(&descriptor_pool_info, None)
-                .unwrap()
-        };
+        let descriptor_pool = Arc::new(DescriptorPool::new(&ctx, &descriptor_pool_sizes, 48));
 
-        let sampler_info = vk::SamplerCreateInfo::default()
-            .mag_filter(vk::Filter::LINEAR)
-            .min_filter(vk::Filter::LINEAR)
-            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE);
-        let texture_sampler = unsafe { ctx.device.create_sampler(&sampler_info, None).unwrap() };
+        let environment = StudioEnvironment::new(&ctx);
+        let textures = TextureRegistry::new(&ctx, &descriptor_pool, &pipelines);
 
-        let alloc_info = vk::DescriptorSetAllocateInfo::default()
-            .descriptor_pool(descriptor_pool)
-            .set_layouts(std::slice::from_ref(&pipelines.raster_texture_layout));
-        let raster_texture_set =
-            unsafe { ctx.device.allocate_descriptor_sets(&alloc_info).unwrap()[0] };
-
-        let dummy_texture = Image::new(
-            &ctx,
-            1,
-            1,
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-            vk::ImageAspectFlags::COLOR,
-            vk::SampleCountFlags::TYPE_1,
-        );
-        let command_pool = unsafe {
-            ctx.device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(ctx.queue_family_index)
-                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                    None,
-                )
-                .unwrap()
-        };
-        let command_buffer = unsafe {
-            ctx.device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0]
-        };
-        unsafe {
-            ctx.device
-                .begin_command_buffer(
-                    command_buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .unwrap();
-            let barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(dummy_texture.vk_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::SHADER_READ);
-            ctx.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-            ctx.device.end_command_buffer(command_buffer).unwrap();
-            let submit_info =
-                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-            ctx.device
-                .queue_submit(ctx.queue, &[submit_info], vk::Fence::null())
-                .unwrap();
-            ctx.device.queue_wait_idle(ctx.queue).unwrap();
-            ctx.device.destroy_command_pool(command_pool, None);
-        }
-
-        let dummy_image_infos: Vec<_> = (0..16)
-            .map(|_| {
-                vk::DescriptorImageInfo::default()
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                    .image_view(dummy_texture.view)
-            })
-            .collect();
-        let images_write = vk::WriteDescriptorSet::default()
-            .dst_set(raster_texture_set)
-            .dst_binding(0)
-            .dst_array_element(0)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .image_info(&dummy_image_infos);
-
-        let sampler_image_info = [vk::DescriptorImageInfo::default().sampler(texture_sampler)];
-        let sampler_write = vk::WriteDescriptorSet::default()
-            .dst_set(raster_texture_set)
-            .dst_binding(1)
-            .descriptor_type(vk::DescriptorType::SAMPLER)
-            .image_info(&sampler_image_info);
-        unsafe {
-            ctx.device
-                .update_descriptor_sets(&[images_write, sampler_write], &[]);
-        }
-
-        let limits = unsafe {
-            ctx.instance
-                .get_physical_device_properties(ctx.physical_device)
-                .limits
-        };
-        let uniform_alignment = limits.min_uniform_buffer_offset_alignment.max(1);
-        let storage_alignment = limits.min_storage_buffer_offset_alignment.max(1);
-        let vertex_buffer_stride = (std::mem::size_of::<Vertex>() * 1_000_000) as u64;
-        let index_buffer_stride = (std::mem::size_of::<u32>() * 3_000_000) as u64;
-        let camera_buffer_stride = align_up(
-            std::mem::size_of::<CameraUniform>() as u64,
-            uniform_alignment,
-        );
-        let material_buffer_3d_stride = align_up(
-            (std::mem::size_of::<MaterialData3D>() * MAX_SURFACE_MATERIALS) as u64,
-            storage_alignment,
-        );
-        let primitive_buffer_stride = align_up(
-            (std::mem::size_of::<GpuSdfPrimitive>() * 10_000) as u64,
-            storage_alignment,
-        );
-        let static_vertex_buffer_2d_size = (std::mem::size_of::<Vertex2D>() * 1_000_000) as u64;
-        let static_index_buffer_2d_size = (std::mem::size_of::<u32>() * 3_000_000) as u64;
-        let vertex_staging_buffer_2d_stride = static_vertex_buffer_2d_size;
-        let index_staging_buffer_2d_stride = static_index_buffer_2d_size;
-        let instance_buffer_2d_stride = (std::mem::size_of::<Instance2D>() * 100_000) as u64;
-        let camera_buffer_2d_stride = align_up(
-            std::mem::size_of::<CameraUniform2D>() as u64,
-            uniform_alignment,
-        );
-        let tone_map_factor_stride = align_up(
-            std::mem::size_of::<ToneMapConstants>() as u64,
-            uniform_alignment,
-        );
-        let frame_count = RENDER_FRAME_COUNT as u64;
-
-        let tone_map_factor_buffer = Buffer::new(
-            &ctx,
-            tone_map_factor_stride * frame_count,
-            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-
-        let vertex_buffer = Buffer::new(
-            &ctx,
-            vertex_buffer_stride * frame_count,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let index_buffer = Buffer::new(
-            &ctx,
-            index_buffer_stride * frame_count,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let camera_buffer = Buffer::new(
-            &ctx,
-            camera_buffer_stride * frame_count,
-            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let material_buffer_3d = Buffer::new(
-            &ctx,
-            material_buffer_3d_stride * frame_count,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let buffer_3d = Buffer::new(
-            &ctx,
-            primitive_buffer_stride * frame_count,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let nv12_constants_buffer = Buffer::new(
-            &ctx,
-            std::mem::size_of::<Nv12Constants>() as u64,
-            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-
-        let vertex_buffer_2d = Buffer::new(
-            &ctx,
-            static_vertex_buffer_2d_size + vertex_staging_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::GpuOnly,
-        );
-        let index_buffer_2d = Buffer::new(
-            &ctx,
-            static_index_buffer_2d_size + index_staging_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::GpuOnly,
-        );
-        let vertex_staging_buffer_2d = Buffer::new(
-            &ctx,
-            vertex_staging_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let index_staging_buffer_2d = Buffer::new(
-            &ctx,
-            index_staging_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let instance_buffer_2d = Buffer::new(
-            &ctx,
-            instance_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        let camera_buffer_2d = Buffer::new(
-            &ctx,
-            camera_buffer_2d_stride * frame_count,
-            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-
+        let frame_buffers = FrameBuffers::new(&ctx);
+        let (static_vertex_buffer_2d_size, static_index_buffer_2d_size) =
+            frame_buffers.static_mesh_2d_capacities();
         let frames = FrameSet::new(Arc::clone(&ctx));
+        let output_retirement = OutputRetirement::new(Arc::clone(&ctx));
 
         Self {
             ctx,
-            environment_map,
-            environment_sampler,
+            environment,
             descriptor_pool,
             pipelines,
-            vertex_buffer,
-            index_buffer,
-            camera_buffer,
-            material_buffer_3d,
-            buffer_3d,
-            nv12_constants_buffer,
-            raster_texture_set,
-            active_textures: vec![dummy_texture],
-            texture_sampler,
-            vertex_buffer_2d,
-            index_buffer_2d,
-            vertex_staging_buffer_2d,
-            index_staging_buffer_2d,
-            instance_buffer_2d,
-            camera_buffer_2d,
-            tone_map_factor_buffer,
-            vertex_buffer_stride,
-            index_buffer_stride,
-            camera_buffer_stride,
-            material_buffer_3d_stride,
-            primitive_buffer_stride,
-            vertex_staging_buffer_2d_stride,
-            index_staging_buffer_2d_stride,
-            instance_buffer_2d_stride,
-            camera_buffer_2d_stride,
-            tone_map_factor_stride,
+            frame_buffers,
+            textures,
             mesh_upload_planner_2d: Mesh2DUploadPlanner::new(
                 static_vertex_buffer_2d_size,
                 static_index_buffer_2d_size,
@@ -1226,6 +425,7 @@ impl VulkanRenderer {
             bloom_enabled: false,
             analytic_aa_2d,
             frames,
+            output_retirement,
             cache: None,
             msaa_samples: sample_count.as_raw(),
             ssaa_factor,
@@ -1271,198 +471,20 @@ impl VulkanRenderer {
         let prepared = self
             .scene_preparer
             .prepare(scene, scene_config, self.ssaa_factor);
-        let objects_3d = prepared
-            .sdf_primitives
-            .iter()
-            .map(|prepared| GpuSdfPrimitive::encode(prepared.primitive, prepared.material_index))
-            .collect::<Vec<_>>();
-
-        self.render(
-            scene_config.output_width,
-            scene_config.output_height,
-            &prepared.camera_uniform,
-            &prepared.camera_uniform_2d,
-            &objects_3d,
-            &prepared.surface_materials,
-            &prepared.mesh_vertices,
-            &prepared.mesh_indices,
-            &prepared.mesh_draws_3d,
-            &prepared.mesh_batches_2d,
-            output,
-            outputs,
-            prepared.background_color,
-        );
+        self.render(prepared, output, outputs);
     }
 
     pub fn update_texture(&mut self, index: u32, width: u32, height: u32, data: &[u8]) {
-        assert!(index < 16, "Texture index out of bounds");
-
-        let byte_offset = (width * height * 4) as u64;
-        let mut staging = Buffer::new(
-            &self.ctx,
-            byte_offset,
-            vk::BufferUsageFlags::TRANSFER_SRC,
-            gpu_allocator::MemoryLocation::CpuToGpu,
-        );
-        staging.write_bytes(0, data);
-
-        let image = Image::new(
-            &self.ctx,
-            width,
-            height,
-            vk::Format::R8G8B8A8_UNORM,
-            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
-            vk::ImageAspectFlags::COLOR,
-            vk::SampleCountFlags::TYPE_1,
-        );
-
-        let command_pool = unsafe {
-            self.ctx
-                .device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(self.ctx.queue_family_index)
-                        .flags(vk::CommandPoolCreateFlags::TRANSIENT),
-                    None,
-                )
-                .unwrap()
-        };
-        let command_buffer = unsafe {
-            self.ctx
-                .device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(command_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0]
-        };
-
-        unsafe {
-            self.ctx
-                .device
-                .begin_command_buffer(
-                    command_buffer,
-                    &vk::CommandBufferBeginInfo::default()
-                        .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
-                )
-                .unwrap();
-
-            let mut barrier = vk::ImageMemoryBarrier::default()
-                .old_layout(vk::ImageLayout::UNDEFINED)
-                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .image(image.vk_image)
-                .subresource_range(vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: 1,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .src_access_mask(vk::AccessFlags::empty())
-                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
-
-            self.ctx.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-
-            let region = vk::BufferImageCopy::default()
-                .buffer_offset(0)
-                .image_subresource(vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                })
-                .image_extent(vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                });
-
-            self.ctx.device.cmd_copy_buffer_to_image(
-                command_buffer,
-                staging.vk_buffer,
-                image.vk_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[region],
-            );
-
-            barrier.old_layout = vk::ImageLayout::TRANSFER_DST_OPTIMAL;
-            barrier.new_layout = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
-            barrier.src_access_mask = vk::AccessFlags::TRANSFER_WRITE;
-            barrier.dst_access_mask = vk::AccessFlags::SHADER_READ;
-
-            self.ctx.device.cmd_pipeline_barrier(
-                command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[barrier],
-            );
-
-            self.ctx.device.end_command_buffer(command_buffer).unwrap();
-
-            let submit_info =
-                vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-            self.ctx
-                .device
-                .queue_submit(self.ctx.queue, &[submit_info], vk::Fence::null())
-                .unwrap();
-            self.ctx.device.queue_wait_idle(self.ctx.queue).unwrap();
-            self.ctx.device.destroy_command_pool(command_pool, None);
-
-            let image_info = [vk::DescriptorImageInfo::default()
-                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(image.view)];
-
-            let write = vk::WriteDescriptorSet::default()
-                .dst_set(self.raster_texture_set)
-                .dst_binding(0)
-                .dst_array_element(index)
-                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-                .image_info(&image_info);
-
-            self.ctx.device.update_descriptor_sets(&[write], &[]);
-        }
-
-        self.active_textures.push(image);
+        self.textures.update(index, width, height, data);
     }
 
     pub fn current_output_image_view(&self) -> Option<vk::ImageView> {
         let cache = self.cache.as_ref()?;
-        if cache.current_frame == 0 {
-            return None;
-        }
-        let frame_idx = (cache.current_frame - 1) % RENDER_FRAME_COUNT;
-        Some(cache.render_targets[frame_idx].texture.view)
+        self.output_retirement.current_image_view(cache)
     }
 
     pub fn bind_texture_view(&mut self, index: u32, view: vk::ImageView) {
-        assert!(index < 16, "Texture index out of bounds");
-        let image_info = [vk::DescriptorImageInfo::default()
-            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            .image_view(view)];
-        let write = vk::WriteDescriptorSet::default()
-            .dst_set(self.raster_texture_set)
-            .dst_binding(0)
-            .dst_array_element(index)
-            .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
-            .image_info(&image_info);
-        unsafe {
-            self.ctx.device.update_descriptor_sets(&[write], &[]);
-        }
+        self.textures.bind(index, view);
     }
 
     pub fn wait_idle(&self) {
@@ -1471,1209 +493,233 @@ impl VulkanRenderer {
         }
     }
 
-    fn render(
-        &mut self,
-        width: u32,
-        height: u32,
-        camera_uniform: &CameraUniform,
-        camera_uniform_2d: &CameraUniform2D,
-        objects_3d: &[GpuSdfPrimitive],
-        surface_materials: &[SurfaceMaterial],
-        mesh_vertices: &[Vertex],
-        mesh_indices: &[u32],
-        mesh_draws_3d: &[Mesh3DDraw],
-        mesh_batches_2d: &[Mesh2DBatch],
-        output: Option<&mut [u8]>,
-        outputs: RenderOutputs,
-        background_color: [f32; 4],
-    ) {
-        let align = 256;
-        let unpadded_bytes_per_row = width * 4;
-        let padded_bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+    fn render(&mut self, scene: PreparedScene, output: Option<&mut [u8]>, outputs: RenderOutputs) {
+        let requirements = FrameRequirements::for_scene(&scene);
+        self.ensure_target_cache(requirements);
 
-        let needs_raster_gbuffer = mesh_draws_3d.iter().any(|draw| !draw.is_transparent());
-        let needs_overlay_hdr = (needs_raster_gbuffer || !objects_3d.is_empty())
-            && (mesh_draws_3d.iter().any(|draw| draw.is_transparent())
-                || !mesh_batches_2d.is_empty());
-        let cache_needs_update = self.cache.as_ref().map_or(true, |c| {
-            c.width != width
-                || c.height != height
-                || (needs_raster_gbuffer && !c.has_raster_gbuffer)
-                || (needs_overlay_hdr && !c.has_overlay_hdr)
-        });
-
-        if cache_needs_update {
-            if let Some(mut old_cache) = self.cache.take() {
-                unsafe {
-                    self.ctx.device.device_wait_idle().unwrap();
-                }
-                old_cache.destroy(&self.ctx, self.descriptor_pool);
-            }
-            let resources = TargetCacheResources {
-                ctx: &self.ctx,
-                descriptor_pool: self.descriptor_pool,
-                pipelines: &self.pipelines,
-                msaa_samples: self.msaa_samples,
+        let frame_index = self.cache.as_ref().unwrap().current_frame % RENDER_FRAME_COUNT;
+        let (mesh_2d, mesh_2d_arena_rebuilds) =
+            self.prepare_mesh_2d(frame_index, &scene.mesh_batches_2d);
+        let frame = PreparedFrame::new(
+            scene,
+            requirements,
+            mesh_2d,
+            mesh_2d_arena_rebuilds,
+            FrameOptions {
                 ssaa_factor: self.ssaa_factor,
-                environment_map: &self.environment_map,
-                environment_sampler: self.environment_sampler,
-                camera_buffer: &self.camera_buffer,
-                material_buffer_3d: &self.material_buffer_3d,
-                primitive_buffer: &self.buffer_3d,
-                camera_buffer_2d: &self.camera_buffer_2d,
-                nv12_constants_buffer: &self.nv12_constants_buffer,
-                tone_map_factor_buffer: &self.tone_map_factor_buffer,
-                camera_buffer_stride: self.camera_buffer_stride,
-                material_buffer_3d_stride: self.material_buffer_3d_stride,
-                primitive_buffer_stride: self.primitive_buffer_stride,
-                camera_buffer_2d_stride: self.camera_buffer_2d_stride,
-                tone_map_factor_stride: self.tone_map_factor_stride,
-            };
-            self.cache = Some(TargetCache::new(
-                width,
-                height,
-                padded_bytes_per_row,
-                needs_raster_gbuffer,
-                needs_overlay_hdr,
-                &resources,
-            ));
-        }
-
-        let cache = self.cache.as_mut().unwrap();
-        let frame_idx = cache.current_frame % 3;
-        let video_frame_idx = cache.current_frame % cache.video_nv12_slots.len();
-        if outputs.vulkan_video && cache.current_frame > 0 {
-            let previous_video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_slots.len();
-            assert!(
-                !cache.video_nv12_slots[previous_video_frame_idx].frame_available,
-                "the previous Vulkan video frame must be acquired before rendering another frame"
-            );
-        }
-
-        let mut mesh_2d_arena_rebuilds = 0;
-        let mesh_2d_arenas = self.mesh_upload_planner_2d.frame_arenas(
-            frame_idx as u64,
-            self.vertex_staging_buffer_2d_stride,
-            self.index_staging_buffer_2d_stride,
-            self.instance_buffer_2d_stride,
+                analytic_aa_2d: self.analytic_aa_2d,
+                bloom_enabled: self.bloom_enabled,
+                gpu_profiling: self.gpu_profiling,
+                outputs,
+            },
         );
-        let prepared_2d = self
-            .mesh_upload_planner_2d
-            .prepare(mesh_2d_arenas, mesh_batches_2d);
-        let PreparedMesh2D {
-            batches: prepared_mesh_batches_2d,
-            uploads: geometry_uploads_2d,
-            instances: instances_2d,
-        } = match prepared_2d {
-            Ok(prepared) => prepared,
+        self.submit_prepared_frame(frame, output);
+    }
+
+    fn ensure_target_cache(&mut self, requirements: FrameRequirements) {
+        let cache_needs_update = self
+            .cache
+            .as_ref()
+            .map_or(true, |cache| !cache.satisfies(requirements));
+        if !cache_needs_update {
+            return;
+        }
+
+        if let Some(old_cache) = self.cache.take() {
+            unsafe {
+                self.ctx.device.device_wait_idle().unwrap();
+            }
+            drop(old_cache);
+        }
+        let resources = TargetCacheResources {
+            ctx: &self.ctx,
+            descriptor_pool: &self.descriptor_pool,
+            pipelines: &self.pipelines,
+            msaa_samples: self.msaa_samples,
+            ssaa_factor: self.ssaa_factor,
+            environment_map: &self.environment.image,
+            environment_sampler: self.environment.sampler,
+            camera_buffer: &self.frame_buffers.camera,
+            material_buffer_3d: &self.frame_buffers.material_3d,
+            primitive_buffer: &self.frame_buffers.primitive,
+            camera_buffer_2d: &self.frame_buffers.camera_2d,
+            nv12_constants_buffer: &self.frame_buffers.nv12_constants,
+            tone_map_factor_buffer: &self.frame_buffers.tone_map_factor,
+            camera_buffer_stride: self.frame_buffers.strides.camera,
+            material_buffer_3d_stride: self.frame_buffers.strides.material_3d,
+            primitive_buffer_stride: self.frame_buffers.strides.primitive,
+            camera_buffer_2d_stride: self.frame_buffers.strides.camera_2d,
+            tone_map_factor_stride: self.frame_buffers.strides.tone_map_factor,
+        };
+        self.cache = Some(TargetCache::new(requirements, &resources));
+    }
+
+    fn prepare_mesh_2d(
+        &mut self,
+        frame_index: usize,
+        mesh_batches: &[Mesh2DBatch],
+    ) -> (PreparedMesh2D, u32) {
+        let arenas = self.mesh_upload_planner_2d.frame_arenas(
+            frame_index as u64,
+            self.frame_buffers.strides.vertex_staging_2d,
+            self.frame_buffers.strides.index_staging_2d,
+            self.frame_buffers.strides.instance_2d,
+        );
+        match self.mesh_upload_planner_2d.prepare(arenas, mesh_batches) {
+            Ok(prepared) => (prepared, 0),
             Err(PrepareMesh2DError::StaticArenaExhausted) => {
                 unsafe {
                     self.ctx.device.device_wait_idle().unwrap();
                 }
                 self.mesh_upload_planner_2d.reset_static_arena();
-                mesh_2d_arena_rebuilds = 1;
-                self.mesh_upload_planner_2d
-                    .prepare(mesh_2d_arenas, mesh_batches_2d)
-                    .expect("active 2D scene exceeds a frame or persistent geometry arena")
+                let prepared = self
+                    .mesh_upload_planner_2d
+                    .prepare(arenas, mesh_batches)
+                    .expect("active 2D scene exceeds a frame or persistent geometry arena");
+                (prepared, 1)
             }
             Err(error) => panic!("2D frame preparation failed: {error:?}"),
-        };
-        let has_sdf = !objects_3d.is_empty();
-        // Analytic AA applies only when every rastered 2D instance is a
-        // filled rectangle: the frame then renders at output resolution with
-        // one sample, and the tone-map downsample factor becomes one.
-        // Bloom is excluded for now because its extract pass still derives
-        // its sampling grid from the resolved image dimensions.
-        let raster_2d_only = objects_3d.is_empty()
-            && mesh_indices.is_empty()
-            && !prepared_mesh_batches_2d.is_empty();
-        let analytic_2d = raster_2d_only
-            && self.analytic_aa_2d
-            && !self.bloom_enabled
-            && instances_2d
-                .iter()
-                .all(|instance| instance.aa_params[2] > 0.5);
-        let frame_plan = if analytic_2d {
-            FrameExecutionPlan::RasterToneMap
-        } else {
-            FrameExecutionPlan::build(
-                has_sdf,
-                !mesh_indices.is_empty() || !prepared_mesh_batches_2d.is_empty(),
-                self.ssaa_factor,
-            )
-        };
-        let raster_scale = if analytic_2d { 1 } else { self.ssaa_factor };
-        let fused_video_downsample = frame_plan == FrameExecutionPlan::RasterDownsample
-            && self.ssaa_factor == 2
-            && !self.bloom_enabled
-            && outputs.vulkan_video
-            && !outputs.cpu_nv12
-            && !outputs.cpu_yuv444p
-            && !outputs.cpu_rgba;
-        let runs_postprocess = frame_plan != FrameExecutionPlan::Empty && !fused_video_downsample;
-        let raster_uses_depth = !mesh_indices.is_empty();
-        let has_transparent_meshes = mesh_draws_3d.iter().any(|draw| draw.is_transparent());
-        let has_opaque_meshes = mesh_draws_3d.iter().any(|draw| !draw.is_transparent());
-        let uses_deferred_raster = has_opaque_meshes;
-        let has_surface_overlay = (frame_plan.runs_sdf() || uses_deferred_raster)
-            && (has_transparent_meshes || !prepared_mesh_batches_2d.is_empty());
-        if raster_uses_depth && cache.msaa_depth_texture.is_none() {
-            cache.msaa_depth_texture = Some(Image::new(
-                &self.ctx,
-                width * self.ssaa_factor,
-                height * self.ssaa_factor,
-                vk::Format::D32_SFLOAT,
-                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
-                vk::ImageAspectFlags::DEPTH,
-                msaa_to_vk_sample_count(self.msaa_samples),
-            ));
-            cache.msaa_depth_texture_state = TrackedImageState::UNDEFINED;
         }
-        let raster_sample_count = msaa_to_vk_sample_count(self.msaa_samples);
-        if frame_plan.runs_raster()
-            && !analytic_2d
-            && cache.msaa_texture.is_none()
-            && raster_sample_count != vk::SampleCountFlags::TYPE_1
-        {
-            cache.msaa_texture = Some(Image::new(
-                &self.ctx,
-                width * self.ssaa_factor,
-                height * self.ssaa_factor,
-                vk::Format::R16G16B16A16_SFLOAT,
-                vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                vk::ImageAspectFlags::COLOR,
-                raster_sample_count,
-            ));
-            cache.msaa_texture_state = TrackedImageState::UNDEFINED;
-        }
+    }
 
-        self.last_stats = RendererStats {
-            mesh_3d_opaque_draw_calls: mesh_draws_3d
-                .iter()
-                .filter(|draw| !draw.is_transparent())
-                .count() as u32,
-            mesh_3d_transparent_draw_calls: mesh_draws_3d
-                .iter()
-                .filter(|draw| draw.is_transparent())
-                .count() as u32
-                * 2,
-            mesh_2d_draw_calls: prepared_mesh_batches_2d.len() as u32,
-            mesh_2d_instances: instances_2d.len() as u32,
-            mesh_2d_geometry_uploads: geometry_uploads_2d.len() as u32,
-            mesh_2d_vertex_bytes_uploaded: geometry_uploads_2d
-                .iter()
-                .map(|upload| std::mem::size_of_val(upload.geometry.vertices()) as u64)
-                .sum(),
-            mesh_2d_index_bytes_uploaded: geometry_uploads_2d
-                .iter()
-                .map(|upload| std::mem::size_of_val(upload.geometry.indices()) as u64)
-                .sum(),
-            mesh_2d_arena_rebuilds,
-            mesh_2d_analytic_aa: analytic_2d as u32,
-            sdf_dispatches: frame_plan.runs_sdf() as u32,
-            surface_lighting_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
-            raster_passes: frame_plan.runs_raster() as u32 + has_transparent_meshes as u32 * 2,
-            depth_attachment_raster_passes: raster_uses_depth as u32
-                * (1 + has_transparent_meshes as u32),
-            tone_map_dispatches: runs_postprocess as u32,
-            bloom_dispatches: if self.bloom_enabled && frame_plan != FrameExecutionPlan::Empty {
-                3
-            } else {
-                0
-            },
-            downsample_dispatches: (frame_plan == FrameExecutionPlan::RasterDownsample
-                && !fused_video_downsample) as u32,
-            fused_video_downsample_dispatches: fused_video_downsample as u32,
-            surface_resolve_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
-            surface_composite_dispatches: (frame_plan.runs_sdf() || uses_deferred_raster) as u32,
-            output_conversion_dispatches: outputs.cpu_nv12 as u32
-                + outputs.cpu_yuv444p as u32
-                + outputs.vulkan_video as u32,
-            rgba_readback_copies: outputs.cpu_rgba as u32,
-        };
+    fn submit_prepared_frame(&mut self, prepared: PreparedFrame, output: Option<&mut [u8]>) {
+        let PreparedFrame {
+            scene,
+            sdf_primitives,
+            mesh_2d,
+            plan,
+            outputs,
+            stats,
+        } = prepared;
+        let PreparedMesh2D {
+            batches: mesh_batches_2d,
+            uploads: geometry_uploads_2d,
+            instances: instances_2d,
+        } = mesh_2d;
 
-        let gpu_profiling = self.gpu_profiling;
-        let targets = &mut cache.render_targets[frame_idx];
-        let (frame, completed_timings) = self.frames.begin(frame_idx, gpu_profiling);
+        let cache = self.cache.as_mut().unwrap();
+        cache.ensure_frame_attachments(&self.ctx, plan, self.msaa_samples);
+        let output_submission = self
+            .output_retirement
+            .prepare_submission(cache, plan, outputs);
+        let frame_index = output_submission.frame_index();
+        let video_frame_index = output_submission.video_frame_index();
+        self.last_stats = stats;
+
+        let (frame, completed_timings) = self.frames.begin(frame_index, plan.gpu_profiling);
         if let Some(timings) = completed_timings {
             self.last_gpu_timings = Some(timings);
         }
         let command_buffer = frame.command_buffer();
         let query_pool = frame.query_pool();
-        let uploaded = FrameUploader {
-            vertex: &self.vertex_buffer,
-            index: &self.index_buffer,
-            camera: &self.camera_buffer,
-            material_3d: &self.material_buffer_3d,
-            primitive: &self.buffer_3d,
-            vertex_staging_2d: &self.vertex_staging_buffer_2d,
-            index_staging_2d: &self.index_staging_buffer_2d,
-            instance_2d: &self.instance_buffer_2d,
-            camera_2d: &self.camera_buffer_2d,
-            tone_map_factor: &self.tone_map_factor_buffer,
-            strides: FrameBufferStrides {
-                vertex: self.vertex_buffer_stride,
-                index: self.index_buffer_stride,
-                camera: self.camera_buffer_stride,
-                material_3d: self.material_buffer_3d_stride,
-                primitive: self.primitive_buffer_stride,
-                vertex_staging_2d: self.vertex_staging_buffer_2d_stride,
-                index_staging_2d: self.index_staging_buffer_2d_stride,
-                instance_2d: self.instance_buffer_2d_stride,
-                camera_2d: self.camera_buffer_2d_stride,
-                tone_map_factor: self.tone_map_factor_stride,
-            },
-        }
-        .upload(
-            frame_idx,
+        let uploaded = self.frame_buffers.upload(
+            frame_index,
             FrameUpload {
-                camera: camera_uniform,
-                camera_2d: camera_uniform_2d,
-                primitives: objects_3d,
-                materials: surface_materials,
-                mesh_vertices,
-                mesh_indices,
+                camera: &scene.camera_uniform,
+                camera_2d: &scene.camera_uniform_2d,
+                primitives: &sdf_primitives,
+                materials: &scene.surface_materials,
+                mesh_vertices: &scene.mesh_vertices,
+                mesh_indices: &scene.mesh_indices,
                 geometry_2d: &geometry_uploads_2d,
                 instances_2d: &instances_2d,
-                tone_map_factor: raster_scale,
+                tone_map_factor: plan.raster_scale,
             },
         );
-        let vertex_buffer_offset = uploaded.vertex_offset;
-        let index_buffer_offset = uploaded.index_offset;
-        let vertex_staging_buffer_2d_offset = uploaded.vertex_staging_2d_offset;
-        let index_staging_buffer_2d_offset = uploaded.index_staging_2d_offset;
-        let instance_buffer_2d_offset = uploaded.instance_2d_offset;
-        let compute_dynamic_offsets = uploaded.compute_dynamic_offsets;
-        let surface_dynamic_offsets = uploaded.surface_dynamic_offsets;
-        let raster_dynamic_offsets = uploaded.raster_dynamic_offsets;
-        let raster_2d_dynamic_offsets = uploaded.raster_2d_dynamic_offsets;
 
         unsafe {
-            if outputs.vulkan_video {
-                let input_info = vk::DescriptorImageInfo {
-                    image_view: if fused_video_downsample {
-                        targets.resolved_texture.view
-                    } else {
-                        targets.texture.view
-                    },
-                    image_layout: vk::ImageLayout::GENERAL,
-                    ..Default::default()
-                };
-                let input_write = vk::WriteDescriptorSet {
-                    s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
-                    dst_set: cache.video_nv12_slots[video_frame_idx].descriptor_set,
-                    dst_binding: 0,
-                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
-                    descriptor_count: 1,
-                    p_image_info: &input_info,
-                    ..Default::default()
-                };
-                self.ctx
-                    .device
-                    .update_descriptor_sets(std::slice::from_ref(&input_write), &[]);
-            }
-
             let recorder = CommandRecorder::new(&self.ctx.device, command_buffer, &self.pipelines);
-            recorder.record_geometry_uploads_2d(
-                &geometry_uploads_2d,
-                GeometryUploadBuffers2D {
-                    vertex_staging: self.vertex_staging_buffer_2d.vk_buffer,
-                    vertex_staging_base: vertex_staging_buffer_2d_offset,
-                    index_staging: self.index_staging_buffer_2d.vk_buffer,
-                    index_staging_base: index_staging_buffer_2d_offset,
-                    vertex_device: self.vertex_buffer_2d.vk_buffer,
-                    index_device: self.index_buffer_2d.vk_buffer,
+            recorder.record_frame(FrameRecord {
+                plan,
+                cache,
+                frame_index,
+                video_frame_index,
+                uploaded,
+                outputs,
+                mesh_draws_3d: &scene.mesh_draws_3d,
+                mesh_batches_2d: &mesh_batches_2d,
+                geometry_uploads_2d: &geometry_uploads_2d,
+                uploads_2d: GeometryUploadBuffers2D {
+                    vertex_staging: self.frame_buffers.vertex_staging_2d.vk_buffer,
+                    vertex_staging_base: uploaded.vertex_staging_2d_offset,
+                    index_staging: self.frame_buffers.index_staging_2d.vk_buffer,
+                    index_staging_base: uploaded.index_staging_2d_offset,
+                    vertex_device: self.frame_buffers.vertex_2d.vk_buffer,
+                    index_device: self.frame_buffers.index_2d.vk_buffer,
                 },
-            );
-            write_gpu_timestamp(
-                &self.ctx.device,
-                command_buffer,
+                mesh_3d_vertex: self.frame_buffers.vertex.vk_buffer,
+                mesh_3d_index: self.frame_buffers.index.vk_buffer,
+                mesh_2d_vertex: self.frame_buffers.vertex_2d.vk_buffer,
+                mesh_2d_index: self.frame_buffers.index_2d.vk_buffer,
+                mesh_2d_instance: self.frame_buffers.instance_2d.vk_buffer,
+                raster_texture_set: self.textures.descriptor_set(),
                 query_pool,
-                1,
-                gpu_profiling,
-            );
-
-            let color_attachment_state = TrackedImageState {
-                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-                access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-            };
-            let compute_write_state = TrackedImageState {
-                layout: vk::ImageLayout::GENERAL,
-                stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
-                access: vk::AccessFlags2::SHADER_WRITE,
-            };
-            let compute_read_state = TrackedImageState {
-                layout: vk::ImageLayout::GENERAL,
-                stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
-                access: vk::AccessFlags2::SHADER_READ,
-            };
-            if frame_plan == FrameExecutionPlan::Empty {
-                recorder.record_empty_frame(targets, background_color);
-            }
-
-            if frame_plan.runs_sdf() {
-                recorder.record_sdf(targets, &compute_dynamic_offsets, width, height);
-            }
-            write_gpu_timestamp(
-                &self.ctx.device,
-                command_buffer,
-                query_pool,
-                2,
-                gpu_profiling,
-            );
-
-            if uses_deferred_raster {
-                let raster_extent = vk::Extent2D {
-                    width: width * self.ssaa_factor,
-                    height: height * self.ssaa_factor,
-                };
-                let (depth_image, depth_view) = {
-                    let depth = cache
-                        .msaa_depth_texture
-                        .as_ref()
-                        .expect("deferred raster requires a depth attachment");
-                    (depth.vk_image, depth.view)
-                };
-                recorder.record_deferred_opaque(DeferredOpaquePass {
-                    normal_depth: RasterAttachment {
-                        image: cache.raster_normal_depth.vk_image,
-                        view: cache.raster_normal_depth.view,
-                        state: &mut cache.raster_normal_depth_state,
-                    },
-                    albedo: RasterAttachment {
-                        image: cache.raster_albedo.vk_image,
-                        view: cache.raster_albedo.view,
-                        state: &mut cache.raster_albedo_state,
-                    },
-                    material_id: RasterAttachment {
-                        image: cache.raster_material_id.vk_image,
-                        view: cache.raster_material_id.view,
-                        state: &mut cache.raster_material_id_state,
-                    },
-                    depth: RasterAttachment {
-                        image: depth_image,
-                        view: depth_view,
-                        state: &mut cache.msaa_depth_texture_state,
-                    },
-                    region: RasterRegion::new(
-                        raster_extent,
-                        (camera_uniform.has_clip != 0).then_some([
-                            camera_uniform.clip_x,
-                            camera_uniform.clip_y,
-                            camera_uniform.clip_w,
-                            camera_uniform.clip_h,
-                        ]),
-                        camera_uniform.raster_scale as f32,
-                    ),
-                    preserve_depth: has_transparent_meshes,
-                    meshes: Mesh3DBindings {
-                        draws: mesh_draws_3d,
-                        descriptor_set: targets.raster_descriptor_set,
-                        dynamic_offsets: &raster_dynamic_offsets,
-                        vertex_buffer: self.vertex_buffer.vk_buffer,
-                        vertex_offset: vertex_buffer_offset,
-                        index_buffer: self.index_buffer.vk_buffer,
-                        index_offset: index_buffer_offset,
-                    },
-                });
-                if !frame_plan.runs_sdf() {
-                    for (image, state) in [
-                        (
-                            targets.sdf_normal_coverage.vk_image,
-                            &mut targets.sdf_normal_coverage_state,
-                        ),
-                        (
-                            targets.sdf_material_id.vk_image,
-                            &mut targets.sdf_material_id_state,
-                        ),
-                        (targets.sdf_depth.vk_image, &mut targets.sdf_depth_state),
-                    ] {
-                        transition_image(
-                            &self.ctx.device,
-                            command_buffer,
-                            image,
-                            vk::ImageAspectFlags::COLOR,
-                            state,
-                            compute_read_state,
-                        );
-                    }
-                }
-                recorder.record_surface_compute(targets, &surface_dynamic_offsets, raster_extent);
-
-                if has_surface_overlay {
-                    if has_transparent_meshes {
-                        if frame_plan.runs_sdf() {
-                            transition_image(
-                                &self.ctx.device,
-                                command_buffer,
-                                targets.sdf_depth.vk_image,
-                                vk::ImageAspectFlags::COLOR,
-                                &mut targets.sdf_depth_state,
-                                TrackedImageState {
-                                    layout: vk::ImageLayout::GENERAL,
-                                    stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                                    access: vk::AccessFlags2::SHADER_READ,
-                                },
-                            );
-                        }
-                        transition_image(
-                            &self.ctx.device,
-                            command_buffer,
-                            targets.surface_hdr.vk_image,
-                            vk::ImageAspectFlags::COLOR,
-                            &mut targets.surface_hdr_state,
-                            TrackedImageState {
-                                layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                stage: vk::PipelineStageFlags2::COPY,
-                                access: vk::AccessFlags2::TRANSFER_READ,
-                            },
-                        );
-                        transition_image(
-                            &self.ctx.device,
-                            command_buffer,
-                            targets.scene_color.vk_image,
-                            vk::ImageAspectFlags::COLOR,
-                            &mut targets.scene_color_state,
-                            TrackedImageState {
-                                layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                stage: vk::PipelineStageFlags2::COPY,
-                                access: vk::AccessFlags2::TRANSFER_WRITE,
-                            },
-                        );
-                        self.ctx.device.cmd_copy_image(
-                            command_buffer,
-                            targets.surface_hdr.vk_image,
-                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            targets.scene_color.vk_image,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            &[vk::ImageCopy::default()
-                                .src_subresource(vk::ImageSubresourceLayers {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    mip_level: 0,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                })
-                                .dst_subresource(vk::ImageSubresourceLayers {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    mip_level: 0,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                })
-                                .extent(vk::Extent3D {
-                                    width: raster_extent.width,
-                                    height: raster_extent.height,
-                                    depth: 1,
-                                })],
-                        );
-                        transition_image(
-                            &self.ctx.device,
-                            command_buffer,
-                            targets.scene_color.vk_image,
-                            vk::ImageAspectFlags::COLOR,
-                            &mut targets.scene_color_state,
-                            TrackedImageState {
-                                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                                stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                                access: vk::AccessFlags2::SHADER_READ,
-                            },
-                        );
-
-                        recorder.record_transparent_depth(TransparentDepthPass {
-                            depth: RasterAttachment {
-                                image: targets.transparent_back_depth.vk_image,
-                                view: targets.transparent_back_depth.view,
-                                state: &mut targets.transparent_back_depth_state,
-                            },
-                            extent: raster_extent,
-                            meshes: Mesh3DBindings {
-                                draws: mesh_draws_3d,
-                                descriptor_set: targets.raster_descriptor_set,
-                                dynamic_offsets: &raster_dynamic_offsets,
-                                vertex_buffer: self.vertex_buffer.vk_buffer,
-                                vertex_offset: vertex_buffer_offset,
-                                index_buffer: self.index_buffer.vk_buffer,
-                                index_offset: index_buffer_offset,
-                            },
-                        });
-                    }
-
-                    let overlay_color = match cache.msaa_texture.as_ref() {
-                        Some(msaa_texture) => ColorAttachment::Resolve {
-                            multisample: RasterAttachment {
-                                image: msaa_texture.vk_image,
-                                view: msaa_texture.view,
-                                state: &mut cache.msaa_texture_state,
-                            },
-                            resolved: RasterAttachment {
-                                image: targets.overlay_hdr.vk_image,
-                                view: targets.overlay_hdr.view,
-                                state: &mut targets.overlay_hdr_state,
-                            },
-                            preserve_multisample: false,
-                        },
-                        None => ColorAttachment::Single(RasterAttachment {
-                            image: targets.overlay_hdr.vk_image,
-                            view: targets.overlay_hdr.view,
-                            state: &mut targets.overlay_hdr_state,
-                        }),
-                    };
-                    let overlay_depth = cache
-                        .msaa_depth_texture
-                        .as_ref()
-                        .expect("deferred overlay requires a depth attachment");
-                    recorder.record_color_raster(ColorRasterPass {
-                        color: overlay_color,
-                        color_load: ColorLoad::Clear([0.0; 4]),
-                        depth: Some(DepthAttachment {
-                            attachment: RasterAttachment {
-                                image: overlay_depth.vk_image,
-                                view: overlay_depth.view,
-                                state: &mut cache.msaa_depth_texture_state,
-                            },
-                            load: if has_transparent_meshes {
-                                DepthLoad::Load
-                            } else {
-                                DepthLoad::Discard
-                            },
-                            preserve: false,
-                        }),
-                        region: RasterRegion::new(raster_extent, None, 1.0),
-                        meshes_3d: has_transparent_meshes.then(|| {
-                            (
-                                Mesh3DPass::TransparentColor,
-                                Mesh3DBindings {
-                                    draws: mesh_draws_3d,
-                                    descriptor_set: targets.raster_descriptor_set,
-                                    dynamic_offsets: &raster_dynamic_offsets,
-                                    vertex_buffer: self.vertex_buffer.vk_buffer,
-                                    vertex_offset: vertex_buffer_offset,
-                                    index_buffer: self.index_buffer.vk_buffer,
-                                    index_offset: index_buffer_offset,
-                                },
-                            )
-                        }),
-                        meshes_2d: Some((
-                            Mesh2DPass::Depth,
-                            Mesh2DBindings {
-                                batches: &prepared_mesh_batches_2d,
-                                camera_descriptor_set: cache.raster_descriptor_set_2d,
-                                camera_dynamic_offsets: &raster_2d_dynamic_offsets,
-                                texture_descriptor_set: self.raster_texture_set,
-                                vertex_buffer: self.vertex_buffer_2d.vk_buffer,
-                                index_buffer: self.index_buffer_2d.vk_buffer,
-                                instance_buffer: self.instance_buffer_2d.vk_buffer,
-                                instance_offset: instance_buffer_2d_offset,
-                            },
-                        )),
-                    });
-                }
-            }
-
-            if frame_plan.runs_sdf() && !uses_deferred_raster {
-                for (image, state) in [
-                    (
-                        cache.raster_normal_depth.vk_image,
-                        &mut cache.raster_normal_depth_state,
-                    ),
-                    (cache.raster_albedo.vk_image, &mut cache.raster_albedo_state),
-                    (
-                        cache.raster_material_id.vk_image,
-                        &mut cache.raster_material_id_state,
-                    ),
-                ] {
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        image,
-                        vk::ImageAspectFlags::COLOR,
-                        state,
-                        compute_read_state,
-                    );
-                }
-                recorder.record_surface_compute(
-                    targets,
-                    &surface_dynamic_offsets,
-                    vk::Extent2D {
-                        width: width * self.ssaa_factor,
-                        height: height * self.ssaa_factor,
-                    },
-                );
-                if has_transparent_meshes {
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        targets.sdf_depth.vk_image,
-                        vk::ImageAspectFlags::COLOR,
-                        &mut targets.sdf_depth_state,
-                        TrackedImageState {
-                            layout: vk::ImageLayout::GENERAL,
-                            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                            access: vk::AccessFlags2::SHADER_READ,
-                        },
-                    );
-                }
-            }
-
-            if frame_plan.runs_raster() && !uses_deferred_raster {
-                let (target_image, target_view, target_state) =
-                    if frame_plan == FrameExecutionPlan::SdfRasterComposite {
-                        (
-                            targets.overlay_hdr.vk_image,
-                            targets.overlay_hdr.view,
-                            &mut targets.overlay_hdr_state,
-                        )
-                    } else {
-                        (
-                            targets.resolved_texture.vk_image,
-                            targets.resolved_texture.view,
-                            &mut targets.resolved_texture_state,
-                        )
-                    };
-                let raster_extent = vk::Extent2D {
-                    width: width * raster_scale,
-                    height: height * raster_scale,
-                };
-                let color = match cache.msaa_texture.as_ref() {
-                    Some(msaa_texture) => ColorAttachment::Resolve {
-                        multisample: RasterAttachment {
-                            image: msaa_texture.vk_image,
-                            view: msaa_texture.view,
-                            state: &mut cache.msaa_texture_state,
-                        },
-                        resolved: RasterAttachment {
-                            image: target_image,
-                            view: target_view,
-                            state: &mut *target_state,
-                        },
-                        preserve_multisample: true,
-                    },
-                    None => ColorAttachment::Single(RasterAttachment {
-                        image: target_image,
-                        view: target_view,
-                        state: &mut *target_state,
-                    }),
-                };
-                let depth = if raster_uses_depth {
-                    let texture = cache
-                        .msaa_depth_texture
-                        .as_ref()
-                        .expect("3D raster requires a depth attachment");
-                    Some(DepthAttachment {
-                        attachment: RasterAttachment {
-                            image: texture.vk_image,
-                            view: texture.view,
-                            state: &mut cache.msaa_depth_texture_state,
-                        },
-                        load: DepthLoad::Clear,
-                        preserve: has_transparent_meshes,
-                    })
-                } else {
-                    None
-                };
-                recorder.record_color_raster(ColorRasterPass {
-                    color,
-                    color_load: ColorLoad::Clear(background_color),
-                    depth,
-                    region: RasterRegion::new(
-                        raster_extent,
-                        (camera_uniform.has_clip != 0).then_some([
-                            camera_uniform.clip_x,
-                            camera_uniform.clip_y,
-                            camera_uniform.clip_w,
-                            camera_uniform.clip_h,
-                        ]),
-                        camera_uniform.raster_scale as f32,
-                    ),
-                    meshes_3d: None,
-                    meshes_2d: (!has_transparent_meshes).then(|| {
-                        (
-                            if analytic_2d {
-                                Mesh2DPass::Analytic
-                            } else if raster_uses_depth {
-                                Mesh2DPass::Depth
-                            } else {
-                                Mesh2DPass::Depthless
-                            },
-                            Mesh2DBindings {
-                                batches: &prepared_mesh_batches_2d,
-                                camera_descriptor_set: cache.raster_descriptor_set_2d,
-                                camera_dynamic_offsets: &raster_2d_dynamic_offsets,
-                                texture_descriptor_set: self.raster_texture_set,
-                                vertex_buffer: self.vertex_buffer_2d.vk_buffer,
-                                index_buffer: self.index_buffer_2d.vk_buffer,
-                                instance_buffer: self.instance_buffer_2d.vk_buffer,
-                                instance_offset: instance_buffer_2d_offset,
-                            },
-                        )
-                    }),
-                });
-
-                if has_transparent_meshes {
-                    let (scene_source_image, scene_source_state) = if frame_plan.runs_sdf() {
-                        (targets.surface_hdr.vk_image, &mut targets.surface_hdr_state)
-                    } else {
-                        (target_image, &mut *target_state)
-                    };
-                    let transfer_source_state = TrackedImageState {
-                        layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        stage: vk::PipelineStageFlags2::COPY,
-                        access: vk::AccessFlags2::TRANSFER_READ,
-                    };
-                    let transfer_destination_state = TrackedImageState {
-                        layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        stage: vk::PipelineStageFlags2::COPY,
-                        access: vk::AccessFlags2::TRANSFER_WRITE,
-                    };
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        scene_source_image,
-                        vk::ImageAspectFlags::COLOR,
-                        scene_source_state,
-                        transfer_source_state,
-                    );
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        targets.scene_color.vk_image,
-                        vk::ImageAspectFlags::COLOR,
-                        &mut targets.scene_color_state,
-                        transfer_destination_state,
-                    );
-                    let copy_region = vk::ImageCopy::default()
-                        .src_subresource(vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .dst_subresource(vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        })
-                        .extent(vk::Extent3D {
-                            width: raster_extent.width,
-                            height: raster_extent.height,
-                            depth: 1,
-                        });
-                    self.ctx.device.cmd_copy_image(
-                        command_buffer,
-                        scene_source_image,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        targets.scene_color.vk_image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        std::slice::from_ref(&copy_region),
-                    );
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        scene_source_image,
-                        vk::ImageAspectFlags::COLOR,
-                        scene_source_state,
-                        if frame_plan.runs_sdf() {
-                            compute_read_state
-                        } else {
-                            color_attachment_state
-                        },
-                    );
-                    transition_image(
-                        &self.ctx.device,
-                        command_buffer,
-                        targets.scene_color.vk_image,
-                        vk::ImageAspectFlags::COLOR,
-                        &mut targets.scene_color_state,
-                        TrackedImageState {
-                            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                            access: vk::AccessFlags2::SHADER_READ,
-                        },
-                    );
-
-                    recorder.record_transparent_depth(TransparentDepthPass {
-                        depth: RasterAttachment {
-                            image: targets.transparent_back_depth.vk_image,
-                            view: targets.transparent_back_depth.view,
-                            state: &mut targets.transparent_back_depth_state,
-                        },
-                        extent: raster_extent,
-                        meshes: Mesh3DBindings {
-                            draws: mesh_draws_3d,
-                            descriptor_set: targets.raster_descriptor_set,
-                            dynamic_offsets: &raster_dynamic_offsets,
-                            vertex_buffer: self.vertex_buffer.vk_buffer,
-                            vertex_offset: vertex_buffer_offset,
-                            index_buffer: self.index_buffer.vk_buffer,
-                            index_offset: index_buffer_offset,
-                        },
-                    });
-
-                    let color = match cache.msaa_texture.as_ref() {
-                        Some(msaa_texture) => ColorAttachment::Resolve {
-                            multisample: RasterAttachment {
-                                image: msaa_texture.vk_image,
-                                view: msaa_texture.view,
-                                state: &mut cache.msaa_texture_state,
-                            },
-                            resolved: RasterAttachment {
-                                image: target_image,
-                                view: target_view,
-                                state: &mut *target_state,
-                            },
-                            preserve_multisample: false,
-                        },
-                        None => ColorAttachment::Single(RasterAttachment {
-                            image: target_image,
-                            view: target_view,
-                            state: &mut *target_state,
-                        }),
-                    };
-                    let depth = if raster_uses_depth {
-                        let texture = cache
-                            .msaa_depth_texture
-                            .as_ref()
-                            .expect("transparent 3D raster requires a depth attachment");
-                        Some(DepthAttachment {
-                            attachment: RasterAttachment {
-                                image: texture.vk_image,
-                                view: texture.view,
-                                state: &mut cache.msaa_depth_texture_state,
-                            },
-                            load: DepthLoad::Load,
-                            preserve: false,
-                        })
-                    } else {
-                        None
-                    };
-                    recorder.record_color_raster(ColorRasterPass {
-                        color,
-                        color_load: ColorLoad::Load,
-                        depth,
-                        region: RasterRegion::new(
-                            raster_extent,
-                            (camera_uniform.has_clip != 0).then_some([
-                                camera_uniform.clip_x,
-                                camera_uniform.clip_y,
-                                camera_uniform.clip_w,
-                                camera_uniform.clip_h,
-                            ]),
-                            camera_uniform.raster_scale as f32,
-                        ),
-                        meshes_3d: Some((
-                            Mesh3DPass::TransparentColor,
-                            Mesh3DBindings {
-                                draws: mesh_draws_3d,
-                                descriptor_set: targets.raster_descriptor_set,
-                                dynamic_offsets: &raster_dynamic_offsets,
-                                vertex_buffer: self.vertex_buffer.vk_buffer,
-                                vertex_offset: vertex_buffer_offset,
-                                index_buffer: self.index_buffer.vk_buffer,
-                                index_offset: index_buffer_offset,
-                            },
-                        )),
-                        meshes_2d: Some((
-                            Mesh2DPass::Depth,
-                            Mesh2DBindings {
-                                batches: &prepared_mesh_batches_2d,
-                                camera_descriptor_set: cache.raster_descriptor_set_2d,
-                                camera_dynamic_offsets: &raster_2d_dynamic_offsets,
-                                texture_descriptor_set: self.raster_texture_set,
-                                vertex_buffer: self.vertex_buffer_2d.vk_buffer,
-                                index_buffer: self.index_buffer_2d.vk_buffer,
-                                instance_buffer: self.instance_buffer_2d.vk_buffer,
-                                instance_offset: instance_buffer_2d_offset,
-                            },
-                        )),
-                    });
-                }
-            }
-
-            if frame_plan.runs_sdf() || uses_deferred_raster {
-                recorder.record_surface_composite(
-                    targets,
-                    has_surface_overlay,
-                    width,
-                    height,
-                    self.ssaa_factor,
-                );
-            }
-            write_gpu_timestamp(
-                &self.ctx.device,
-                command_buffer,
-                query_pool,
-                3,
-                gpu_profiling,
-            );
-
-            if frame_plan != FrameExecutionPlan::Empty {
-                recorder.record_bloom(targets, self.bloom_enabled);
-            }
-
-            if runs_postprocess {
-                recorder.record_tone_map(targets, width, height);
-            }
-            write_gpu_timestamp(
-                &self.ctx.device,
-                command_buffer,
-                query_pool,
-                4,
-                gpu_profiling,
-            );
-
-            let has_compute_output =
-                outputs.cpu_nv12 || outputs.cpu_yuv444p || outputs.vulkan_video;
-            let video_output = outputs.vulkan_video.then(|| {
-                let slot = &cache.video_nv12_slots[video_frame_idx];
-                VideoOutputPass {
-                    image: slot.image.vk_image,
-                    descriptor_set: slot.descriptor_set,
-                    current_layout: slot.layout,
-                }
             });
-            recorder.record_outputs(
-                targets,
-                OutputPasses {
-                    width,
-                    height,
-                    fused_video_downsample,
-                    cpu_nv12_descriptor_set: outputs
-                        .cpu_nv12
-                        .then_some(cache.nv12_descriptor_sets[frame_idx]),
-                    cpu_yuv444p_descriptor_set: outputs
-                        .cpu_yuv444p
-                        .then_some(cache.yuv444p_descriptor_sets[frame_idx]),
-                    video: video_output,
-                    rgba_buffer: outputs
-                        .cpu_rgba
-                        .then_some(cache.output_buffers[frame_idx].vk_buffer),
-                    rgba_padded_bytes_per_row: cache.padded_bytes_per_row,
-                },
-            );
-            if outputs.vulkan_video {
-                cache.video_nv12_slots[video_frame_idx].layout = vk::ImageLayout::GENERAL;
-            }
-            write_gpu_timestamp(
-                &self.ctx.device,
-                command_buffer,
-                query_pool,
-                5,
-                gpu_profiling,
-            );
 
-            if !has_compute_output && !outputs.cpu_rgba {
-                transition_image(
-                    &self.ctx.device,
-                    command_buffer,
-                    targets.texture.vk_image,
-                    vk::ImageAspectFlags::COLOR,
-                    &mut targets.texture_state,
-                    TrackedImageState {
-                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                        stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-                        access: vk::AccessFlags2::SHADER_READ,
-                    },
-                );
-            }
-
-            let mut wait_infos = Vec::with_capacity(1);
-            let mut signal_infos = Vec::with_capacity(1);
-            if outputs.vulkan_video {
-                let video_slot = &cache.video_nv12_slots[video_frame_idx];
-                let (wait_value, ready_value, _) =
-                    video_timeline_values(video_slot.next_ready_value);
-                if let Some(wait_value) = wait_value {
-                    wait_infos.push(
-                        vk::SemaphoreSubmitInfo::default()
-                            .semaphore(video_slot.timeline.handle())
-                            .value(wait_value)
-                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
-                    );
-                }
-                signal_infos.push(
-                    vk::SemaphoreSubmitInfo::default()
-                        .semaphore(video_slot.timeline.handle())
-                        .value(ready_value)
-                        .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
-                );
-            }
             frame.submit(
-                &wait_infos,
-                &signal_infos,
-                gpu_profiling.then_some(FrameProfile {
-                    plan: frame_plan,
+                output_submission.wait_infos(),
+                output_submission.signal_infos(),
+                plan.gpu_profiling.then_some(FrameProfile {
+                    plan: plan.execution,
                     geometry_upload: !geometry_uploads_2d.is_empty(),
-                    postprocess: runs_postprocess,
+                    postprocess: plan.runs_postprocess,
                     output: outputs.cpu_nv12
                         || outputs.cpu_yuv444p
                         || outputs.vulkan_video
                         || outputs.cpu_rgba,
                 }),
             );
-            if outputs.vulkan_video {
-                let video_slot = &mut cache.video_nv12_slots[video_frame_idx];
-                video_slot.last_ready_value = Some(video_slot.next_ready_value);
-                video_slot.next_ready_value += 2;
-                video_slot.frame_available = true;
-            }
         }
 
         if let Some(out_buf) = output {
-            let read_frame_idx = cache.current_frame % 3;
-            self.frames.wait(read_frame_idx);
-
-            if let Some(alloc) = &cache.output_buffers[read_frame_idx].allocation {
-                if let Some(mapped) = alloc.mapped_ptr() {
-                    let padded_data = unsafe {
-                        std::slice::from_raw_parts(
-                            mapped.as_ptr() as *const u8,
-                            (cache.padded_bytes_per_row * height) as usize,
-                        )
-                    };
-                    for row in 0..height {
-                        let start = (row * cache.padded_bytes_per_row) as usize;
-                        let end = start + unpadded_bytes_per_row as usize;
-                        let dst_start = (row * unpadded_bytes_per_row) as usize;
-                        let dst_end = dst_start + unpadded_bytes_per_row as usize;
-                        out_buf[dst_start..dst_end].copy_from_slice(&padded_data[start..end]);
-                    }
-                }
-            }
+            self.output_retirement
+                .copy_submitted_rgba(cache, &self.frames, frame_index, out_buf);
         }
-
-        cache.current_frame += 1;
+        output_submission.commit(cache);
     }
 
     pub fn get_nv12_bytes(&self) -> Option<&[u8]> {
-        if let Some(cache) = self.cache.as_ref() {
-            if cache.current_frame == 0 {
-                return None;
-            }
-            let read_frame_idx = (cache.current_frame - 1) % 3;
-            self.frames.wait(read_frame_idx);
-
-            if let Some(alloc) = &cache.nv12_output_buffers[read_frame_idx].allocation {
-                if let Some(mapped) = alloc.mapped_ptr() {
-                    let len = (cache.width * cache.height * 3 / 2) as usize;
-                    return Some(unsafe {
-                        std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len)
-                    });
-                }
-            }
-        }
-        None
+        let cache = self.cache.as_ref()?;
+        self.output_retirement.latest_nv12(cache, &self.frames)
     }
 
     pub fn get_yuv444p_bytes(&self) -> Option<&[u8]> {
-        if let Some(cache) = self.cache.as_ref() {
-            if cache.current_frame == 0 {
-                return None;
-            }
-            let read_frame_idx = (cache.current_frame - 1) % 3;
-            self.frames.wait(read_frame_idx);
-
-            if let Some(alloc) = &cache.yuv444p_output_buffers[read_frame_idx].allocation {
-                if let Some(mapped) = alloc.mapped_ptr() {
-                    let len = (cache.width * cache.height * 3) as usize;
-                    return Some(unsafe {
-                        std::slice::from_raw_parts(mapped.as_ptr() as *const u8, len)
-                    });
-                }
-            }
-        }
-        None
+        let cache = self.cache.as_ref()?;
+        self.output_retirement.latest_yuv444p(cache, &self.frames)
     }
 
     pub fn get_vulkan_video_frame(&mut self) -> Option<VulkanVideoFrame> {
-        if let Some(cache) = self.cache.as_mut() {
-            if cache.current_frame == 0 || cache.video_nv12_slots.is_empty() {
-                return None;
-            }
-            let video_frame_idx = (cache.current_frame - 1) % cache.video_nv12_slots.len();
-            let slot = &mut cache.video_nv12_slots[video_frame_idx];
-            if !slot.frame_available {
-                return None;
-            }
-            let ready_value = slot.last_ready_value?;
-            let (_, _, release_value) = video_timeline_values(ready_value);
-            slot.frame_available = false;
-            return Some(VulkanVideoFrame::new(
-                slot.image.vk_image,
-                slot.image.color_view,
-                slot.layout,
-                slot.image.format,
-                slot.image.width,
-                slot.image.height,
-                self.ctx.device.handle(),
-                slot.timeline.clone(),
-                ready_value,
-                release_value,
-            ));
-        }
-        None
+        let cache = self.cache.as_mut()?;
+        self.output_retirement.take_video_frame(cache)
     }
 
     pub fn get_rgba_bytes(&mut self) -> Option<&[u8]> {
-        if let Some(cache) = self.cache.as_mut() {
-            if cache.current_frame == 0 {
-                return None;
-            }
-            let read_frame_idx = (cache.current_frame - 1) % 3;
-            self.frames.wait(read_frame_idx);
+        let cache = self.cache.as_ref()?;
+        self.output_retirement.latest_rgba(cache, &self.frames)
+    }
+}
 
-            if let Some(alloc) = &cache.output_buffers[read_frame_idx].allocation {
-                if let Some(mapped) = alloc.mapped_ptr() {
-                    let height = cache.height;
-                    let unpadded_bytes_per_row = cache.width * 4;
-                    let padded_data = unsafe {
-                        std::slice::from_raw_parts(
-                            mapped.as_ptr() as *const u8,
-                            (cache.padded_bytes_per_row * height) as usize,
-                        )
-                    };
-                    for row in 0..height {
-                        let start = (row * cache.padded_bytes_per_row) as usize;
-                        let end = start + unpadded_bytes_per_row as usize;
-                        let dst_start = (row * unpadded_bytes_per_row) as usize;
-                        let dst_end = dst_start + unpadded_bytes_per_row as usize;
-                        cache.rgba_preview_buffer[dst_start..dst_end]
-                            .copy_from_slice(&padded_data[start..end]);
-                    }
-                    let ptr = cache.rgba_preview_buffer.as_ptr();
-                    let len = cache.rgba_preview_buffer.len();
-                    return Some(unsafe { std::slice::from_raw_parts(ptr, len) });
-                }
-            }
+impl Drop for VulkanRenderer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.ctx.device.device_wait_idle();
         }
-        None
+        drop(self.cache.take());
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::profiling::timestamp_delta;
     use nalgebra::{Point3, Vector3};
 
-    use super::{
-        FrameExecutionPlan, GpuSdfPrimitive, MaterialData3D, timestamp_delta, video_timeline_values,
-    };
+    use super::MaterialData3D;
+    use super::frame::FrameExecutionPlan;
+    use super::prepared_frame::GpuSdfPrimitive;
     use crate::mobjects::mesh_3d::{
         AlphaMode3D, SphericalPatchMaterial, SurfaceMaterial, Transmission3D,
     };
     use crate::mobjects::object_3d::SdfPrimitive;
-
-    #[test]
-    fn video_timeline_values_alternate_ready_and_release() {
-        assert_eq!(video_timeline_values(1), (None, 1, 2));
-        assert_eq!(video_timeline_values(3), (Some(2), 3, 4));
-        assert_eq!(video_timeline_values(9), (Some(8), 9, 10));
-    }
-
-    #[test]
-    #[should_panic(expected = "must be odd")]
-    fn video_timeline_rejects_even_ready_values() {
-        video_timeline_values(2);
-    }
 
     #[test]
     fn frame_execution_plan_eliminates_empty_passes() {
