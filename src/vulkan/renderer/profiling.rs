@@ -1,4 +1,4 @@
-use super::{FrameExecutionPlan, GPU_TIMESTAMP_COUNT};
+use super::frame::{FrameExecutionPlan, GPU_TIMESTAMP_COUNT};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RendererStats {

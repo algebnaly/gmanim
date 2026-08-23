@@ -96,10 +96,21 @@ fn vs_main(model: VertexInput) -> VertexOutput {
 }
 
 fn antialiased_periodic_line(coord: f32, width_pixels: f32) -> f32 {
-    let distance_to_line = abs(fract(coord + 0.5) - 0.5);
-    let pixel_footprint = max(fwidth(coord), 1e-5);
-    let half_width = pixel_footprint * max(width_pixels, 0.25) * 0.5;
-    return 1.0 - smoothstep(half_width, half_width + pixel_footprint, distance_to_line);
+    if width_pixels < 0.02 {
+        return 0.0;
+    }
+    let grad = vec2<f32>(dpdx(coord), dpdy(coord));
+    let deriv = max(length(grad), 1e-6);
+    let dist_coord = abs(fract(coord + 0.5) - 0.5);
+    let dist_pixels = dist_coord / deriv;
+    
+    let target_w = max(width_pixels, 0.01);
+    let draw_w = max(target_w, 1.0);
+    let coverage = clamp(draw_w * 0.5 + 0.5 - dist_pixels, 0.0, 1.0);
+    let subpixel_alpha = min(target_w, 1.0);
+    let nyquist_fade = clamp(1.0 - (deriv - 0.2) / 0.25, 0.0, 1.0);
+    
+    return coverage * subpixel_alpha * nyquist_fade;
 }
 
 fn spherical_grid(surface_coord: vec3<f32>, material: MaterialData3D) -> f32 {
@@ -111,15 +122,77 @@ fn spherical_grid(surface_coord: vec3<f32>, material: MaterialData3D) -> f32 {
     return max(longitude_line, latitude_line) * step(0.5, material.grid.w);
 }
 
+fn antialiased_line(distance: f32, width_pixels: f32) -> f32 {
+    if width_pixels < 0.02 {
+        return 0.0;
+    }
+    let grad = vec2<f32>(dpdx(distance), dpdy(distance));
+    let deriv = max(length(grad), 1e-6);
+    let dist_pixels = abs(distance) / deriv;
+    
+    let target_w = max(width_pixels, 0.01);
+    let draw_w = max(target_w, 1.0);
+    let coverage = clamp(draw_w * 0.5 + 0.5 - dist_pixels, 0.0, 1.0);
+    let subpixel_alpha = min(target_w, 1.0);
+    
+    return coverage * subpixel_alpha;
+}
+
+fn planar_grid(
+    frag_pos: vec3<f32>,
+    surface_coord: vec3<f32>,
+    material: MaterialData3D,
+) -> vec4<f32> {
+    let cell_size = max(material.patch_params.x, 0.001);
+    let subdivisions = max(material.patch_params.y, 1.0);
+    let fade_radius = max(material.patch_params.z, 1.0);
+    let line_width = material.patch_params.w;
+
+    let minor_step = cell_size / subdivisions;
+    let major_step = cell_size;
+
+    let coord = surface_coord.xy;
+
+    let minor_u = antialiased_periodic_line(coord.x / minor_step, line_width * 0.9);
+    let minor_v = antialiased_periodic_line(coord.y / minor_step, line_width * 0.9);
+    let minor_mask = max(minor_u, minor_v);
+
+    let major_u = antialiased_periodic_line(coord.x / major_step, line_width);
+    let major_v = antialiased_periodic_line(coord.y / major_step, line_width);
+    let major_mask = max(major_u, major_v);
+
+    let axis_u_mask = antialiased_line(coord.y, line_width * 1.5);
+    let axis_v_mask = antialiased_line(coord.x, line_width * 1.5);
+
+    let dist = length(frag_pos - camera.pos);
+    let fade = smoothstep(fade_radius, fade_radius * 0.2, dist);
+
+    var out_a = minor_mask * material.grid_color.a;
+    var out_c = material.grid_color.rgb * out_a;
+
+    let major_a = major_mask * material.patch_color.a;
+    out_c = material.patch_color.rgb * major_a + out_c * (1.0 - major_a);
+    out_a = major_a + out_a * (1.0 - major_a);
+
+    let axis_u_a = axis_u_mask * material.patch_edge_color.a;
+    out_c = material.patch_edge_color.rgb * axis_u_a + out_c * (1.0 - axis_u_a);
+    out_a = axis_u_a + out_a * (1.0 - axis_u_a);
+
+    let axis_v_a = axis_v_mask * material.patch_corner_0.a;
+    out_c = material.patch_corner_0.rgb * axis_v_a + out_c * (1.0 - axis_v_a);
+    out_a = axis_v_a + out_a * (1.0 - axis_v_a);
+
+    var final_col = vec3<f32>(0.0);
+    if out_a > 0.0 {
+        final_col = out_c / out_a;
+    }
+
+    return vec4<f32>(final_col, out_a * fade);
+}
+
 struct SphericalPatchMasks {
     fill: f32,
     edge: f32,
-}
-
-fn antialiased_line(distance: f32, width_pixels: f32) -> f32 {
-    let pixel_footprint = max(fwidth(distance), 1e-5);
-    let half_width = pixel_footprint * max(width_pixels, 0.25) * 0.5;
-    return 1.0 - smoothstep(half_width, half_width + pixel_footprint, abs(distance));
 }
 
 fn spherical_patch(
@@ -228,6 +301,18 @@ fn fs_gbuffer(in: VertexOutput, @builtin(front_facing) is_front: bool) -> GBuffe
     let geometric_normal = normalize(in.normal);
     let normal = select(-geometric_normal, geometric_normal, is_front);
     var albedo = in.color.rgb * material.base_color.rgb;
+
+    if material.grid.w > 1.5 {
+        let planar_res = planar_grid(in.frag_pos, in.surface_coord, material);
+        albedo = mix(albedo, planar_res.rgb, planar_res.a);
+        let alpha = max(in.color.a * material.base_color.a, planar_res.a);
+        let linear_depth = dot(in.frag_pos - camera.pos, normalize(camera.look_at));
+        return GBufferOutput(
+            vec4<f32>(normal, linear_depth),
+            vec4<f32>(albedo, alpha),
+            in.material_index,
+        );
+    }
 
     let patch_masks = spherical_patch(in.surface_coord, material);
     albedo = mix(
@@ -356,22 +441,28 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location
         color = mix(transmitted, color, environment_fresnel);
     }
 
-    let patch_masks = spherical_patch(in.surface_coord, material);
-    color = mix(
-        color,
-        material.patch_color.rgb,
-        patch_masks.fill * material.patch_color.a,
-    );
+    var planar_res = vec4<f32>(0.0);
+    if material.grid.w > 1.5 {
+        planar_res = planar_grid(in.frag_pos, in.surface_coord, material);
+        color = mix(color, planar_res.rgb, planar_res.a);
+    } else {
+        let patch_masks = spherical_patch(in.surface_coord, material);
+        color = mix(
+            color,
+            material.patch_color.rgb,
+            patch_masks.fill * material.patch_color.a,
+        );
 
-    let grid_mask = spherical_grid(in.surface_coord, material);
-    let face_intensity = select(material.grid_backface.x, 1.0, is_front);
-    let grid_mix = clamp(grid_mask * material.grid_color.a * face_intensity, 0.0, 1.0);
-    color = mix(color, material.grid_color.rgb, grid_mix);
-    color = mix(
-        color,
-        material.patch_edge_color.rgb,
-        patch_masks.edge * material.patch_edge_color.a,
-    );
+        let grid_mask = spherical_grid(in.surface_coord, material);
+        let face_intensity = select(material.grid_backface.x, 1.0, is_front);
+        let grid_mix = clamp(grid_mask * material.grid_color.a * face_intensity, 0.0, 1.0);
+        color = mix(color, material.grid_color.rgb, grid_mix);
+        color = mix(
+            color,
+            material.patch_edge_color.rgb,
+            patch_masks.edge * material.patch_edge_color.a,
+        );
+    }
 
     let base_medium_alpha = 1.0
         - (1.0 - material.transmission.x) * (1.0 - absorption_alpha);
@@ -386,6 +477,15 @@ fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location
         0.0,
         1.0,
     );
+
+    if material.grid.w > 1.5 {
+        let alpha = max(surface_alpha, planar_res.a);
+        return vec4<f32>(color, alpha);
+    }
+
+    let patch_masks = spherical_patch(in.surface_coord, material);
+    let grid_mask = spherical_grid(in.surface_coord, material);
+    let face_intensity = select(material.grid_backface.x, 1.0, is_front);
     let grid_alpha = grid_mask * material.grid_color.a * face_intensity;
     let patch_alpha = patch_masks.fill * material.patch_color.a;
     let patch_edge_alpha = patch_masks.edge * material.patch_edge_color.a;

@@ -6,7 +6,7 @@ use crate::vulkan::context::VulkanContext;
 
 use super::{
     Buffer, Image, Nv12Constants, PipelineSet, RENDER_FRAME_COUNT, TrackedImageState,
-    VIDEO_NV12_IMAGE_COUNT, VideoNv12Slot, msaa_to_vk_sample_count, transition_image,
+    VIDEO_NV12_IMAGE_COUNT, VideoNv12Slot, msaa_to_vk_sample_count,
 };
 
 pub(super) struct TargetCacheResources<'a> {
@@ -91,128 +91,6 @@ impl RenderTargetSet {
         self.transparent_back_depth.destroy(ctx);
         self.bloom_ping.destroy(ctx);
         self.bloom_pong.destroy(ctx);
-    }
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct SurfaceComputePipelines {
-    pub(super) resolve: vk::Pipeline,
-    pub(super) resolve_layout: vk::PipelineLayout,
-    pub(super) lighting: vk::Pipeline,
-    pub(super) lighting_layout: vk::PipelineLayout,
-}
-
-fn transition_resolved_surface(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    targets: &mut RenderTargetSet,
-    destination: TrackedImageState,
-) {
-    for (image, state) in [
-        (
-            targets.resolved_primary_normal_depth.vk_image,
-            &mut targets.resolved_primary_normal_depth_state,
-        ),
-        (
-            targets.resolved_primary_albedo_coverage.vk_image,
-            &mut targets.resolved_primary_albedo_coverage_state,
-        ),
-        (
-            targets.resolved_secondary_normal_depth.vk_image,
-            &mut targets.resolved_secondary_normal_depth_state,
-        ),
-        (
-            targets.resolved_secondary_albedo_coverage.vk_image,
-            &mut targets.resolved_secondary_albedo_coverage_state,
-        ),
-        (
-            targets.resolved_material_ids.vk_image,
-            &mut targets.resolved_material_ids_state,
-        ),
-    ] {
-        unsafe {
-            transition_image(
-                device,
-                command_buffer,
-                image,
-                vk::ImageAspectFlags::COLOR,
-                state,
-                destination,
-            );
-        }
-    }
-}
-
-pub(super) fn record_surface_compute(
-    device: &ash::Device,
-    command_buffer: vk::CommandBuffer,
-    targets: &mut RenderTargetSet,
-    pipelines: SurfaceComputePipelines,
-    dynamic_offsets: &[u32],
-    extent: vk::Extent2D,
-) {
-    let compute_write_state = TrackedImageState {
-        layout: vk::ImageLayout::GENERAL,
-        stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
-        access: vk::AccessFlags2::SHADER_WRITE,
-    };
-    let compute_read_state = TrackedImageState {
-        access: vk::AccessFlags2::SHADER_READ,
-        ..compute_write_state
-    };
-
-    transition_resolved_surface(device, command_buffer, targets, compute_write_state);
-    unsafe {
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipelines.resolve,
-        );
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipelines.resolve_layout,
-            0,
-            std::slice::from_ref(&targets.surface_resolve_descriptor_set),
-            dynamic_offsets,
-        );
-        device.cmd_dispatch(
-            command_buffer,
-            (extent.width + 15) / 16,
-            (extent.height + 15) / 16,
-            1,
-        );
-    }
-
-    transition_resolved_surface(device, command_buffer, targets, compute_read_state);
-    unsafe {
-        transition_image(
-            device,
-            command_buffer,
-            targets.surface_hdr.vk_image,
-            vk::ImageAspectFlags::COLOR,
-            &mut targets.surface_hdr_state,
-            compute_write_state,
-        );
-        device.cmd_bind_pipeline(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipelines.lighting,
-        );
-        device.cmd_bind_descriptor_sets(
-            command_buffer,
-            vk::PipelineBindPoint::COMPUTE,
-            pipelines.lighting_layout,
-            0,
-            std::slice::from_ref(&targets.surface_lighting_descriptor_set),
-            dynamic_offsets,
-        );
-        device.cmd_dispatch(
-            command_buffer,
-            (extent.width + 15) / 16,
-            (extent.height + 15) / 16,
-            1,
-        );
     }
 }
 

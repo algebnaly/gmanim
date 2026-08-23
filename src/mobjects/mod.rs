@@ -12,6 +12,7 @@ pub mod three_d_viewport;
 pub mod wrapper_3d;
 pub use basic::{Arc, PolyLine, QuadraticBezier, Rectangle, SimpleLine};
 pub use dot::Dot;
+pub use mesh_3d::{PlanarGridMaterial, SphericalGridMaterial, SphericalPatchMaterial, SurfaceMaterial, TriangleMesh3D};
 
 use std::{
     borrow::Cow,
