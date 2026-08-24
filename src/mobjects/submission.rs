@@ -5,10 +5,16 @@ use crate::GMFloat;
 use super::{
     RectangleId,
     basic::Rectangle,
+    grid_3d::GridPlane3D,
     mesh_2d::TriangleMesh2D,
     mesh_3d::{SurfaceMaterial, TriangleMesh3D},
     object_3d::Object3D,
 };
+
+pub struct Grid3DSubmission<'a> {
+    pub grid: &'a GridPlane3D,
+    pub transform: Matrix4<GMFloat>,
+}
 
 pub enum Geometry3DRef<'a> {
     Mesh(&'a TriangleMesh3D),
@@ -34,4 +40,6 @@ pub trait RenderVisitor {
     );
 
     fn push_surface_3d(&mut self, surface: Surface3DSubmission<'_>);
+
+    fn push_grid_3d(&mut self, grid: Grid3DSubmission<'_>);
 }

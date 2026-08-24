@@ -4,9 +4,12 @@ use super::mesh_2d::PreparedMesh2D;
 use super::output::RenderOutputs;
 use super::profiling::RendererStats;
 use super::record::{RecordingPlan, RecordingPlanInput};
-use super::scene::PreparedScene;
+use super::scene::{PreparedGrid3D, PreparedScene};
 
 const COPY_BYTES_PER_ROW_ALIGNMENT: u32 = 256;
+pub(super) const GRID_LINE_COUNT: u32 = 151;
+pub(super) const GRID_LOD_COUNT: u32 = 3;
+pub(super) const GRID_INSTANCES_PER_GRID: u32 = GRID_LINE_COUNT * 2 * GRID_LOD_COUNT;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -131,6 +134,56 @@ impl GpuSdfPrimitive {
     }
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub(super) struct GpuGrid3D {
+    pub(super) origin: [f32; 4],
+    pub(super) u_axis: [f32; 4],
+    pub(super) v_axis: [f32; 4],
+    pub(super) major_color: [f32; 4],
+    pub(super) minor_color: [f32; 4],
+    pub(super) u_axis_color: [f32; 4],
+    pub(super) v_axis_color: [f32; 4],
+    pub(super) params: [f32; 4],
+    pub(super) extent: [f32; 4],
+}
+
+impl From<&PreparedGrid3D> for GpuGrid3D {
+    fn from(grid: &PreparedGrid3D) -> Self {
+        Self {
+            origin: [
+                grid.origin.x as f32,
+                grid.origin.y as f32,
+                grid.origin.z as f32,
+                1.0,
+            ],
+            u_axis: [
+                grid.u_axis.x as f32,
+                grid.u_axis.y as f32,
+                grid.u_axis.z as f32,
+                0.0,
+            ],
+            v_axis: [
+                grid.v_axis.x as f32,
+                grid.v_axis.y as f32,
+                grid.v_axis.z as f32,
+                0.0,
+            ],
+            major_color: grid.style.major_color,
+            minor_color: grid.style.minor_color,
+            u_axis_color: grid.style.u_axis_color,
+            v_axis_color: grid.style.v_axis_color,
+            params: [
+                grid.style.cell_size,
+                grid.style.subdivisions as f32,
+                grid.style.line_width_pixels,
+                grid.style.fade_radius,
+            ],
+            extent: [grid.half_extent as f32, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct FrameRequirements {
     pub(super) width: u32,
@@ -155,6 +208,7 @@ impl FrameRequirements {
             has_opaque_meshes,
             has_transparent_meshes,
             !scene.mesh_batches_2d.is_empty(),
+            !scene.grids_3d.is_empty(),
         )
     }
 
@@ -165,6 +219,7 @@ impl FrameRequirements {
         has_opaque_meshes: bool,
         has_transparent_meshes: bool,
         has_mesh_2d: bool,
+        has_grid_3d: bool,
     ) -> Self {
         let rgba_row_bytes = width * 4;
         let padded_rgba_row_bytes =
@@ -175,7 +230,8 @@ impl FrameRequirements {
             rgba_row_bytes,
             padded_rgba_row_bytes,
             raster_gbuffer: has_opaque_meshes,
-            overlay_hdr: (has_sdf || has_opaque_meshes) && (has_transparent_meshes || has_mesh_2d),
+            overlay_hdr: (has_sdf || has_opaque_meshes)
+                && (has_transparent_meshes || has_mesh_2d || has_grid_3d),
         }
     }
 }
@@ -192,6 +248,7 @@ pub(super) struct FrameOptions {
 pub(super) struct PreparedFrame {
     pub(super) scene: PreparedScene,
     pub(super) sdf_primitives: Vec<GpuSdfPrimitive>,
+    pub(super) grids_3d: Vec<GpuGrid3D>,
     pub(super) mesh_2d: PreparedMesh2D,
     pub(super) plan: RecordingPlan,
     pub(super) outputs: RenderOutputs,
@@ -210,6 +267,11 @@ impl PreparedFrame {
             .sdf_primitives
             .iter()
             .map(|prepared| GpuSdfPrimitive::encode(prepared.primitive, prepared.material_index))
+            .collect::<Vec<_>>();
+        let grids_3d = scene
+            .grids_3d
+            .iter()
+            .map(GpuGrid3D::from)
             .collect::<Vec<_>>();
         let has_opaque_meshes = scene
             .mesh_draws_3d
@@ -232,6 +294,7 @@ impl PreparedFrame {
                 .all(|instance| instance.aa_params[2] > 0.5),
             has_opaque_meshes,
             has_transparent_meshes,
+            has_grid_3d: !grids_3d.is_empty(),
             outputs: options.outputs,
             background_color: scene.background_color,
             camera_clip: (scene.camera_uniform.has_clip != 0).then_some([
@@ -253,6 +316,7 @@ impl PreparedFrame {
         Self {
             scene,
             sdf_primitives,
+            grids_3d,
             mesh_2d,
             plan,
             outputs: options.outputs,
@@ -263,28 +327,46 @@ impl PreparedFrame {
 
 #[cfg(test)]
 mod tests {
-    use super::FrameRequirements;
+    use super::{FrameRequirements, GpuGrid3D};
+
+    #[test]
+    fn grid_shader_abi_is_nine_vec4_values() {
+        assert_eq!(std::mem::size_of::<GpuGrid3D>(), 9 * 16);
+    }
 
     #[test]
     fn rgba_rows_are_aligned_for_buffer_copies() {
-        let requirements = FrameRequirements::from_features(1921, 1080, false, false, false, false);
+        let requirements =
+            FrameRequirements::from_features(1921, 1080, false, false, false, false, false);
         assert_eq!(requirements.rgba_row_bytes, 7684);
         assert_eq!(requirements.padded_rgba_row_bytes, 7936);
     }
 
     #[test]
     fn target_features_follow_surface_composition() {
-        let sdf_with_2d = FrameRequirements::from_features(320, 180, true, false, false, true);
+        let sdf_with_2d =
+            FrameRequirements::from_features(320, 180, true, false, false, true, false);
         assert!(!sdf_with_2d.raster_gbuffer);
         assert!(sdf_with_2d.overlay_hdr);
 
-        let opaque_only = FrameRequirements::from_features(320, 180, false, true, false, false);
+        let opaque_only =
+            FrameRequirements::from_features(320, 180, false, true, false, false, false);
         assert!(opaque_only.raster_gbuffer);
         assert!(!opaque_only.overlay_hdr);
 
         let transparent_only =
-            FrameRequirements::from_features(320, 180, false, false, true, false);
+            FrameRequirements::from_features(320, 180, false, false, true, false, false);
         assert!(!transparent_only.raster_gbuffer);
         assert!(!transparent_only.overlay_hdr);
+
+        let grid_only =
+            FrameRequirements::from_features(320, 180, false, false, false, false, true);
+        assert!(!grid_only.raster_gbuffer);
+        assert!(!grid_only.overlay_hdr);
+
+        let sdf_with_grid =
+            FrameRequirements::from_features(320, 180, true, false, false, false, true);
+        assert!(!sdf_with_grid.raster_gbuffer);
+        assert!(sdf_with_grid.overlay_hdr);
     }
 }

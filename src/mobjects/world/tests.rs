@@ -232,6 +232,8 @@ impl RenderVisitor for TransformRecorder {
     }
 
     fn push_surface_3d(&mut self, _surface: Surface3DSubmission<'_>) {}
+
+    fn push_grid_3d(&mut self, _grid: crate::mobjects::Grid3DSubmission<'_>) {}
 }
 
 #[test]

@@ -4,6 +4,7 @@ use super::frame::{FrameExecutionPlan, GPU_TIMESTAMP_COUNT};
 pub struct RendererStats {
     pub mesh_3d_opaque_draw_calls: u32,
     pub mesh_3d_transparent_draw_calls: u32,
+    pub grid_3d_draw_calls: u32,
     pub mesh_2d_draw_calls: u32,
     pub mesh_2d_instances: u32,
     pub mesh_2d_geometry_uploads: u32,

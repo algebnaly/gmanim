@@ -11,9 +11,9 @@ use super::super::{Image, Mesh3DDraw};
 use super::plan::RecordingPlan;
 use super::{
     ColorAttachment, ColorLoad, ColorRasterPass, CommandRecorder, DeferredOpaquePass,
-    DepthAttachment, DepthLoad, GeometryUploadBuffers2D, Mesh2DBindings, Mesh2DPass,
-    Mesh3DBindings, Mesh3DPass, OutputPasses, RasterAttachment, RasterRegion, TransparentDepthPass,
-    VideoOutputPass,
+    DepthAttachment, DepthLoad, GeometryUploadBuffers2D, Grid3DBindings, Mesh2DBindings,
+    Mesh2DPass, Mesh3DBindings, Mesh3DPass, OutputPasses, RasterAttachment, RasterRegion,
+    TransparentDepthPass, VideoOutputPass,
 };
 
 const COLOR_ATTACHMENT_STATE: TrackedImageState = TrackedImageState {
@@ -55,6 +55,7 @@ pub(in crate::vulkan::renderer) struct FrameRecord<'a> {
     pub(in crate::vulkan::renderer) uploaded: UploadedFrame,
     pub(in crate::vulkan::renderer) outputs: RenderOutputs,
     pub(in crate::vulkan::renderer) mesh_draws_3d: &'a [Mesh3DDraw],
+    pub(in crate::vulkan::renderer) grid_count_3d: u32,
     pub(in crate::vulkan::renderer) mesh_batches_2d: &'a [PreparedMesh2DBatch],
     pub(in crate::vulkan::renderer) geometry_uploads_2d: &'a [GeometryUpload2D],
     pub(in crate::vulkan::renderer) uploads_2d: GeometryUploadBuffers2D,
@@ -77,6 +78,7 @@ impl<'a> CommandRecorder<'a> {
             uploaded,
             outputs,
             mesh_draws_3d,
+            grid_count_3d,
             mesh_batches_2d,
             geometry_uploads_2d,
             uploads_2d,
@@ -107,6 +109,11 @@ impl<'a> CommandRecorder<'a> {
             index_buffer: mesh_2d_index,
             instance_buffer: mesh_2d_instance,
             instance_offset: uploaded.instance_2d_offset,
+        };
+        let grids_3d = Grid3DBindings {
+            count: grid_count_3d,
+            descriptor_set: targets.grid_descriptor_set,
+            dynamic_offsets: &uploaded.grid_dynamic_offsets,
         };
 
         unsafe {
@@ -174,7 +181,7 @@ impl<'a> CommandRecorder<'a> {
                         plan.camera_clip,
                         plan.camera_raster_scale,
                     ),
-                    preserve_depth: plan.has_transparent_meshes,
+                    preserve_depth: plan.has_transparent_meshes || plan.has_grid_3d,
                     meshes: mesh_3d,
                 });
                 if !plan.execution.runs_sdf() {
@@ -187,17 +194,19 @@ impl<'a> CommandRecorder<'a> {
                 );
 
                 if plan.has_surface_overlay {
+                    if plan.execution.runs_sdf()
+                        && (plan.has_transparent_meshes || plan.has_grid_3d)
+                    {
+                        transition_image(
+                            self.device,
+                            self.command_buffer,
+                            targets.sdf_depth.vk_image,
+                            vk::ImageAspectFlags::COLOR,
+                            &mut targets.sdf_depth_state,
+                            SDF_DEPTH_FRAGMENT_READ_STATE,
+                        );
+                    }
                     if plan.has_transparent_meshes {
-                        if plan.execution.runs_sdf() {
-                            transition_image(
-                                self.device,
-                                self.command_buffer,
-                                targets.sdf_depth.vk_image,
-                                vk::ImageAspectFlags::COLOR,
-                                &mut targets.sdf_depth_state,
-                                SDF_DEPTH_FRAGMENT_READ_STATE,
-                            );
-                        }
                         self.copy_color_image(
                             targets.surface_hdr.vk_image,
                             &mut targets.surface_hdr_state,
@@ -237,7 +246,7 @@ impl<'a> CommandRecorder<'a> {
                                 view: overlay_depth.view,
                                 state: &mut cache.msaa_depth_texture_state,
                             },
-                            load: if plan.has_transparent_meshes {
+                            load: if plan.has_transparent_meshes || plan.has_grid_3d {
                                 DepthLoad::Load
                             } else {
                                 DepthLoad::Discard
@@ -248,6 +257,7 @@ impl<'a> CommandRecorder<'a> {
                         meshes_3d: plan
                             .has_transparent_meshes
                             .then_some((Mesh3DPass::TransparentColor, mesh_3d)),
+                        grids_3d: plan.has_grid_3d.then_some(grids_3d),
                         meshes_2d: Some((Mesh2DPass::Depth, mesh_2d)),
                     });
                 }
@@ -279,7 +289,7 @@ impl<'a> CommandRecorder<'a> {
                     &uploaded.surface_dynamic_offsets,
                     plan.ssaa_extent(),
                 );
-                if plan.has_transparent_meshes {
+                if plan.has_transparent_meshes || plan.has_grid_3d {
                     transition_image(
                         self.device,
                         self.command_buffer,
@@ -340,6 +350,7 @@ impl<'a> CommandRecorder<'a> {
                         plan.camera_raster_scale,
                     ),
                     meshes_3d: None,
+                    grids_3d: plan.has_grid_3d.then_some(grids_3d),
                     meshes_2d: (!plan.has_transparent_meshes).then_some((
                         if plan.analytic_2d {
                             Mesh2DPass::Analytic
@@ -443,6 +454,7 @@ impl<'a> CommandRecorder<'a> {
                             plan.camera_raster_scale,
                         ),
                         meshes_3d: Some((Mesh3DPass::TransparentColor, mesh_3d)),
+                        grids_3d: None,
                         meshes_2d: Some((Mesh2DPass::Depth, mesh_2d)),
                     });
                 }

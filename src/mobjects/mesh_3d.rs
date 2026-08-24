@@ -61,33 +61,6 @@ impl Default for SphericalGridMaterial {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct PlanarGridMaterial {
-    pub major_color: [f32; 4],
-    pub minor_color: [f32; 4],
-    pub x_axis_color: [f32; 4],
-    pub z_axis_color: [f32; 4],
-    pub cell_size: f32,
-    pub subdivisions: f32,
-    pub line_width_pixels: f32,
-    pub fade_radius: f32,
-}
-
-impl Default for PlanarGridMaterial {
-    fn default() -> Self {
-        Self {
-            major_color: [0.35, 0.40, 0.48, 0.55],
-            minor_color: [0.22, 0.26, 0.32, 0.30],
-            x_axis_color: [0.85, 0.22, 0.22, 0.85],
-            z_axis_color: [0.22, 0.52, 0.88, 0.85],
-            cell_size: 1.0,
-            subdivisions: 5.0,
-            line_width_pixels: 1.2,
-            fade_radius: 35.0,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
 pub struct SphericalPatchMaterial {
     pub directions: [[f32; 3]; 3],
     pub color: [f32; 4],
@@ -108,7 +81,6 @@ pub struct SurfaceMaterial {
     pub alpha_mode: AlphaMode3D,
     pub spherical_grid: Option<SphericalGridMaterial>,
     pub spherical_patch: Option<SphericalPatchMaterial>,
-    pub planar_grid: Option<PlanarGridMaterial>,
 }
 
 impl Default for SurfaceMaterial {
@@ -125,7 +97,6 @@ impl Default for SurfaceMaterial {
             alpha_mode: AlphaMode3D::Opaque,
             spherical_grid: None,
             spherical_patch: None,
-            planar_grid: None,
         }
     }
 }
@@ -656,88 +627,6 @@ impl TriangleMesh3D {
         }
 
         Self::new(vertices, indices)
-    }
-
-    pub fn infinite_grid_plane(
-        plane: &str,
-        center: Point3<GMFloat>,
-        size: GMFloat,
-        planar_grid: PlanarGridMaterial,
-    ) -> Self {
-        let half = (size * 0.5) as f32;
-        let cx = center.x as f32;
-        let cy = center.y as f32;
-        let cz = center.z as f32;
-
-        let (normal, p0, p1, p2, p3) = match plane.to_ascii_lowercase().as_str() {
-            "xz" | "zx" => (
-                [0.0, 1.0, 0.0],
-                [cx - half, cy, cz - half],
-                [cx + half, cy, cz - half],
-                [cx + half, cy, cz + half],
-                [cx - half, cy, cz + half],
-            ),
-            "yz" | "zy" => (
-                [1.0, 0.0, 0.0],
-                [cx, cy - half, cz - half],
-                [cx, cy - half, cz + half],
-                [cx, cy + half, cz + half],
-                [cx, cy + half, cz - half],
-            ),
-            _ => (
-                // "xy" or "yx" (default front plane)
-                [0.0, 0.0, 1.0],
-                [cx - half, cy - half, cz],
-                [cx + half, cy - half, cz],
-                [cx + half, cy + half, cz],
-                [cx - half, cy + half, cz],
-            ),
-        };
-
-        let vertices = vec![
-            Vertex {
-                position: p0,
-                normal,
-                color: [1.0, 1.0, 1.0, 1.0],
-                surface_coord: [-half, -half, 0.0],
-            },
-            Vertex {
-                position: p1,
-                normal,
-                color: [1.0, 1.0, 1.0, 1.0],
-                surface_coord: [half, -half, 0.0],
-            },
-            Vertex {
-                position: p2,
-                normal,
-                color: [1.0, 1.0, 1.0, 1.0],
-                surface_coord: [half, half, 0.0],
-            },
-            Vertex {
-                position: p3,
-                normal,
-                color: [1.0, 1.0, 1.0, 1.0],
-                surface_coord: [-half, half, 0.0],
-            },
-        ];
-
-        let indices = vec![
-            0, 1, 2, 0, 2, 3, // Front
-            0, 2, 1, 0, 3, 2, // Back
-        ];
-
-        let mut mesh = Self::new(vertices, indices);
-        mesh.material.base_color = [0.0, 0.0, 0.0, 0.0];
-        mesh.material.unlit = true;
-        mesh.material.alpha_mode = AlphaMode3D::Blend(Transmission3D {
-            opacity: 1.0,
-            fresnel_opacity: 0.0,
-            absorption: [0.0, 0.0, 0.0],
-            ior: 1.0,
-            backface_opacity_scale: 1.0,
-        });
-        mesh.material.planar_grid = Some(planar_grid);
-        mesh
     }
 }
 

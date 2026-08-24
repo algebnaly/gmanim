@@ -5,6 +5,7 @@ use ash::vk;
 use std::sync::Arc;
 
 use super::mesh_2d::Instance2D;
+use super::prepared_frame::{GRID_INSTANCES_PER_GRID, GRID_LINE_COUNT, GRID_LOD_COUNT};
 
 pub(super) struct PipelineSet {
     device: Arc<ash::Device>,
@@ -13,6 +14,7 @@ pub(super) struct PipelineSet {
     pub(super) surface_lighting_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) surface_composite_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) raster_descriptor_set_layout: vk::DescriptorSetLayout,
+    pub(super) grid_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) raster_descriptor_set_layout_2d: vk::DescriptorSetLayout,
     pub(super) composite_descriptor_set_layout: vk::DescriptorSetLayout,
     pub(super) bloom_descriptor_set_layout: vk::DescriptorSetLayout,
@@ -29,6 +31,7 @@ pub(super) struct PipelineSet {
     pub(super) nv12_pipeline_layout: vk::PipelineLayout,
     pub(super) video_nv12_pipeline_layout: vk::PipelineLayout,
     pub(super) raster_pipeline_layout: vk::PipelineLayout,
+    pub(super) grid_pipeline_layout: vk::PipelineLayout,
     pub(super) raster_pipeline_layout_2d: vk::PipelineLayout,
 
     pub(super) compute_pipeline: vk::Pipeline,
@@ -45,6 +48,7 @@ pub(super) struct PipelineSet {
     pub(super) video_nv12_downsample_pipeline: vk::Pipeline,
     pub(super) yuv444p_pipeline: vk::Pipeline,
     pub(super) raster_pipeline: vk::Pipeline,
+    pub(super) grid_pipeline: vk::Pipeline,
     pub(super) raster_pipeline_transparent_depth: vk::Pipeline,
     pub(super) raster_pipeline_transparent_back: vk::Pipeline,
     pub(super) raster_pipeline_transparent_front: vk::Pipeline,
@@ -120,6 +124,13 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         );
         let compute_shader = compile_wgsl_full(&ctx, compute_shader_source);
         let raster_shader = compile_wgsl_full(&ctx, &raster_shader_source);
+        let grid_shader_source = format!(
+            "const LINE_COUNT: u32 = {GRID_LINE_COUNT}u;\n\
+             const LOD_COUNT: u32 = {GRID_LOD_COUNT}u;\n\
+             const INSTANCES_PER_GRID: u32 = {GRID_INSTANCES_PER_GRID}u;\n{}",
+            include_str!("../grid_shader.wgsl"),
+        );
+        let grid_shader = compile_wgsl_full(&ctx, &grid_shader_source);
         let surface_resolve_shader = compile_wgsl_full(&ctx, &surface_resolve_shader_source);
         let surface_lighting_shader = compile_wgsl_full(&ctx, &surface_lighting_shader_source);
         let surface_composite_shader =
@@ -661,6 +672,32 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .unwrap()
         };
 
+        let grid_bindings = [
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(1)
+                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::VERTEX),
+            vk::DescriptorSetLayoutBinding::default()
+                .binding(2)
+                .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
+                .descriptor_count(1)
+                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+        ];
+        let grid_descriptor_set_layout = unsafe {
+            ctx.device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default().bindings(&grid_bindings),
+                    None,
+                )
+                .unwrap()
+        };
+
         let compute_pipeline_layout_info = vk::PipelineLayoutCreateInfo {
             s_type: vk::StructureType::PIPELINE_LAYOUT_CREATE_INFO,
             set_layout_count: 1,
@@ -780,6 +817,15 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let raster_pipeline_layout = unsafe {
             ctx.device
                 .create_pipeline_layout(&raster_pipeline_layout_info, None)
+                .unwrap()
+        };
+        let grid_pipeline_layout = unsafe {
+            ctx.device
+                .create_pipeline_layout(
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(std::slice::from_ref(&grid_descriptor_set_layout)),
+                    None,
+                )
                 .unwrap()
         };
 
@@ -1030,6 +1076,48 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .create_graphics_pipelines(
                     vk::PipelineCache::null(),
                     std::slice::from_ref(&gbuffer_pipeline_info),
+                    None,
+                )
+                .unwrap()[0]
+        };
+        let grid_shader_stages = [
+            vk::PipelineShaderStageCreateInfo {
+                module: grid_shader,
+                ..shader_stages[0]
+            },
+            vk::PipelineShaderStageCreateInfo {
+                module: grid_shader,
+                ..shader_stages[1]
+            },
+        ];
+        let grid_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let grid_depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
+            depth_write_enable: vk::FALSE,
+            depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
+            ..depth_stencil
+        };
+        let grid_blend_attachment = vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::TRUE,
+            ..color_blend_attachment
+        };
+        let grid_color_blending = vk::PipelineColorBlendStateCreateInfo {
+            p_attachments: &grid_blend_attachment,
+            ..color_blending
+        };
+        let grid_pipeline_info = vk::GraphicsPipelineCreateInfo {
+            stage_count: grid_shader_stages.len() as u32,
+            p_stages: grid_shader_stages.as_ptr(),
+            p_vertex_input_state: &grid_vertex_input,
+            p_depth_stencil_state: &grid_depth_stencil,
+            p_color_blend_state: &grid_color_blending,
+            layout: grid_pipeline_layout,
+            ..raster_pipeline_info
+        };
+        let grid_pipeline = unsafe {
+            ctx.device
+                .create_graphics_pipelines(
+                    vk::PipelineCache::null(),
+                    std::slice::from_ref(&grid_pipeline_info),
                     None,
                 )
                 .unwrap()[0]
@@ -1312,6 +1400,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         unsafe {
             ctx.device.destroy_shader_module(compute_shader, None);
             ctx.device.destroy_shader_module(raster_shader, None);
+            ctx.device.destroy_shader_module(grid_shader, None);
             ctx.device
                 .destroy_shader_module(surface_resolve_shader, None);
             ctx.device
@@ -1337,6 +1426,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             surface_lighting_descriptor_set_layout,
             surface_composite_descriptor_set_layout,
             raster_descriptor_set_layout,
+            grid_descriptor_set_layout,
             raster_descriptor_set_layout_2d,
             composite_descriptor_set_layout,
             bloom_descriptor_set_layout,
@@ -1352,6 +1442,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             nv12_pipeline_layout,
             video_nv12_pipeline_layout,
             raster_pipeline_layout,
+            grid_pipeline_layout,
             raster_pipeline_layout_2d,
             compute_pipeline,
             surface_resolve_pipeline,
@@ -1367,6 +1458,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             video_nv12_downsample_pipeline,
             yuv444p_pipeline,
             raster_pipeline,
+            grid_pipeline,
             raster_pipeline_transparent_depth,
             raster_pipeline_transparent_back,
             raster_pipeline_transparent_front,
@@ -1395,6 +1487,7 @@ impl Drop for PipelineSet {
                 self.video_nv12_downsample_pipeline,
                 self.yuv444p_pipeline,
                 self.raster_pipeline,
+                self.grid_pipeline,
                 self.raster_pipeline_transparent_depth,
                 self.raster_pipeline_transparent_back,
                 self.raster_pipeline_transparent_front,
@@ -1414,6 +1507,7 @@ impl Drop for PipelineSet {
                 self.nv12_pipeline_layout,
                 self.video_nv12_pipeline_layout,
                 self.raster_pipeline_layout,
+                self.grid_pipeline_layout,
                 self.raster_pipeline_layout_2d,
             ] {
                 self.device.destroy_pipeline_layout(layout, None);
@@ -1424,6 +1518,7 @@ impl Drop for PipelineSet {
                 self.surface_lighting_descriptor_set_layout,
                 self.surface_composite_descriptor_set_layout,
                 self.raster_descriptor_set_layout,
+                self.grid_descriptor_set_layout,
                 self.raster_descriptor_set_layout_2d,
                 self.composite_descriptor_set_layout,
                 self.bloom_descriptor_set_layout,

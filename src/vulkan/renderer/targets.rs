@@ -21,12 +21,14 @@ pub(super) struct TargetCacheResources<'a> {
     pub(super) camera_buffer: &'a Buffer,
     pub(super) material_buffer_3d: &'a Buffer,
     pub(super) primitive_buffer: &'a Buffer,
+    pub(super) grid_buffer_3d: &'a Buffer,
     pub(super) camera_buffer_2d: &'a Buffer,
     pub(super) nv12_constants_buffer: &'a Buffer,
     pub(super) tone_map_factor_buffer: &'a Buffer,
     pub(super) camera_buffer_stride: u64,
     pub(super) material_buffer_3d_stride: u64,
     pub(super) primitive_buffer_stride: u64,
+    pub(super) grid_buffer_3d_stride: u64,
     pub(super) camera_buffer_2d_stride: u64,
     pub(super) tone_map_factor_stride: u64,
 }
@@ -70,6 +72,7 @@ pub(super) struct RenderTargetSet {
     pub(super) surface_lighting_descriptor_set: vk::DescriptorSet,
     pub(super) surface_composite_descriptor_set: vk::DescriptorSet,
     pub(super) raster_descriptor_set: vk::DescriptorSet,
+    pub(super) grid_descriptor_set: vk::DescriptorSet,
     pub(super) composite_descriptor_set: vk::DescriptorSet,
     pub(super) bloom_descriptor_sets: [vk::DescriptorSet; 3],
 }
@@ -349,6 +352,7 @@ impl TargetCache {
                 surface_lighting_descriptor_set: vk::DescriptorSet::null(),
                 surface_composite_descriptor_set: vk::DescriptorSet::null(),
                 raster_descriptor_set: vk::DescriptorSet::null(),
+                grid_descriptor_set: vk::DescriptorSet::null(),
                 composite_descriptor_set: vk::DescriptorSet::null(),
                 bloom_descriptor_sets: [vk::DescriptorSet::null(); 3],
             }
@@ -524,6 +528,22 @@ impl TargetCache {
             .zip(raster_descriptor_sets.into_iter())
         {
             targets.raster_descriptor_set = descriptor_set;
+        }
+
+        let grid_layouts = [resources.pipelines.grid_descriptor_set_layout; RENDER_FRAME_COUNT];
+        let grid_descriptor_sets = unsafe {
+            resources
+                .ctx
+                .device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(resources.descriptor_pool.handle())
+                        .set_layouts(&grid_layouts),
+                )
+                .unwrap()
+        };
+        for (targets, descriptor_set) in render_targets.iter_mut().zip(grid_descriptor_sets) {
+            targets.grid_descriptor_set = descriptor_set;
         }
 
         let alloc_info_raster_2d = vk::DescriptorSetAllocateInfo {
@@ -823,6 +843,12 @@ impl TargetCache {
             range: resources.primitive_buffer_stride,
             ..Default::default()
         };
+        let grid_buffer_3d_info = vk::DescriptorBufferInfo {
+            buffer: resources.grid_buffer_3d.vk_buffer,
+            offset: 0,
+            range: resources.grid_buffer_3d_stride,
+            ..Default::default()
+        };
 
         let camera_buffer_2d_info = vk::DescriptorBufferInfo {
             buffer: resources.camera_buffer_2d.vk_buffer,
@@ -908,6 +934,30 @@ impl TargetCache {
                     s_type: vk::StructureType::WRITE_DESCRIPTOR_SET,
                     dst_set: targets.raster_descriptor_set,
                     dst_binding: 7,
+                    descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                    descriptor_count: 1,
+                    p_image_info: &sdf_depth_infos[index],
+                    ..Default::default()
+                },
+                vk::WriteDescriptorSet {
+                    dst_set: targets.grid_descriptor_set,
+                    dst_binding: 0,
+                    descriptor_type: vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC,
+                    descriptor_count: 1,
+                    p_buffer_info: &camera_buffer_info,
+                    ..Default::default()
+                },
+                vk::WriteDescriptorSet {
+                    dst_set: targets.grid_descriptor_set,
+                    dst_binding: 1,
+                    descriptor_type: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC,
+                    descriptor_count: 1,
+                    p_buffer_info: &grid_buffer_3d_info,
+                    ..Default::default()
+                },
+                vk::WriteDescriptorSet {
+                    dst_set: targets.grid_descriptor_set,
+                    dst_binding: 2,
                     descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
                     descriptor_count: 1,
                     p_image_info: &sdf_depth_infos[index],
@@ -1506,6 +1556,7 @@ impl Drop for TargetCache {
                 targets.surface_lighting_descriptor_set,
                 targets.surface_composite_descriptor_set,
                 targets.raster_descriptor_set,
+                targets.grid_descriptor_set,
                 targets.composite_descriptor_set,
             ]);
             descriptor_sets.extend(targets.bloom_descriptor_sets);

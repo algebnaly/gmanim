@@ -70,6 +70,13 @@ pub(super) struct Mesh3DBindings<'a> {
 }
 
 #[derive(Clone, Copy)]
+pub(super) struct Grid3DBindings<'a> {
+    pub(super) count: u32,
+    pub(super) descriptor_set: vk::DescriptorSet,
+    pub(super) dynamic_offsets: &'a [u32],
+}
+
+#[derive(Clone, Copy)]
 pub(super) enum Mesh2DPass {
     Depth,
     Depthless,
@@ -181,6 +188,7 @@ pub(super) struct ColorRasterPass<'a> {
     pub(super) depth: Option<DepthAttachment<'a>>,
     pub(super) region: RasterRegion,
     pub(super) meshes_3d: Option<(Mesh3DPass, Mesh3DBindings<'a>)>,
+    pub(super) grids_3d: Option<Grid3DBindings<'a>>,
     pub(super) meshes_2d: Option<(Mesh2DPass, Mesh2DBindings<'a>)>,
 }
 

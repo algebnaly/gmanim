@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial, Vertex};
 use crate::mobjects::object_3d::SdfPrimitive;
-use crate::mobjects::{Rectangle, RectangleId};
+use crate::mobjects::{GridStyle3D, Rectangle, RectangleId};
 
 use super::mesh_2d::{
     CachedRectangle2D, Instance2D, Mesh2DBatch, Mesh2DSubmission, build_ordered_mesh_2d_batches,
@@ -15,6 +15,14 @@ pub(super) struct PreparedSdfPrimitive {
     pub(super) material_index: u32,
 }
 
+pub(super) struct PreparedGrid3D {
+    pub(super) origin: nalgebra::Point3<crate::GMFloat>,
+    pub(super) u_axis: nalgebra::Vector3<crate::GMFloat>,
+    pub(super) v_axis: nalgebra::Vector3<crate::GMFloat>,
+    pub(super) half_extent: crate::GMFloat,
+    pub(super) style: GridStyle3D,
+}
+
 pub(super) struct PreparedScene {
     pub(super) width: u32,
     pub(super) height: u32,
@@ -25,6 +33,7 @@ pub(super) struct PreparedScene {
     pub(super) mesh_vertices: Vec<Vertex>,
     pub(super) mesh_indices: Vec<u32>,
     pub(super) mesh_draws_3d: Vec<Mesh3DDraw>,
+    pub(super) grids_3d: Vec<PreparedGrid3D>,
     pub(super) mesh_batches_2d: Vec<Mesh2DBatch>,
     pub(super) background_color: [f32; 4],
 }
@@ -80,6 +89,7 @@ impl ScenePreparer {
         let mut mesh_indices = Vec::new();
         let mut mesh_draws_3d = Vec::new();
         let mut surface_materials = Vec::new();
+        let mut grids_3d = Vec::new();
 
         let mut mesh_submissions_2d = Vec::new();
         let mut active_rectangles_2d = HashSet::new();
@@ -90,6 +100,7 @@ impl ScenePreparer {
             mesh_indices: &'a mut Vec<u32>,
             mesh_draws_3d: &'a mut Vec<Mesh3DDraw>,
             surface_materials: &'a mut Vec<SurfaceMaterial>,
+            grids_3d: &'a mut Vec<PreparedGrid3D>,
             mesh_submissions_2d: &'a mut Vec<Mesh2DSubmission>,
             rectangle_cache_2d: &'a mut HashMap<RectangleId, CachedRectangle2D>,
             active_rectangles_2d: &'a mut HashSet<RectangleId>,
@@ -227,6 +238,19 @@ impl ScenePreparer {
                     }
                 }
             }
+
+            fn push_grid_3d(&mut self, submission: crate::mobjects::Grid3DSubmission<'_>) {
+                let (u_axis, v_axis) = submission.grid.plane.axes();
+                self.grids_3d.push(PreparedGrid3D {
+                    origin: submission
+                        .transform
+                        .transform_point(&submission.grid.center),
+                    u_axis: submission.transform.transform_vector(&u_axis),
+                    v_axis: submission.transform.transform_vector(&v_axis),
+                    half_extent: submission.grid.size * 0.5,
+                    style: submission.grid.style,
+                });
+            }
         }
 
         let mut collector = VulkanDataCollector {
@@ -235,6 +259,7 @@ impl ScenePreparer {
             mesh_indices: &mut mesh_indices,
             mesh_draws_3d: &mut mesh_draws_3d,
             surface_materials: &mut surface_materials,
+            grids_3d: &mut grids_3d,
             mesh_submissions_2d: &mut mesh_submissions_2d,
             rectangle_cache_2d: &mut self.rectangle_cache_2d,
             active_rectangles_2d: &mut active_rectangles_2d,
@@ -351,6 +376,7 @@ impl ScenePreparer {
             mesh_vertices,
             mesh_indices,
             mesh_draws_3d,
+            grids_3d,
             mesh_batches_2d,
             background_color: bg_clear_color,
         }
@@ -364,9 +390,9 @@ mod tests {
     use nalgebra::{Point3, Vector3};
 
     use super::ScenePreparer;
-    use crate::mobjects::Rectangle;
     use crate::mobjects::mesh_3d::{SurfaceMaterial, TriangleMesh3D};
     use crate::mobjects::object_3d::{SdfPrimitive, Sphere3D};
+    use crate::mobjects::{GridPlane, GridPlane3D, GridStyle3D, Rectangle};
     use crate::{Color, Scene, SceneConfig};
 
     #[test]
@@ -388,6 +414,12 @@ mod tests {
             p3: Point3::new(-1.0, 1.0, 0.0),
             ..Default::default()
         });
+        scene.add(GridPlane3D::new(
+            GridPlane::Xz,
+            Point3::new(0.0, -1.0, 0.0),
+            40.0,
+            GridStyle3D::default(),
+        ));
 
         let config = SceneConfig::default();
         let mut preparer = ScenePreparer::default();
@@ -399,6 +431,10 @@ mod tests {
         assert!(!first.mesh_vertices.is_empty());
         assert!(!first.mesh_indices.is_empty());
         assert_eq!(first.mesh_draws_3d.len(), 1);
+        assert_eq!(first.grids_3d.len(), 1);
+        assert_eq!(first.grids_3d[0].origin, Point3::new(0.0, -1.0, 0.0));
+        assert_eq!(first.grids_3d[0].u_axis, Vector3::x());
+        assert_eq!(first.grids_3d[0].v_axis, Vector3::z());
         assert_eq!(first.mesh_batches_2d.len(), 1);
         assert!(matches!(
             first.sdf_primitives[0].primitive,

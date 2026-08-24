@@ -1,6 +1,7 @@
 pub mod basic;
 pub mod dot;
 pub mod formula;
+pub mod grid_3d;
 pub mod mesh_2d;
 pub mod mesh_3d;
 mod mobject;
@@ -17,14 +18,12 @@ pub mod wrapper_3d;
 
 pub use basic::{Arc, PolyLine, QuadraticBezier, Rectangle, SimpleLine};
 pub use dot::Dot;
-pub use mesh_3d::{
-    PlanarGridMaterial, SphericalGridMaterial, SphericalPatchMaterial, SurfaceMaterial,
-    TriangleMesh3D,
-};
+pub use grid_3d::{GridPlane, GridPlane3D, GridStyle3D};
+pub use mesh_3d::{SphericalGridMaterial, SphericalPatchMaterial, SurfaceMaterial, TriangleMesh3D};
 pub use mobject::Mobject;
 pub use node::{MobjectId, MobjectNode, RectangleId};
 pub use spawn::{NodeBundle, NodeVisual, SpawnPlan};
-pub use submission::{Geometry3DRef, RenderVisitor, Surface3DSubmission};
+pub use submission::{Geometry3DRef, Grid3DSubmission, RenderVisitor, Surface3DSubmission};
 pub use world::{SceneWorld, SceneWorldError};
 
 use crate::{Color, GMFloat};

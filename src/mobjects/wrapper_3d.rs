@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::mobjects::{
-    Geometry3DRef, Mobject, Rectangle, RectangleId, RenderVisitor, Surface3DSubmission,
-    mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D, mesh_3d::Vertex,
+    Geometry3DRef, Grid3DSubmission, Mobject, Rectangle, RectangleId, RenderVisitor,
+    Surface3DSubmission, mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D, mesh_3d::Vertex,
 };
 use nalgebra::Matrix4;
 
@@ -61,6 +61,13 @@ impl RenderVisitor for InterceptorVisitor<'_> {
             geometry: surface.geometry,
             material: surface.material,
             transform: self.wrapper_matrix * surface.transform,
+        });
+    }
+
+    fn push_grid_3d(&mut self, grid: Grid3DSubmission<'_>) {
+        self.real_visitor.push_grid_3d(Grid3DSubmission {
+            grid: grid.grid,
+            transform: self.wrapper_matrix * grid.transform,
         });
     }
 }

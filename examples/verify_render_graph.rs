@@ -1,7 +1,7 @@
 use gmanim_core::{
     Color, RendererConfig, Scene, SceneConfig,
     mobjects::{
-        Rectangle,
+        GridPlane, GridPlane3D, GridStyle3D, Rectangle,
         mesh_3d::{SurfaceMaterial, TriangleMesh3D},
         object_3d::Sphere3D,
     },
@@ -25,6 +25,16 @@ fn render_and_count_non_black(
         .filter(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8)
         .count();
     (stats, non_black)
+}
+
+fn render_coverage(renderer: &mut VulkanRenderer, scene: &Scene, config: &SceneConfig) -> u64 {
+    renderer.render_scene_with_outputs(scene, config, None, RenderOutputs::CPU_RGBA_ONLY);
+    renderer
+        .get_rgba_bytes()
+        .unwrap()
+        .chunks_exact(4)
+        .map(|pixel| u64::from(pixel[3]))
+        .sum()
 }
 
 fn main() {
@@ -201,7 +211,7 @@ fn main() {
     );
 
     let mut single_sample_renderer = VulkanRenderer::new(
-        context,
+        context.clone(),
         RendererConfig {
             msaa_samples: 1,
             ssaa_factor: 1,
@@ -235,6 +245,81 @@ fn main() {
     assert_eq!(stats.mesh_2d_draw_calls, 1);
     assert_eq!(stats.surface_resolve_dispatches, 1);
     assert!(non_black > 100);
+
+    let mut grid = Scene::default();
+    grid.add(GridPlane3D::new(
+        GridPlane::Xy,
+        nalgebra::Point3::new(0.0, 0.0, -3.0),
+        20.0,
+        GridStyle3D {
+            major_color: [0.0; 4],
+            minor_color: [0.0; 4],
+            u_axis_color: [1.0, 0.0, 0.0, 1.0],
+            v_axis_color: [0.0, 1.0, 0.0, 1.0],
+            line_width_pixels: 1.0,
+            ..Default::default()
+        },
+    ));
+    let grid_energy_ssaa_1 = render_coverage(&mut single_sample_renderer, &grid, &config);
+    let mut ssaa_2_renderer = VulkanRenderer::new(
+        context.clone(),
+        RendererConfig {
+            msaa_samples: 1,
+            ssaa_factor: 2,
+            output_color_profile: Default::default(),
+            analytic_aa_2d: true,
+        },
+    );
+    let grid_energy_ssaa_2 = render_coverage(&mut ssaa_2_renderer, &grid, &config);
+    let mut ssaa_4_renderer = VulkanRenderer::new(
+        context,
+        RendererConfig {
+            msaa_samples: 1,
+            ssaa_factor: 4,
+            output_color_profile: Default::default(),
+            analytic_aa_2d: true,
+        },
+    );
+    let grid_energy_ssaa_4 = render_coverage(&mut ssaa_4_renderer, &grid, &config);
+    let grid_energy_ratio_2 = grid_energy_ssaa_2 as f64 / grid_energy_ssaa_1 as f64;
+    let grid_energy_ratio = grid_energy_ssaa_4 as f64 / grid_energy_ssaa_1 as f64;
+    assert!(
+        (0.9..=1.1).contains(&grid_energy_ratio_2) && (0.9..=1.1).contains(&grid_energy_ratio),
+        "procedural-grid coverage must stay stable across SSAA factors: \
+         SSAA 1 energy={grid_energy_ssaa_1}, SSAA 2 energy={grid_energy_ssaa_2}, \
+         SSAA 4 energy={grid_energy_ssaa_4}, ratios={grid_energy_ratio_2:.3}/{grid_energy_ratio:.3}"
+    );
+
+    let mut distant_grid = Scene::default();
+    distant_grid.add(GridPlane3D::new(
+        GridPlane::Xy,
+        nalgebra::Point3::new(0.0, 0.0, -20.0),
+        100.0,
+        GridStyle3D {
+            major_color: [1.0, 1.0, 1.0, 0.6],
+            minor_color: [0.7, 0.7, 0.7, 0.3],
+            u_axis_color: [0.0; 4],
+            v_axis_color: [0.0; 4],
+            cell_size: 1.0,
+            subdivisions: 5,
+            line_width_pixels: 1.0,
+            ..Default::default()
+        },
+    ));
+    let distant_energy_ssaa_1 =
+        render_coverage(&mut single_sample_renderer, &distant_grid, &config);
+    let distant_energy_ssaa_2 = render_coverage(&mut ssaa_2_renderer, &distant_grid, &config);
+    let distant_energy_ssaa_4 = render_coverage(&mut ssaa_4_renderer, &distant_grid, &config);
+    let distant_energy_ratio_2 = distant_energy_ssaa_2 as f64 / distant_energy_ssaa_1 as f64;
+    let distant_energy_ratio = distant_energy_ssaa_4 as f64 / distant_energy_ssaa_1 as f64;
+    assert!(
+        (0.9..=1.1).contains(&distant_energy_ratio_2)
+            && (0.9..=1.1).contains(&distant_energy_ratio),
+        "procedural-grid Nyquist fading must stay stable across SSAA factors: \
+         SSAA 1 energy={distant_energy_ssaa_1}, SSAA 2 energy={distant_energy_ssaa_2}, \
+         SSAA 4 energy={distant_energy_ssaa_4}, \
+         ratios={distant_energy_ratio_2:.3}/{distant_energy_ratio:.3}"
+    );
 
     println!("render graph verification passed");
 }

@@ -7,10 +7,10 @@ use crate::vulkan::context::VulkanContext;
 
 use super::frame::RENDER_FRAME_COUNT;
 use super::mesh_2d::{GeometryUpload2D, Instance2D};
-use super::prepared_frame::GpuSdfPrimitive;
+use super::prepared_frame::{GpuGrid3D, GpuSdfPrimitive};
 use super::{
-    Buffer, CameraUniform, CameraUniform2D, MAX_SURFACE_MATERIALS, MaterialData3D, Nv12Constants,
-    ToneMapConstants, align_up,
+    Buffer, CameraUniform, CameraUniform2D, MAX_GRIDS_3D, MAX_SURFACE_MATERIALS, MaterialData3D,
+    Nv12Constants, ToneMapConstants, align_up,
 };
 
 pub(super) struct FrameBuffers {
@@ -19,6 +19,7 @@ pub(super) struct FrameBuffers {
     pub(super) camera: Buffer,
     pub(super) material_3d: Buffer,
     pub(super) primitive: Buffer,
+    pub(super) grid_3d: Buffer,
     pub(super) nv12_constants: Buffer,
     pub(super) vertex_2d: Buffer,
     pub(super) index_2d: Buffer,
@@ -40,6 +41,7 @@ pub(super) struct FrameBufferStrides {
     pub(super) camera: u64,
     pub(super) material_3d: u64,
     pub(super) primitive: u64,
+    pub(super) grid_3d: u64,
     pub(super) vertex_staging_2d: u64,
     pub(super) index_staging_2d: u64,
     pub(super) instance_2d: u64,
@@ -51,6 +53,7 @@ pub(super) struct FrameUpload<'a> {
     pub(super) camera: &'a CameraUniform,
     pub(super) camera_2d: &'a CameraUniform2D,
     pub(super) primitives: &'a [GpuSdfPrimitive],
+    pub(super) grids_3d: &'a [GpuGrid3D],
     pub(super) materials: &'a [SurfaceMaterial],
     pub(super) mesh_vertices: &'a [Vertex],
     pub(super) mesh_indices: &'a [u32],
@@ -69,6 +72,7 @@ pub(super) struct UploadedFrame {
     pub(super) compute_dynamic_offsets: [u32; 2],
     pub(super) surface_dynamic_offsets: [u32; 2],
     pub(super) raster_dynamic_offsets: [u32; 2],
+    pub(super) grid_dynamic_offsets: [u32; 2],
     pub(super) raster_2d_dynamic_offsets: [u32; 1],
 }
 
@@ -96,6 +100,10 @@ impl FrameBuffers {
             ),
             primitive: align_up(
                 (std::mem::size_of::<GpuSdfPrimitive>() * 10_000) as u64,
+                storage_alignment,
+            ),
+            grid_3d: align_up(
+                (std::mem::size_of::<GpuGrid3D>() * MAX_GRIDS_3D) as u64,
                 storage_alignment,
             ),
             vertex_staging_2d: static_vertex_2d_capacity,
@@ -139,6 +147,12 @@ impl FrameBuffers {
             primitive: Buffer::new(
                 ctx,
                 strides.primitive * frame_count,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                gpu_allocator::MemoryLocation::CpuToGpu,
+            ),
+            grid_3d: Buffer::new(
+                ctx,
+                strides.grid_3d * frame_count,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::CpuToGpu,
             ),
@@ -211,6 +225,7 @@ impl FrameBuffers {
         let camera_offset = self.strides.camera * frame_index;
         let material_offset = self.strides.material_3d * frame_index;
         let primitive_offset = self.strides.primitive * frame_index;
+        let grid_3d_offset = self.strides.grid_3d * frame_index;
         let vertex_staging_2d_offset = self.strides.vertex_staging_2d * frame_index;
         let index_staging_2d_offset = self.strides.index_staging_2d * frame_index;
         let instance_2d_offset = self.strides.instance_2d * frame_index;
@@ -245,6 +260,16 @@ impl FrameBuffers {
             primitive_offset,
             self.strides.primitive,
             upload.primitives,
+        );
+        assert!(
+            upload.grids_3d.len() <= MAX_GRIDS_3D,
+            "3D grid count exceeds {MAX_GRIDS_3D}"
+        );
+        Self::write_slice(
+            &self.grid_3d,
+            grid_3d_offset,
+            self.strides.grid_3d,
+            upload.grids_3d,
         );
         Self::write_slice(
             &self.vertex,
@@ -284,6 +309,7 @@ impl FrameBuffers {
             compute_dynamic_offsets: [camera_offset as u32, primitive_offset as u32],
             surface_dynamic_offsets: [camera_offset as u32, material_offset as u32],
             raster_dynamic_offsets: [camera_offset as u32, material_offset as u32],
+            grid_dynamic_offsets: [camera_offset as u32, grid_3d_offset as u32],
             raster_2d_dynamic_offsets: [camera_2d_offset as u32],
         }
     }

@@ -1,10 +1,11 @@
 use ash::vk;
 
 use super::super::frame::{TrackedImageState, transition_image};
+use super::super::prepared_frame::GRID_INSTANCES_PER_GRID;
 use super::{
     ColorAttachment, ColorLoad, ColorRasterPass, CommandRecorder, DeferredOpaquePass,
-    DepthAttachment, DepthLoad, Mesh2DBindings, Mesh2DPass, Mesh3DBindings, Mesh3DPass,
-    RasterAttachment, TransparentDepthPass,
+    DepthAttachment, DepthLoad, Grid3DBindings, Mesh2DBindings, Mesh2DPass, Mesh3DBindings,
+    Mesh3DPass, RasterAttachment, TransparentDepthPass,
 };
 
 const COLOR_ATTACHMENT_STATE: TrackedImageState = TrackedImageState {
@@ -34,6 +35,7 @@ impl<'a> CommandRecorder<'a> {
             depth,
             region,
             meshes_3d,
+            grids_3d,
             meshes_2d,
         } = pass;
 
@@ -131,6 +133,9 @@ impl<'a> CommandRecorder<'a> {
                 0,
                 std::slice::from_ref(&region.scissor),
             );
+            if let Some(bindings) = grids_3d {
+                self.record_grids_3d(bindings);
+            }
             if let Some((mesh_pass, bindings)) = meshes_3d {
                 self.record_meshes_3d(mesh_pass, bindings);
             }
@@ -138,6 +143,34 @@ impl<'a> CommandRecorder<'a> {
                 self.record_meshes_2d(mesh_pass, bindings);
             }
             self.device.cmd_end_rendering(self.command_buffer);
+        }
+    }
+
+    unsafe fn record_grids_3d(&self, bindings: Grid3DBindings<'_>) {
+        if bindings.count == 0 {
+            return;
+        }
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines.grid_pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipelines.grid_pipeline_layout,
+                0,
+                std::slice::from_ref(&bindings.descriptor_set),
+                bindings.dynamic_offsets,
+            );
+            self.device.cmd_draw(
+                self.command_buffer,
+                6,
+                bindings.count * GRID_INSTANCES_PER_GRID,
+                0,
+                0,
+            );
         }
     }
 

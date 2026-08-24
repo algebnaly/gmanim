@@ -84,6 +84,7 @@ fn test_formula_to_node_bundle() {
             self.vertex_count += rectangle.tessellate().vertices().len();
         }
         fn push_surface_3d(&mut self, _surface: crate::mobjects::Surface3DSubmission<'_>) {}
+        fn push_grid_3d(&mut self, _grid: crate::mobjects::Grid3DSubmission<'_>) {}
     }
 
     let mut visitor = TestVisitor { vertex_count: 0 };

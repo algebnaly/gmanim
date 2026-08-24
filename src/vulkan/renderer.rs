@@ -33,6 +33,7 @@ use textures::{StudioEnvironment, TextureRegistry};
 use upload::{FrameBuffers, FrameUpload};
 
 const MAX_SURFACE_MATERIALS: usize = 10_000;
+const MAX_GRIDS_3D: usize = 1_024;
 
 fn align_up(value: u64, alignment: u64) -> u64 {
     if alignment <= 1 {
@@ -175,54 +176,28 @@ impl From<SurfaceMaterial> for MaterialData3D {
     fn from(material: SurfaceMaterial) -> Self {
         let grid = material.spherical_grid.unwrap_or_default();
         let patch = material.spherical_patch;
-        let planar = material.planar_grid;
         let transmission = match material.alpha_mode {
             AlphaMode3D::Opaque => None,
             AlphaMode3D::Blend(transmission) => Some(transmission),
         };
         let patch_directions = patch.map(|patch| patch.directions).unwrap_or([[0.0; 3]; 3]);
 
-        let (grid_color, patch_color, patch_edge_color, patch_corner_0, patch_params, grid_mode) =
-            if let Some(planar) = planar {
-                (
-                    planar.minor_color,
-                    planar.major_color,
-                    planar.x_axis_color,
-                    planar.z_axis_color,
-                    [
-                        planar.cell_size,
-                        planar.subdivisions,
-                        planar.fade_radius,
-                        planar.line_width_pixels,
-                    ],
-                    2.0,
-                )
-            } else {
-                (
-                    grid.color,
-                    patch.map(|patch| patch.color).unwrap_or([0.0; 4]),
-                    patch.map(|patch| patch.edge_color).unwrap_or([0.0; 4]),
-                    [
-                        patch_directions[0][0],
-                        patch_directions[0][1],
-                        patch_directions[0][2],
-                        0.0,
-                    ],
-                    [
-                        patch
-                            .map(|patch| patch.edge_width_pixels)
-                            .unwrap_or_default(),
-                        0.0,
-                        0.0,
-                        0.0,
-                    ],
-                    if material.spherical_grid.is_some() {
-                        1.0
-                    } else {
-                        0.0
-                    },
-                )
-            };
+        let patch_color = patch.map(|patch| patch.color).unwrap_or([0.0; 4]);
+        let patch_edge_color = patch.map(|patch| patch.edge_color).unwrap_or([0.0; 4]);
+        let patch_corner_0 = [
+            patch_directions[0][0],
+            patch_directions[0][1],
+            patch_directions[0][2],
+            0.0,
+        ];
+        let patch_params = [
+            patch
+                .map(|patch| patch.edge_width_pixels)
+                .unwrap_or_default(),
+            0.0,
+            0.0,
+            0.0,
+        ];
 
         Self {
             base_color: material.base_color,
@@ -232,7 +207,7 @@ impl From<SurfaceMaterial> for MaterialData3D {
                 material.emissive[2],
                 material.emissive_strength,
             ],
-            grid_color,
+            grid_color: grid.color,
             surface: [
                 material.roughness,
                 material.metallic,
@@ -240,29 +215,17 @@ impl From<SurfaceMaterial> for MaterialData3D {
                 if transmission.is_some() { 1.0 } else { 0.0 },
             ],
             grid: [
-                if let Some(planar) = planar {
-                    planar.cell_size
-                } else {
-                    grid.longitude_count
-                },
-                if let Some(planar) = planar {
-                    planar.subdivisions
-                } else {
-                    grid.latitude_count
-                },
-                if let Some(planar) = planar {
-                    planar.line_width_pixels
-                } else {
-                    grid.line_width_pixels
-                },
-                grid_mode,
-            ],
-            grid_backface: [
-                if planar.is_some() {
+                grid.longitude_count,
+                grid.latitude_count,
+                grid.line_width_pixels,
+                if material.spherical_grid.is_some() {
                     1.0
                 } else {
-                    grid.backface_intensity
+                    0.0
                 },
+            ],
+            grid_backface: [
+                grid.backface_intensity,
                 if material.unlit { 1.0 } else { 0.0 },
                 if material.flat_shading { 1.0 } else { 0.0 },
                 0.0,
@@ -542,12 +505,14 @@ impl VulkanRenderer {
             camera_buffer: &self.frame_buffers.camera,
             material_buffer_3d: &self.frame_buffers.material_3d,
             primitive_buffer: &self.frame_buffers.primitive,
+            grid_buffer_3d: &self.frame_buffers.grid_3d,
             camera_buffer_2d: &self.frame_buffers.camera_2d,
             nv12_constants_buffer: &self.frame_buffers.nv12_constants,
             tone_map_factor_buffer: &self.frame_buffers.tone_map_factor,
             camera_buffer_stride: self.frame_buffers.strides.camera,
             material_buffer_3d_stride: self.frame_buffers.strides.material_3d,
             primitive_buffer_stride: self.frame_buffers.strides.primitive,
+            grid_buffer_3d_stride: self.frame_buffers.strides.grid_3d,
             camera_buffer_2d_stride: self.frame_buffers.strides.camera_2d,
             tone_map_factor_stride: self.frame_buffers.strides.tone_map_factor,
         };
@@ -586,6 +551,7 @@ impl VulkanRenderer {
         let PreparedFrame {
             scene,
             sdf_primitives,
+            grids_3d,
             mesh_2d,
             plan,
             outputs,
@@ -618,6 +584,7 @@ impl VulkanRenderer {
                 camera: &scene.camera_uniform,
                 camera_2d: &scene.camera_uniform_2d,
                 primitives: &sdf_primitives,
+                grids_3d: &grids_3d,
                 materials: &scene.surface_materials,
                 mesh_vertices: &scene.mesh_vertices,
                 mesh_indices: &scene.mesh_indices,
@@ -637,6 +604,7 @@ impl VulkanRenderer {
                 uploaded,
                 outputs,
                 mesh_draws_3d: &scene.mesh_draws_3d,
+                grid_count_3d: grids_3d.len() as u32,
                 mesh_batches_2d: &mesh_batches_2d,
                 geometry_uploads_2d: &geometry_uploads_2d,
                 uploads_2d: GeometryUploadBuffers2D {
