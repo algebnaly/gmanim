@@ -483,7 +483,7 @@ impl VulkanRenderer {
         let cache_needs_update = self
             .cache
             .as_ref()
-            .map_or(true, |cache| !cache.satisfies(requirements));
+            .is_none_or(|cache| !cache.satisfies(requirements));
         if !cache_needs_update {
             return;
         }
@@ -532,7 +532,7 @@ impl VulkanRenderer {
         );
         match self.mesh_upload_planner_2d.prepare(arenas, mesh_batches) {
             Ok(prepared) => (prepared, 0),
-            Err(PrepareMesh2DError::StaticArenaExhausted) => {
+            Err(PrepareMesh2DError::StaticGeometry) => {
                 unsafe {
                     self.ctx.device.device_wait_idle().unwrap();
                 }

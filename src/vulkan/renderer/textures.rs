@@ -88,8 +88,10 @@ fn create_studio_environment(ctx: &Arc<VulkanContext>) -> (Image, vk::Sampler) {
     staging.write_bytes(0, bytemuck::cast_slice(&pixels));
     let image = Image::new_with_mip_levels(
         ctx,
-        WIDTH,
-        HEIGHT,
+        vk::Extent2D {
+            width: WIDTH,
+            height: HEIGHT,
+        },
         vk::Format::R32G32B32A32_SFLOAT,
         vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
         vk::ImageAspectFlags::COLOR,

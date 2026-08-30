@@ -128,7 +128,9 @@ fn main() -> io::Result<()> {
 
     let decoded = decode_rgba_frame(output, width, height, frames / 2)?;
     let non_black_pixels = decoded
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] > 8 || px[1] > 8 || px[2] > 8)
         .count();
     if non_black_pixels < (width * height / 40) as usize {

@@ -54,7 +54,7 @@ impl ScenePreparer {
         let output_h = scene_config.output_height as f32;
 
         let bg = scene.background_color.to_array();
-        let bg_clear_color = [bg[0] as f32, bg[1] as f32, bg[2] as f32, bg[3] as f32];
+        let bg_clear_color = [bg[0], bg[1], bg[2], bg[3]];
 
         let (has_clip, clip_x, clip_y, clip_w, clip_h) = match scene.clip_rect {
             Some(crate::ClipRect::Pixel(x, y, w, h)) => {
@@ -193,16 +193,8 @@ impl ScenePreparer {
                             let world_normal =
                                 surface.transform.transform_vector(&normal).normalize();
                             self.mesh_vertices.push(Vertex {
-                                position: [
-                                    world_position.x as f32,
-                                    world_position.y as f32,
-                                    world_position.z as f32,
-                                ],
-                                normal: [
-                                    world_normal.x as f32,
-                                    world_normal.y as f32,
-                                    world_normal.z as f32,
-                                ],
+                                position: [world_position.x, world_position.y, world_position.z],
+                                normal: [world_normal.x, world_normal.y, world_normal.z],
                                 color: vertex.color,
                                 surface_coord: vertex.surface_coord,
                             });
@@ -221,8 +213,7 @@ impl ScenePreparer {
                                     AlphaMode3D::Blend(_)
                                 ),
                                 view_depth: (world_center - self.camera_position)
-                                    .dot(&self.camera_look)
-                                    as f32,
+                                    .dot(&self.camera_look),
                             });
                         }
                     }
@@ -253,22 +244,22 @@ impl ScenePreparer {
             }
         }
 
-        let mut collector = VulkanDataCollector {
-            sdf_primitives: &mut sdf_primitives,
-            mesh_vertices: &mut mesh_vertices,
-            mesh_indices: &mut mesh_indices,
-            mesh_draws_3d: &mut mesh_draws_3d,
-            surface_materials: &mut surface_materials,
-            grids_3d: &mut grids_3d,
-            mesh_submissions_2d: &mut mesh_submissions_2d,
-            rectangle_cache_2d: &mut self.rectangle_cache_2d,
-            active_rectangles_2d: &mut active_rectangles_2d,
-            camera_position: scene.camera.position,
-            camera_look: scene.camera.look_at_dir(),
-        };
-
-        scene.world.submit_to_renderer(&mut collector);
-        drop(collector);
+        {
+            let mut collector = VulkanDataCollector {
+                sdf_primitives: &mut sdf_primitives,
+                mesh_vertices: &mut mesh_vertices,
+                mesh_indices: &mut mesh_indices,
+                mesh_draws_3d: &mut mesh_draws_3d,
+                surface_materials: &mut surface_materials,
+                grids_3d: &mut grids_3d,
+                mesh_submissions_2d: &mut mesh_submissions_2d,
+                rectangle_cache_2d: &mut self.rectangle_cache_2d,
+                active_rectangles_2d: &mut active_rectangles_2d,
+                camera_position: scene.camera.position,
+                camera_look: scene.camera.look_at_dir(),
+            };
+            scene.world.submit_to_renderer(&mut collector);
+        }
         self.rectangle_cache_2d
             .retain(|id, _| active_rectangles_2d.contains(id));
         let mesh_batches_2d = build_ordered_mesh_2d_batches(mesh_submissions_2d);
@@ -276,33 +267,33 @@ impl ScenePreparer {
         let camera_uniform_2d = CameraUniform2D {
             width: output_w,
             height: output_h,
-            scale_factor: scene_config.scale_factor as f32,
+            scale_factor: scene_config.scale_factor,
             _pad: 0.0,
         };
 
         let look = scene.camera.look_at_dir();
         let camera_uniform = CameraUniform {
             pos: [
-                scene.camera.position.x as f32,
-                scene.camera.position.y as f32,
-                scene.camera.position.z as f32,
+                scene.camera.position.x,
+                scene.camera.position.y,
+                scene.camera.position.z,
             ],
             _padding0: 0,
-            look_at: [look.x as f32, look.y as f32, look.z as f32],
+            look_at: [look.x, look.y, look.z],
             _padding1: 0,
             up: [
-                scene.camera.up_dir().x as f32,
-                scene.camera.up_dir().y as f32,
-                scene.camera.up_dir().z as f32,
+                scene.camera.up_dir().x,
+                scene.camera.up_dir().y,
+                scene.camera.up_dir().z,
             ],
-            fov: scene.camera.fov() as f32,
+            fov: scene.camera.fov(),
             width: output_w,
             height: output_h,
             proj_type: scene.camera.proj_type(),
-            ortho_left: scene.camera.ortho_params().0 as f32,
-            ortho_right: scene.camera.ortho_params().1 as f32,
-            ortho_bottom: scene.camera.ortho_params().2 as f32,
-            ortho_top: scene.camera.ortho_params().3 as f32,
+            ortho_left: scene.camera.ortho_params().0,
+            ortho_right: scene.camera.ortho_params().1,
+            ortho_bottom: scene.camera.ortho_params().2,
+            ortho_top: scene.camera.ortho_params().3,
             has_clip: if has_clip { 1 } else { 0 },
             clip_x,
             clip_y,
@@ -315,43 +306,43 @@ impl ScenePreparer {
             proj_mat: {
                 if scene.camera.proj_type() == 0 {
                     crate::camera::Projection::perspective_wgpu(
-                        scene.camera.fov() as f32,
+                        scene.camera.fov(),
                         output_w / output_h,
-                        scene.camera.perspective_params().0 as f32,
-                        scene.camera.perspective_params().1 as f32,
+                        scene.camera.perspective_params().0,
+                        scene.camera.perspective_params().1,
                     )
                 } else {
                     let ortho_params = scene.camera.ortho_params();
                     // ortho_params returns (left, right, bottom, top, near, far) where left/right are often without aspect ratio applied
                     // Actually, let's just use the exact params from the camera
                     crate::camera::Projection::orthographic_wgpu(
-                        ortho_params.0 as f32,
-                        ortho_params.1 as f32,
-                        ortho_params.2 as f32,
-                        ortho_params.3 as f32,
-                        ortho_params.4 as f32,
-                        ortho_params.5 as f32,
+                        ortho_params.0,
+                        ortho_params.1,
+                        ortho_params.2,
+                        ortho_params.3,
+                        ortho_params.4,
+                        ortho_params.5,
                     )
                 }
             },
             light_pos: [
-                scene.point_light.position.x as f32,
-                scene.point_light.position.y as f32,
-                scene.point_light.position.z as f32,
+                scene.point_light.position.x,
+                scene.point_light.position.y,
+                scene.point_light.position.z,
             ],
-            light_intensity: scene.point_light.intensity as f32,
+            light_intensity: scene.point_light.intensity,
             light_color: [
                 scene.point_light.color.r as f32 / 255.0,
                 scene.point_light.color.g as f32 / 255.0,
                 scene.point_light.color.b as f32 / 255.0,
             ],
-            environment_intensity: scene.environment_light.intensity as f32,
+            environment_intensity: scene.environment_light.intensity,
             environment_color: [
                 scene.environment_light.color.r as f32 / 255.0,
                 scene.environment_light.color.g as f32 / 255.0,
                 scene.environment_light.color.b as f32 / 255.0,
             ],
-            environment_rotation: scene.environment_light.rotation_radians as f32,
+            environment_rotation: scene.environment_light.rotation_radians,
             background_color: bg_clear_color,
         };
 

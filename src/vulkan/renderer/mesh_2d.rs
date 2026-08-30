@@ -28,28 +28,28 @@ impl Instance2D {
     ) -> Self {
         Self {
             model_0: [
-                transform[(0, 0)] as f32,
-                transform[(1, 0)] as f32,
-                transform[(2, 0)] as f32,
-                transform[(3, 0)] as f32,
+                transform[(0, 0)],
+                transform[(1, 0)],
+                transform[(2, 0)],
+                transform[(3, 0)],
             ],
             model_1: [
-                transform[(0, 1)] as f32,
-                transform[(1, 1)] as f32,
-                transform[(2, 1)] as f32,
-                transform[(3, 1)] as f32,
+                transform[(0, 1)],
+                transform[(1, 1)],
+                transform[(2, 1)],
+                transform[(3, 1)],
             ],
             model_2: [
-                transform[(0, 2)] as f32,
-                transform[(1, 2)] as f32,
-                transform[(2, 2)] as f32,
-                transform[(3, 2)] as f32,
+                transform[(0, 2)],
+                transform[(1, 2)],
+                transform[(2, 2)],
+                transform[(3, 2)],
             ],
             model_3: [
-                transform[(0, 3)] as f32,
-                transform[(1, 3)] as f32,
-                transform[(2, 3)] as f32,
-                transform[(3, 3)] as f32,
+                transform[(0, 3)],
+                transform[(1, 3)],
+                transform[(2, 3)],
+                transform[(3, 3)],
             ],
             color,
             aa_params,
@@ -101,10 +101,10 @@ pub(super) struct PreparedMesh2DBatch {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum PrepareMesh2DError {
-    StaticArenaExhausted,
-    FrameDynamicArenaExhausted,
-    FrameStagingArenaExhausted,
-    FrameInstanceArenaExhausted,
+    StaticGeometry,
+    FrameGeometry,
+    FrameStaging,
+    FrameInstances,
 }
 
 #[derive(Clone, Copy)]
@@ -148,7 +148,7 @@ impl Mesh2DUploadPlanner {
         arenas: Mesh2DFrameArenas,
         batches: &[Mesh2DBatch],
     ) -> Result<PreparedMesh2D, PrepareMesh2DError> {
-        let (batches, uploads, instances) = prepare_mesh_2d_batches(
+        prepare_mesh_2d_batches(
             &mut self.cache,
             &mut self.static_vertex_used,
             &mut self.static_index_used,
@@ -156,12 +156,7 @@ impl Mesh2DUploadPlanner {
             self.static_index_capacity,
             arenas,
             batches,
-        )?;
-        Ok(PreparedMesh2D {
-            batches,
-            uploads,
-            instances,
-        })
+        )
     }
 
     pub(super) fn frame_arenas(
@@ -216,12 +211,7 @@ pub(super) fn rectangle_analytic_aa_params(rectangle: &Rectangle) -> [f32; 4] {
     } else {
         1.0
     };
-    [
-        (edge_x_len / 2.0) as f32,
-        (edge_y_len / 2.0) as f32,
-        aa_mode,
-        0.0,
-    ]
+    [(edge_x_len / 2.0), (edge_y_len / 2.0), aa_mode, 0.0]
 }
 
 pub(super) fn build_ordered_mesh_2d_batches(
@@ -229,13 +219,12 @@ pub(super) fn build_ordered_mesh_2d_batches(
 ) -> Vec<Mesh2DBatch> {
     let mut batches: Vec<Mesh2DBatch> = Vec::new();
     for submission in submissions {
-        if let Some(last) = batches.last_mut() {
-            if last.dynamic == submission.dynamic
-                && last.geometry.same_geometry(&submission.geometry)
-            {
-                last.instances.push(submission.instance);
-                continue;
-            }
+        if let Some(last) = batches.last_mut()
+            && last.dynamic == submission.dynamic
+            && last.geometry.same_geometry(&submission.geometry)
+        {
+            last.instances.push(submission.instance);
+            continue;
         }
         batches.push(Mesh2DBatch {
             geometry: submission.geometry,
@@ -254,14 +243,7 @@ fn prepare_mesh_2d_batches(
     static_index_capacity: u64,
     arenas: Mesh2DFrameArenas,
     batches: &[Mesh2DBatch],
-) -> Result<
-    (
-        Vec<PreparedMesh2DBatch>,
-        Vec<GeometryUpload2D>,
-        Vec<Instance2D>,
-    ),
-    PrepareMesh2DError,
-> {
+) -> Result<PreparedMesh2D, PrepareMesh2DError> {
     let mut prepared = Vec::with_capacity(batches.len());
     let mut uploads = Vec::new();
     let mut instances = Vec::new();
@@ -288,12 +270,12 @@ fn prepare_mesh_2d_batches(
                 || device_index_offset + index_size
                     > arenas.dynamic_index_base + arenas.dynamic_index_capacity
             {
-                return Err(PrepareMesh2DError::FrameDynamicArenaExhausted);
+                return Err(PrepareMesh2DError::FrameGeometry);
             }
             if staging_vertex_offset + vertex_size > arenas.staging_vertex_capacity
                 || staging_index_offset + index_size > arenas.staging_index_capacity
             {
-                return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
+                return Err(PrepareMesh2DError::FrameStaging);
             }
 
             uploads.push(GeometryUpload2D {
@@ -334,12 +316,12 @@ fn prepare_mesh_2d_batches(
                     if device_vertex_offset + vertex_size > static_vertex_capacity
                         || device_index_offset + index_size > static_index_capacity
                     {
-                        return Err(PrepareMesh2DError::StaticArenaExhausted);
+                        return Err(PrepareMesh2DError::StaticGeometry);
                     }
                     if staging_vertex_offset + vertex_size > arenas.staging_vertex_capacity
                         || staging_index_offset + index_size > arenas.staging_index_capacity
                     {
-                        return Err(PrepareMesh2DError::FrameStagingArenaExhausted);
+                        return Err(PrepareMesh2DError::FrameStaging);
                     }
 
                     let cached = CachedMesh2D {
@@ -380,9 +362,13 @@ fn prepare_mesh_2d_batches(
     }
 
     if std::mem::size_of_val(instances.as_slice()) as u64 > arenas.instance_capacity {
-        return Err(PrepareMesh2DError::FrameInstanceArenaExhausted);
+        return Err(PrepareMesh2DError::FrameInstances);
     }
-    Ok((prepared, uploads, instances))
+    Ok(PreparedMesh2D {
+        batches: prepared,
+        uploads,
+        instances,
+    })
 }
 
 #[cfg(test)]
@@ -510,7 +496,7 @@ mod tests {
 
         assert!(matches!(
             planner.prepare(arenas, &batches),
-            Err(PrepareMesh2DError::StaticArenaExhausted)
+            Err(PrepareMesh2DError::StaticGeometry)
         ));
     }
 }

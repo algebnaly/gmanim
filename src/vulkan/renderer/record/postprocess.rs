@@ -38,8 +38,8 @@ impl<'a> CommandRecorder<'a> {
             );
             self.device.cmd_dispatch(
                 self.command_buffer,
-                (extent.width + 15) / 16,
-                (extent.height + 15) / 16,
+                extent.width.div_ceil(16),
+                extent.height.div_ceil(16),
                 1,
             );
 
@@ -67,8 +67,8 @@ impl<'a> CommandRecorder<'a> {
             );
             self.device.cmd_dispatch(
                 self.command_buffer,
-                (extent.width + 15) / 16,
-                (extent.height + 15) / 16,
+                extent.width.div_ceil(16),
+                extent.height.div_ceil(16),
                 1,
             );
         }

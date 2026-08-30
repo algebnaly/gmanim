@@ -215,11 +215,15 @@ fn render_scene(
 
 fn assert_visible_frame(path: &str, rgba: &[u8]) {
     let visible_pixels = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[..3].iter().copied().max().unwrap_or(0) > 8)
         .count();
     let rgb_energy: u64 = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|pixel| pixel[..3].iter().copied())
         .map(u64::from)
         .sum();
@@ -238,7 +242,7 @@ fn assert_visible_frame(path: &str, rgba: &[u8]) {
 fn write_ppm(path: &str, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
     let mut output = BufWriter::new(File::create(path)?);
     write!(output, "P6\n{width} {height}\n255\n")?;
-    for pixel in rgba.chunks_exact(4) {
+    for pixel in rgba.as_chunks::<4>().0 {
         output.write_all(&pixel[..3])?;
     }
     output.flush()

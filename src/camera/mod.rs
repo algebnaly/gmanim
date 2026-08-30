@@ -339,8 +339,10 @@ impl Camera {
 }
 #[test]
 pub fn test_camera_transform() {
-    let mut r = Camera::default();
-    r.position = Point3::new(0.5, 0.5, -0.5);
+    let mut r = Camera {
+        position: Point3::new(0.5, 0.5, -0.5),
+        ..Default::default()
+    };
     r.set_up_direction(Vector3::new(1.0, 1.0, 0.0));
     let c = r.get_camera_transform_matrix();
     let p1 = Point3::new(1.0, 0.0, 0.0).to_homogeneous();

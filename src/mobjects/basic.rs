@@ -42,16 +42,10 @@ impl Rectangle {
     /// center). These coordinates feed the analytic edge-AA fragment shader;
     /// they are ignored by the legacy MSAA path.
     pub fn tessellate(&self) -> TriangleMesh2D {
-        let center_x = (self.p0.x + self.p1.x + self.p2.x + self.p3.x) as f32 / 4.0;
-        let center_y = (self.p0.y + self.p1.y + self.p2.y + self.p3.y) as f32 / 4.0;
-        let edge_x = [
-            (self.p1.x - self.p0.x) as f32,
-            (self.p1.y - self.p0.y) as f32,
-        ];
-        let edge_y = [
-            (self.p3.x - self.p0.x) as f32,
-            (self.p3.y - self.p0.y) as f32,
-        ];
+        let center_x = (self.p0.x + self.p1.x + self.p2.x + self.p3.x) / 4.0;
+        let center_y = (self.p0.y + self.p1.y + self.p2.y + self.p3.y) / 4.0;
+        let edge_x = [(self.p1.x - self.p0.x), (self.p1.y - self.p0.y)];
+        let edge_y = [(self.p3.x - self.p0.x), (self.p3.y - self.p0.y)];
         let edge_x_len = (edge_x[0] * edge_x[0] + edge_x[1] * edge_x[1])
             .sqrt()
             .max(1e-8);
@@ -65,10 +59,10 @@ impl Rectangle {
         );
 
         let mut builder = Path::builder();
-        builder.begin(point(self.p0.x as f32, self.p0.y as f32));
-        builder.line_to(point(self.p1.x as f32, self.p1.y as f32));
-        builder.line_to(point(self.p2.x as f32, self.p2.y as f32));
-        builder.line_to(point(self.p3.x as f32, self.p3.y as f32));
+        builder.begin(point(self.p0.x, self.p0.y));
+        builder.line_to(point(self.p1.x, self.p1.y));
+        builder.line_to(point(self.p2.x, self.p2.y));
+        builder.line_to(point(self.p3.x, self.p3.y));
         builder.end(true);
         let path = builder.build();
 
@@ -90,7 +84,7 @@ impl Rectangle {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, rect_builder),
                 )
@@ -178,7 +172,7 @@ impl SimpleLine {
 
         let mut builder = Path::builder();
         builder.begin(point(p0_2d.x as f32, p0_2d.y as f32));
-        builder.line_to(point(p1_2d.x as f32, p1_2d.y as f32));
+        builder.line_to(point(p1_2d.x, p1_2d.y));
         builder.end(false);
         let path = builder.build();
 
@@ -190,7 +184,7 @@ impl SimpleLine {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
@@ -267,8 +261,7 @@ impl Arc {
 impl Arc {
     pub fn update_mesh(&mut self) {
         let mut builder = Path::builder();
-        let num_curves =
-            ((self.end_angle - self.start_angle).abs() / (PI as f32 / 2.0)).ceil() as usize;
+        let num_curves = ((self.end_angle - self.start_angle).abs() / (PI / 2.0)).ceil() as usize;
         if num_curves == 0 {
             return;
         }
@@ -277,7 +270,7 @@ impl Arc {
 
         let start_x = self.center_point.x + self.radius * self.start_angle.cos();
         let start_y = self.center_point.y + self.radius * self.start_angle.sin();
-        builder.begin(point(start_x as f32, start_y as f32));
+        builder.begin(point(start_x, start_y));
 
         let mut current_angle = self.start_angle;
         for _ in 0..num_curves {
@@ -300,7 +293,7 @@ impl Arc {
             builder.cubic_bezier_to(
                 point(cp1_x as f32, cp1_y as f32),
                 point(cp2_x as f32, cp2_y as f32),
-                point(end_x as f32, end_y as f32),
+                point(end_x, end_y),
             );
             current_angle = next_angle;
         }
@@ -315,7 +308,7 @@ impl Arc {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
@@ -350,10 +343,10 @@ impl PolyLine {
         let mut first = true;
         for p in &self.points {
             if first {
-                builder.begin(point(p.x as f32, p.y as f32));
+                builder.begin(point(p.x, p.y));
                 first = false;
             } else {
-                builder.line_to(point(p.x as f32, p.y as f32));
+                builder.line_to(point(p.x, p.y));
             }
         }
         builder.end(self.draw_config.fill);
@@ -378,7 +371,7 @@ impl PolyLine {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )
@@ -465,10 +458,7 @@ impl QuadraticBezier {
 
         let mut builder = Path::builder();
         builder.begin(point(a_2d.x as f32, a_2d.y as f32));
-        builder.quadratic_bezier_to(
-            point(b_2d.x as f32, b_2d.y as f32),
-            point(c_2d.x as f32, c_2d.y as f32),
-        );
+        builder.quadratic_bezier_to(point(b_2d.x, b_2d.y), point(c_2d.x, c_2d.y));
         builder.end(false);
         let path = builder.build();
 
@@ -480,7 +470,7 @@ impl QuadraticBezier {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )

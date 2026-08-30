@@ -53,21 +53,31 @@ impl GpuPassTimings {
         };
         Self {
             frame_ms: elapsed_ms(0, 5),
-            geometry_upload_ms: has_geometry_upload
-                .then(|| elapsed_ms(0, 1))
-                .unwrap_or_default(),
-            sdf_ms: plan
-                .runs_sdf()
-                .then(|| elapsed_ms(1, 2))
-                .unwrap_or_default(),
-            raster_ms: plan
-                .runs_raster()
-                .then(|| elapsed_ms(2, 3))
-                .unwrap_or_default(),
-            postprocess_ms: has_postprocess
-                .then(|| elapsed_ms(3, 4))
-                .unwrap_or_default(),
-            output_ms: has_output.then(|| elapsed_ms(4, 5)).unwrap_or_default(),
+            geometry_upload_ms: if has_geometry_upload {
+                elapsed_ms(0, 1)
+            } else {
+                Default::default()
+            },
+            sdf_ms: if plan.runs_sdf() {
+                elapsed_ms(1, 2)
+            } else {
+                Default::default()
+            },
+            raster_ms: if plan.runs_raster() {
+                elapsed_ms(2, 3)
+            } else {
+                Default::default()
+            },
+            postprocess_ms: if has_postprocess {
+                elapsed_ms(3, 4)
+            } else {
+                Default::default()
+            },
+            output_ms: if has_output {
+                elapsed_ms(4, 5)
+            } else {
+                Default::default()
+            },
         }
     }
 }

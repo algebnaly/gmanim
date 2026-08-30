@@ -122,25 +122,25 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             include_str!("../surface_lighting_shader.wgsl"),
             surface_lighting,
         );
-        let compute_shader = compile_wgsl_full(&ctx, compute_shader_source);
-        let raster_shader = compile_wgsl_full(&ctx, &raster_shader_source);
+        let compute_shader = compile_wgsl_full(ctx, compute_shader_source);
+        let raster_shader = compile_wgsl_full(ctx, &raster_shader_source);
         let grid_shader_source = format!(
             "const LINE_COUNT: u32 = {GRID_LINE_COUNT}u;\n\
              const LOD_COUNT: u32 = {GRID_LOD_COUNT}u;\n\
              const INSTANCES_PER_GRID: u32 = {GRID_INSTANCES_PER_GRID}u;\n{}",
             include_str!("../grid_shader.wgsl"),
         );
-        let grid_shader = compile_wgsl_full(&ctx, &grid_shader_source);
-        let surface_resolve_shader = compile_wgsl_full(&ctx, &surface_resolve_shader_source);
-        let surface_lighting_shader = compile_wgsl_full(&ctx, &surface_lighting_shader_source);
+        let grid_shader = compile_wgsl_full(ctx, &grid_shader_source);
+        let surface_resolve_shader = compile_wgsl_full(ctx, &surface_resolve_shader_source);
+        let surface_lighting_shader = compile_wgsl_full(ctx, &surface_lighting_shader_source);
         let surface_composite_shader =
-            compile_wgsl_full(&ctx, include_str!("../surface_composite_shader.wgsl"));
-        let raster_shader_2d = compile_wgsl_full(&ctx, include_str!("../raster_shader_2d.wgsl"));
+            compile_wgsl_full(ctx, include_str!("../surface_composite_shader.wgsl"));
+        let raster_shader_2d = compile_wgsl_full(ctx, include_str!("../raster_shader_2d.wgsl"));
         let raster_shader_2d_analytic =
-            compile_wgsl_full(&ctx, include_str!("../raster_shader_2d_aa.wgsl"));
+            compile_wgsl_full(ctx, include_str!("../raster_shader_2d_aa.wgsl"));
         let compile_output_shader = |source| {
             let source = format!("{output_transform}\n{source}");
-            compile_wgsl_full(&ctx, &source)
+            compile_wgsl_full(ctx, &source)
         };
         let nv12_shader = compile_output_shader(include_str!("../rgba_to_nv12.wgsl"));
         let video_nv12_shader = compile_output_shader(include_str!("../rgba_to_nv12_image.wgsl"));
@@ -148,7 +148,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             compile_output_shader(include_str!("../downsample_to_nv12_image.wgsl"));
         let yuv444p_shader = compile_output_shader(include_str!("../rgba_to_yuv444p.wgsl"));
         let downsample_shader = compile_output_shader(include_str!("../downsample_shader.wgsl"));
-        let bloom_shader = compile_wgsl_full(&ctx, include_str!("../bloom_shader.wgsl"));
+        let bloom_shader = compile_wgsl_full(ctx, include_str!("../bloom_shader.wgsl"));
 
         let composite_bindings = [
             vk::DescriptorSetLayoutBinding {

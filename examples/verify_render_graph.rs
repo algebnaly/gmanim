@@ -21,7 +21,9 @@ fn render_and_count_non_black(
     let non_black = renderer
         .get_rgba_bytes()
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|pixel| pixel[0] > 8 || pixel[1] > 8 || pixel[2] > 8)
         .count();
     (stats, non_black)
@@ -32,7 +34,9 @@ fn render_coverage(renderer: &mut VulkanRenderer, scene: &Scene, config: &SceneC
     renderer
         .get_rgba_bytes()
         .unwrap()
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|pixel| u64::from(pixel[3]))
         .sum()
 }

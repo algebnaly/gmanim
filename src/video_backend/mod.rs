@@ -329,8 +329,9 @@ impl BgraRAWBackend {
     pub fn new(video_config: &VideoConfig) -> Self {
         let file = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .write(true)
-            .open(&format!("{}", video_config.filename))
+            .open(&video_config.filename)
             .unwrap();
         Self {
             file,

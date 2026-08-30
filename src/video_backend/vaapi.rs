@@ -613,19 +613,19 @@ fn convert_rgba_to_nv12(
         };
 
         if let ColorOrder::Nv12 = color_order {
-            let src_y = &rgba[..(width * height) as usize];
-            let src_uv = &rgba[(width * height) as usize..];
+            let src_y = &rgba[..(width * height)];
+            let src_uv = &rgba[(width * height)..];
             for (dst_row, src_row) in y_plane
                 .chunks_exact_mut(y_stride)
-                .zip(src_y.chunks_exact(width as usize))
+                .zip(src_y.chunks_exact(width))
             {
-                dst_row[..width as usize].copy_from_slice(src_row);
+                dst_row[..width].copy_from_slice(src_row);
             }
             for (dst_row, src_row) in uv_plane
                 .chunks_exact_mut(uv_stride)
-                .zip(src_uv.chunks_exact(width as usize))
+                .zip(src_uv.chunks_exact(width))
             {
-                dst_row[..width as usize].copy_from_slice(src_row);
+                dst_row[..width].copy_from_slice(src_row);
             }
             return;
         }
@@ -655,7 +655,7 @@ fn validate_config(config: &VideoConfig) -> io::Result<()> {
     if config.output_width == 0 || config.output_height == 0 {
         return Err(io::Error::other("video dimensions must be positive"));
     }
-    if config.output_width % 2 != 0 || config.output_height % 2 != 0 {
+    if !config.output_width.is_multiple_of(2) || !config.output_height.is_multiple_of(2) {
         return Err(io::Error::other(
             "VAAPI H.264 requires even width and height",
         ));

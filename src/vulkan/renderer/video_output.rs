@@ -42,10 +42,10 @@ impl VideoNv12Image {
             | vk::ImageUsageFlags::from_raw(VK_IMAGE_USAGE_VIDEO_ENCODE_SRC_BIT_KHR_RAW);
         let mut queue_family_indices = Vec::new();
         queue_family_indices.push(ctx.queue_family_index);
-        if let Some(video_queue_family_index) = ctx.video_encode_queue_family_index {
-            if video_queue_family_index != ctx.queue_family_index {
-                queue_family_indices.push(video_queue_family_index);
-            }
+        if let Some(video_queue_family_index) = ctx.video_encode_queue_family_index
+            && video_queue_family_index != ctx.queue_family_index
+        {
+            queue_family_indices.push(video_queue_family_index);
         }
         let sharing_mode = if queue_family_indices.len() > 1 {
             vk::SharingMode::CONCURRENT

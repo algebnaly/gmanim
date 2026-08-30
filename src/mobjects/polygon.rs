@@ -30,9 +30,9 @@ impl Polygon {
         if !self.vertices.is_empty() {
             let mut v_list = self.vertices.iter();
             let start = v_list.next().unwrap();
-            builder.begin(point(start.x as f32, start.y as f32));
+            builder.begin(point(start.x, start.y));
             for p in v_list {
-                builder.line_to(point(p.x as f32, p.y as f32));
+                builder.line_to(point(p.x, p.y));
             }
             builder.end(true);
         } else {
@@ -60,7 +60,7 @@ impl Polygon {
                 .tessellate_path(
                     &path,
                     &StrokeOptions::default()
-                        .with_line_width(self.draw_config.stoke_width as f32)
+                        .with_line_width(self.draw_config.stoke_width)
                         .with_tolerance(0.001),
                     &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
                 )

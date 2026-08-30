@@ -94,8 +94,8 @@ impl<'a> CommandRecorder<'a> {
             );
             self.device.cmd_dispatch(
                 self.command_buffer,
-                (width + 15) / 16,
-                (height + 15) / 16,
+                width.div_ceil(16),
+                height.div_ceil(16),
                 1,
             );
             for (image, state) in [

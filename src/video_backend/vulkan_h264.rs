@@ -713,7 +713,7 @@ pub fn validate_dimensions(width: u32, height: u32) -> io::Result<()> {
             "Vulkan H.264 video dimensions must be non-zero",
         ));
     }
-    if width % 2 != 0 || height % 2 != 0 {
+    if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Vulkan H.264 NV12 video dimensions must be even",
@@ -771,8 +771,10 @@ fn query_h264_encode_profile_support(ctx: &VulkanContext) -> io::Result<bool> {
         .push_next(&mut encode_usage)
         .push_next(&mut h264_profile);
     let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
-    let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
-    encode_caps.p_next = (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast();
+    let mut encode_caps = vk::VideoEncodeCapabilitiesKHR {
+        p_next: (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast(),
+        ..Default::default()
+    };
     let mut video_caps = vk::VideoCapabilitiesKHR::default().push_next(&mut encode_caps);
     let video_queue = khr::video_queue::Instance::new(&ctx.entry, &ctx.instance);
 
@@ -818,8 +820,10 @@ fn create_video_session(
         .push_next(&mut h264_profile);
 
     let mut h264_caps = vk::VideoEncodeH264CapabilitiesKHR::default();
-    let mut encode_caps = vk::VideoEncodeCapabilitiesKHR::default();
-    encode_caps.p_next = (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast();
+    let mut encode_caps = vk::VideoEncodeCapabilitiesKHR {
+        p_next: (&mut h264_caps as *mut vk::VideoEncodeH264CapabilitiesKHR).cast(),
+        ..Default::default()
+    };
     let mut video_caps = vk::VideoCapabilitiesKHR::default().push_next(&mut encode_caps);
     let video_instance = khr::video_queue::Instance::new(&ctx.entry, &ctx.instance);
     let result = unsafe {
@@ -1835,10 +1839,10 @@ fn collect_completed_packets(backend: &mut VulkanH264Backend, wait_all: bool) ->
 }
 
 fn acquire_encode_slot(backend: &mut VulkanH264Backend) -> io::Result<usize> {
-    if let Some(resources) = backend.session.as_ref() {
-        if let Some(index) = resources.slots.iter().position(|slot| !slot.busy) {
-            return Ok(index);
-        }
+    if let Some(resources) = backend.session.as_ref()
+        && let Some(index) = resources.slots.iter().position(|slot| !slot.busy)
+    {
+        return Ok(index);
     }
 
     let ctx = backend

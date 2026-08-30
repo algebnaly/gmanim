@@ -36,23 +36,20 @@ impl SVGPath {
                     if in_subpath {
                         builder.end(false);
                     }
-                    builder.begin(point(p.x as f32, p.y as f32));
+                    builder.begin(point(p.x, p.y));
                     in_subpath = true;
                 }
                 PathElement::LineTo(p) => {
-                    builder.line_to(point(p.x as f32, p.y as f32));
+                    builder.line_to(point(p.x, p.y));
                 }
                 PathElement::QuadTo(p1, p2) => {
-                    builder.quadratic_bezier_to(
-                        point(p1.x as f32, p1.y as f32),
-                        point(p2.x as f32, p2.y as f32),
-                    );
+                    builder.quadratic_bezier_to(point(p1.x, p1.y), point(p2.x, p2.y));
                 }
                 PathElement::CubicTo(p1, p2, p3) => {
                     builder.cubic_bezier_to(
-                        point(p1.x as f32, p1.y as f32),
-                        point(p2.x as f32, p2.y as f32),
-                        point(p3.x as f32, p3.y as f32),
+                        point(p1.x, p1.y),
+                        point(p2.x, p2.y),
+                        point(p3.x, p3.y),
                     );
                 }
                 PathElement::Close => {
@@ -84,7 +81,7 @@ impl SVGPath {
             let _ = stroke_tess.tessellate_path(
                 &path,
                 &StrokeOptions::default()
-                    .with_line_width(self.draw_config.stoke_width as f32)
+                    .with_line_width(self.draw_config.stoke_width)
                     .with_tolerance(0.001),
                 &mut BuffersBuilder::new(&mut geometry, VertexBuilder),
             );
@@ -115,6 +112,12 @@ impl SVGPath {
                 PathElement::Close => {}
             }
         }
+    }
+}
+
+impl Default for SVGPath {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -168,7 +171,7 @@ pub fn open_svg_file(svg_filepath: &str) -> NodeBundle {
     }
 
     for node in tree.root().children() {
-        extract_paths(&node, &mut paths);
+        extract_paths(node, &mut paths);
     }
 
     let scaling_matrix =
@@ -186,16 +189,16 @@ fn map_point(transform: usvg::Transform, x: f32, y: f32) -> nalgebra::Point3<cra
 
 pub fn process_path_element(e: PathSegment, transform: usvg::Transform) -> PathElement {
     match e {
-        PathSegment::MoveTo(p) => PathElement::MoveTo(map_point(transform, p.x as f32, p.y as f32)),
-        PathSegment::LineTo(p) => PathElement::LineTo(map_point(transform, p.x as f32, p.y as f32)),
+        PathSegment::MoveTo(p) => PathElement::MoveTo(map_point(transform, p.x, p.y)),
+        PathSegment::LineTo(p) => PathElement::LineTo(map_point(transform, p.x, p.y)),
         PathSegment::QuadTo(p1, p2) => PathElement::QuadTo(
-            map_point(transform, p1.x as f32, p1.y as f32),
-            map_point(transform, p2.x as f32, p2.y as f32),
+            map_point(transform, p1.x, p1.y),
+            map_point(transform, p2.x, p2.y),
         ),
         PathSegment::CubicTo(p1, p2, p3) => PathElement::CubicTo(
-            map_point(transform, p1.x as f32, p1.y as f32),
-            map_point(transform, p2.x as f32, p2.y as f32),
-            map_point(transform, p3.x as f32, p3.y as f32),
+            map_point(transform, p1.x, p1.y),
+            map_point(transform, p2.x, p2.y),
+            map_point(transform, p3.x, p3.y),
         ),
         PathSegment::Close => PathElement::Close,
     }

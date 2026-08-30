@@ -108,13 +108,20 @@ impl Image {
         aspect_mask: vk::ImageAspectFlags,
         samples: vk::SampleCountFlags,
     ) -> Self {
-        Self::new_with_mip_levels(ctx, width, height, format, usage, aspect_mask, samples, 1)
+        Self::new_with_mip_levels(
+            ctx,
+            vk::Extent2D { width, height },
+            format,
+            usage,
+            aspect_mask,
+            samples,
+            1,
+        )
     }
 
     pub fn new_with_mip_levels(
         ctx: &Arc<VulkanContext>,
-        width: u32,
-        height: u32,
+        extent: vk::Extent2D,
         format: vk::Format,
         usage: vk::ImageUsageFlags,
         aspect_mask: vk::ImageAspectFlags,
@@ -126,8 +133,8 @@ impl Image {
             image_type: vk::ImageType::TYPE_2D,
             format,
             extent: vk::Extent3D {
-                width,
-                height,
+                width: extent.width,
+                height: extent.height,
                 depth: 1,
             },
             mip_levels,
@@ -185,8 +192,8 @@ impl Image {
             allocation: Some(allocation),
             view,
             format,
-            width,
-            height,
+            width: extent.width,
+            height: extent.height,
             mip_levels,
         }
     }

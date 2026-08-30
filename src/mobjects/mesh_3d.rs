@@ -148,12 +148,12 @@ impl TriangleMesh3D {
             color.b as f32 / 255.0,
             color.a as f32 / 255.0,
         ];
-        let hw = size.x as f32;
-        let hh = size.y as f32;
-        let hd = size.z as f32;
-        let cx = center.x as f32;
-        let cy = center.y as f32;
-        let cz = center.z as f32;
+        let hw = size.x;
+        let hh = size.y;
+        let hd = size.z;
+        let cx = center.x;
+        let cy = center.y;
+        let cz = center.z;
 
         let faces = [
             // front
@@ -258,10 +258,10 @@ impl TriangleMesh3D {
             color.a as f32 / 255.0,
         ];
 
-        let cx = center.x as f32;
-        let cy = center.y as f32;
-        let cz = center.z as f32;
-        let r = radius as f32;
+        let cx = center.x;
+        let cy = center.y;
+        let cz = center.z;
+        let r = radius;
 
         for i in 0..=rings {
             let v = i as f32 / rings as f32;
@@ -312,7 +312,6 @@ impl TriangleMesh3D {
         assert!(subdivisions > 0, "subdivisions must be greater than zero");
         let corners = corners.map(|corner| corner.normalize());
         let center = center.cast::<f32>();
-        let radius = radius as f32;
         let color = [
             color.r as f32 / 255.0,
             color.g as f32 / 255.0,
@@ -388,17 +387,17 @@ impl TriangleMesh3D {
         }
         let u1 = axis.cross(&up).normalize();
         let u2 = axis.cross(&u1).normalize();
-        let r = radius as f32;
+        let r = radius;
 
-        let start_f = [start.x as f32, start.y as f32, start.z as f32];
-        let end_f = [end.x as f32, end.y as f32, end.z as f32];
-        let axis_f = [axis.x as f32, axis.y as f32, axis.z as f32];
+        let start_f = [start.x, start.y, start.z];
+        let end_f = [end.x, end.y, end.z];
+        let axis_f = [axis.x, axis.y, axis.z];
 
         // Tube vertices
         for i in 0..=segments {
             let theta = i as f32 * std::f32::consts::PI * 2.0 / segments as f32;
             let p = u1 * (theta.cos() as GMFloat) + u2 * (theta.sin() as GMFloat);
-            let normal = [p.x as f32, p.y as f32, p.z as f32];
+            let normal = [p.x, p.y, p.z];
 
             vertices.push(Vertex {
                 position: [
@@ -446,9 +445,9 @@ impl TriangleMesh3D {
             let normal = [-axis_f[0], -axis_f[1], -axis_f[2]];
             vertices.push(Vertex {
                 position: [
-                    start_f[0] + p.x as f32 * r,
-                    start_f[1] + p.y as f32 * r,
-                    start_f[2] + p.z as f32 * r,
+                    start_f[0] + p.x * r,
+                    start_f[1] + p.y * r,
+                    start_f[2] + p.z * r,
                 ],
                 normal,
                 color: c,
@@ -475,11 +474,7 @@ impl TriangleMesh3D {
             let p = u1 * (theta.cos() as GMFloat) + u2 * (theta.sin() as GMFloat);
             let normal = axis_f;
             vertices.push(Vertex {
-                position: [
-                    end_f[0] + p.x as f32 * r,
-                    end_f[1] + p.y as f32 * r,
-                    end_f[2] + p.z as f32 * r,
-                ],
+                position: [end_f[0] + p.x * r, end_f[1] + p.y * r, end_f[2] + p.z * r],
                 normal,
                 color: c,
                 surface_coord: normal,
@@ -521,16 +516,12 @@ impl TriangleMesh3D {
         }
         let u1 = axis.cross(&up).normalize();
         let u2 = axis.cross(&u1).normalize();
-        let r = radius as f32;
+        let r = radius;
 
-        let base_f = [
-            base_center.x as f32,
-            base_center.y as f32,
-            base_center.z as f32,
-        ];
-        let tip_f = [tip.x as f32, tip.y as f32, tip.z as f32];
-        let axis_f = [axis.x as f32, axis.y as f32, axis.z as f32];
-        let height = (tip - base_center).norm() as f32;
+        let base_f = [base_center.x, base_center.y, base_center.z];
+        let tip_f = [tip.x, tip.y, tip.z];
+        let axis_f = [axis.x, axis.y, axis.z];
+        let height = (tip - base_center).norm();
 
         // 1. Base ring vertices for the cone side
         let base_start_idx = vertices.len() as u32;
@@ -541,17 +532,13 @@ impl TriangleMesh3D {
             // Calculate normal for cone side (points outward and slightly upward)
             let mut normal_vec = p * (height as GMFloat) + axis * (radius as GMFloat);
             normal_vec.normalize_mut();
-            let normal = [
-                normal_vec.x as f32,
-                normal_vec.y as f32,
-                normal_vec.z as f32,
-            ];
+            let normal = [normal_vec.x, normal_vec.y, normal_vec.z];
 
             vertices.push(Vertex {
                 position: [
-                    base_f[0] + p.x as f32 * r,
-                    base_f[1] + p.y as f32 * r,
-                    base_f[2] + p.z as f32 * r,
+                    base_f[0] + p.x * r,
+                    base_f[1] + p.y * r,
+                    base_f[2] + p.z * r,
                 ],
                 normal,
                 color: c,
@@ -568,11 +555,7 @@ impl TriangleMesh3D {
 
             let mut normal_vec = p_mid * (height as GMFloat) + axis * (radius as GMFloat);
             normal_vec.normalize_mut();
-            let normal = [
-                normal_vec.x as f32,
-                normal_vec.y as f32,
-                normal_vec.z as f32,
-            ];
+            let normal = [normal_vec.x, normal_vec.y, normal_vec.z];
 
             vertices.push(Vertex {
                 position: tip_f,
@@ -608,9 +591,9 @@ impl TriangleMesh3D {
             let normal = [-axis_f[0], -axis_f[1], -axis_f[2]];
             vertices.push(Vertex {
                 position: [
-                    base_f[0] + p.x as f32 * r,
-                    base_f[1] + p.y as f32 * r,
-                    base_f[2] + p.z as f32 * r,
+                    base_f[0] + p.x * r,
+                    base_f[1] + p.y * r,
+                    base_f[2] + p.z * r,
                 ],
                 normal,
                 color: c,

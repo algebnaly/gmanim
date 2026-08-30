@@ -125,9 +125,9 @@ impl FfmpegBackend {
 
             if matches!(self.color_order, crate::video_backend::ColorOrder::Yuv444p) {
                 // YUV444p has 3 planes (Y, U, V), each full resolution WxH
-                let y_stride_out = output_frame.stride(0) as usize;
-                let u_stride_out = output_frame.stride(1) as usize;
-                let v_stride_out = output_frame.stride(2) as usize;
+                let y_stride_out = output_frame.stride(0);
+                let u_stride_out = output_frame.stride(1);
+                let v_stride_out = output_frame.stride(2);
                 let stride_in = width as usize;
 
                 let y_out = std::slice::from_raw_parts_mut(
@@ -167,7 +167,7 @@ impl FfmpegBackend {
                 // plane 0: Y
                 // plane 1: UV
 
-                let y_stride_out = output_frame.stride(0) as usize;
+                let y_stride_out = output_frame.stride(0);
                 let y_stride_in = width as usize;
                 let y_out = std::slice::from_raw_parts_mut(
                     output_frame.data_mut(0).as_mut_ptr(),
@@ -179,7 +179,7 @@ impl FfmpegBackend {
                     );
                 }
 
-                let uv_stride_out = output_frame.stride(1) as usize;
+                let uv_stride_out = output_frame.stride(1);
                 let uv_stride_in = width as usize;
                 let uv_out = std::slice::from_raw_parts_mut(
                     output_frame.data_mut(1).as_mut_ptr(),

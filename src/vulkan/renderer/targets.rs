@@ -144,7 +144,7 @@ impl TargetCache {
         };
 
         let raster_normal_depth = Image::new(
-            &resources.ctx,
+            resources.ctx,
             raster_gbuffer_width,
             raster_gbuffer_height,
             vk::Format::R16G16B16A16_SFLOAT,
@@ -153,7 +153,7 @@ impl TargetCache {
             raster_sample_count,
         );
         let raster_albedo = Image::new(
-            &resources.ctx,
+            resources.ctx,
             raster_gbuffer_width,
             raster_gbuffer_height,
             vk::Format::R16G16B16A16_SFLOAT,
@@ -162,7 +162,7 @@ impl TargetCache {
             raster_sample_count,
         );
         let raster_material_id = Image::new(
-            &resources.ctx,
+            resources.ctx,
             raster_gbuffer_width,
             raster_gbuffer_height,
             vk::Format::R16_UINT,
@@ -172,7 +172,7 @@ impl TargetCache {
         );
         let mut render_targets = std::array::from_fn(|_| {
             let texture = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width,
                 height,
                 vk::Format::R8G8B8A8_UNORM,
@@ -185,7 +185,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let sdf_normal_coverage = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width,
                 height,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -194,7 +194,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let sdf_material_id = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width,
                 height,
                 vk::Format::R32_UINT,
@@ -203,7 +203,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let sdf_depth = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width,
                 height,
                 vk::Format::R32_SFLOAT,
@@ -213,7 +213,7 @@ impl TargetCache {
             );
             let resolved_surface_image = |format| {
                 Image::new(
-                    &resources.ctx,
+                    resources.ctx,
                     width * resources.ssaa_factor,
                     height * resources.ssaa_factor,
                     format,
@@ -232,7 +232,7 @@ impl TargetCache {
                 resolved_surface_image(vk::Format::R16G16B16A16_SFLOAT);
             let resolved_material_ids = resolved_surface_image(vk::Format::R32_UINT);
             let surface_hdr = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width * resources.ssaa_factor,
                 height * resources.ssaa_factor,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -244,7 +244,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let overlay_hdr = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 if needs_overlay_hdr {
                     width * resources.ssaa_factor
                 } else {
@@ -261,7 +261,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let resolved_texture = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width * resources.ssaa_factor,
                 height * resources.ssaa_factor,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -273,7 +273,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let scene_color = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width * resources.ssaa_factor,
                 height * resources.ssaa_factor,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -282,7 +282,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let transparent_back_depth = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 width * resources.ssaa_factor,
                 height * resources.ssaa_factor,
                 vk::Format::R32_SFLOAT,
@@ -296,7 +296,7 @@ impl TargetCache {
                 | vk::ImageUsageFlags::SAMPLED
                 | vk::ImageUsageFlags::TRANSFER_DST;
             let bloom_ping = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 bloom_width,
                 bloom_height,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -305,7 +305,7 @@ impl TargetCache {
                 vk::SampleCountFlags::TYPE_1,
             );
             let bloom_pong = Image::new(
-                &resources.ctx,
+                resources.ctx,
                 bloom_width,
                 bloom_height,
                 vk::Format::R16G16B16A16_SFLOAT,
@@ -365,19 +365,19 @@ impl TargetCache {
         let output_buffer_size = (padded_bytes_per_row * height) as u64;
         let output_buffers = [
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 output_buffer_size,
                 vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 output_buffer_size,
                 vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 output_buffer_size,
                 vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
@@ -387,19 +387,19 @@ impl TargetCache {
         let nv12_buffer_size = (width * height * 3 / 2) as u64;
         let nv12_output_buffers = [
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 nv12_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 nv12_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 nv12_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
@@ -409,19 +409,19 @@ impl TargetCache {
         let yuv444p_buffer_size = (width * height * 3) as u64;
         let yuv444p_output_buffers = [
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 yuv444p_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 yuv444p_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
             ),
             Buffer::new(
-                &resources.ctx,
+                resources.ctx,
                 yuv444p_buffer_size,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 gpu_allocator::MemoryLocation::GpuToCpu,
@@ -444,10 +444,7 @@ impl TargetCache {
                 .allocate_descriptor_sets(&alloc_info)
                 .unwrap()
         };
-        for (targets, descriptor_set) in render_targets
-            .iter_mut()
-            .zip(compute_descriptor_sets.into_iter())
-        {
+        for (targets, descriptor_set) in render_targets.iter_mut().zip(compute_descriptor_sets) {
             targets.compute_descriptor_set = descriptor_set;
         }
         let surface_resolve_layouts =
@@ -523,10 +520,7 @@ impl TargetCache {
                 .allocate_descriptor_sets(&alloc_info_raster)
                 .unwrap()
         };
-        for (targets, descriptor_set) in render_targets
-            .iter_mut()
-            .zip(raster_descriptor_sets.into_iter())
-        {
+        for (targets, descriptor_set) in render_targets.iter_mut().zip(raster_descriptor_sets) {
             targets.raster_descriptor_set = descriptor_set;
         }
 
@@ -577,10 +571,7 @@ impl TargetCache {
                 .allocate_descriptor_sets(&alloc_info_composite)
                 .unwrap()
         };
-        for (targets, descriptor_set) in render_targets
-            .iter_mut()
-            .zip(composite_descriptor_sets.into_iter())
-        {
+        for (targets, descriptor_set) in render_targets.iter_mut().zip(composite_descriptor_sets) {
             targets.composite_descriptor_set = descriptor_set;
         }
         let bloom_layouts =
@@ -599,11 +590,10 @@ impl TargetCache {
                 .allocate_descriptor_sets(&bloom_alloc_info)
                 .unwrap()
         };
-        for (targets, sets) in render_targets
-            .iter_mut()
-            .zip(bloom_descriptor_sets.chunks_exact(3))
-        {
-            targets.bloom_descriptor_sets.copy_from_slice(sets);
+        let (bloom_descriptor_sets, remainder) = bloom_descriptor_sets.as_chunks::<3>();
+        debug_assert!(remainder.is_empty());
+        for (targets, sets) in render_targets.iter_mut().zip(bloom_descriptor_sets) {
+            targets.bloom_descriptor_sets = *sets;
         }
 
         let nv12_layouts = [resources.pipelines.nv12_descriptor_set_layout; 3];
@@ -642,10 +632,10 @@ impl TargetCache {
             yuv444p_descriptor_sets_vec.try_into().unwrap();
 
         let mut video_nv12_slots = (0..VIDEO_NV12_IMAGE_COUNT)
-            .map(|_| VideoNv12Slot::new(&resources.ctx, width, height))
+            .map(|_| VideoNv12Slot::new(resources.ctx, width, height))
             .collect::<Vec<_>>();
         let video_nv12_set_layouts =
-            vec![resources.pipelines.video_nv12_descriptor_set_layout; VIDEO_NV12_IMAGE_COUNT];
+            [resources.pipelines.video_nv12_descriptor_set_layout; VIDEO_NV12_IMAGE_COUNT];
         let video_nv12_alloc_info = vk::DescriptorSetAllocateInfo {
             s_type: vk::StructureType::DESCRIPTOR_SET_ALLOCATE_INFO,
             descriptor_pool: resources.descriptor_pool.handle(),
@@ -829,39 +819,33 @@ impl TargetCache {
             buffer: resources.camera_buffer.vk_buffer,
             offset: 0,
             range: resources.camera_buffer_stride,
-            ..Default::default()
         };
         let material_buffer_3d_info = vk::DescriptorBufferInfo {
             buffer: resources.material_buffer_3d.vk_buffer,
             offset: 0,
             range: resources.material_buffer_3d_stride,
-            ..Default::default()
         };
         let buffer_3d_info = vk::DescriptorBufferInfo {
             buffer: resources.primitive_buffer.vk_buffer,
             offset: 0,
             range: resources.primitive_buffer_stride,
-            ..Default::default()
         };
         let grid_buffer_3d_info = vk::DescriptorBufferInfo {
             buffer: resources.grid_buffer_3d.vk_buffer,
             offset: 0,
             range: resources.grid_buffer_3d_stride,
-            ..Default::default()
         };
 
         let camera_buffer_2d_info = vk::DescriptorBufferInfo {
             buffer: resources.camera_buffer_2d.vk_buffer,
             offset: 0,
             range: resources.camera_buffer_2d_stride,
-            ..Default::default()
         };
         let tone_map_factor_infos: Vec<_> = (0..RENDER_FRAME_COUNT)
             .map(|index| vk::DescriptorBufferInfo {
                 buffer: resources.tone_map_factor_buffer.vk_buffer,
                 offset: index as u64 * resources.tone_map_factor_stride,
                 range: resources.tone_map_factor_stride,
-                ..Default::default()
             })
             .collect();
 
@@ -1339,18 +1323,16 @@ impl TargetCache {
             buffer: resources.nv12_constants_buffer.vk_buffer,
             offset: 0,
             range: vk::WHOLE_SIZE,
-            ..Default::default()
         };
 
-        let mut nv12_buffer_infos = Vec::new();
-        for i in 0..3 {
-            nv12_buffer_infos.push(vk::DescriptorBufferInfo {
-                buffer: nv12_output_buffers[i].vk_buffer,
+        let nv12_buffer_infos: Vec<_> = nv12_output_buffers
+            .iter()
+            .map(|buffer| vk::DescriptorBufferInfo {
+                buffer: buffer.vk_buffer,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
-                ..Default::default()
-            });
-        }
+            })
+            .collect();
 
         for i in 0..3 {
             write_descriptor_sets.push(vk::WriteDescriptorSet {
@@ -1382,14 +1364,14 @@ impl TargetCache {
             });
         }
 
-        let mut yuv444p_buffer_infos = Vec::new();
-        for i in 0..3 {
-            yuv444p_buffer_infos.push(vk::DescriptorBufferInfo {
-                buffer: yuv444p_output_buffers[i].vk_buffer,
+        let yuv444p_buffer_infos: Vec<_> = yuv444p_output_buffers
+            .iter()
+            .map(|buffer| vk::DescriptorBufferInfo {
+                buffer: buffer.vk_buffer,
                 offset: 0,
                 range: vk::WHOLE_SIZE,
-            });
-        }
+            })
+            .collect();
 
         for i in 0..3 {
             write_descriptor_sets.push(vk::WriteDescriptorSet {
