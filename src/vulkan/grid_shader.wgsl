@@ -59,6 +59,9 @@ struct VertexOutput {
     @location(7) @interpolate(flat) lod_center: vec2<f32>,
     @location(8) @interpolate(flat) lod_half_span: f32,
     @location(9) @interpolate(flat) plane_normal: vec3<f32>,
+    @location(10) @interpolate(flat) grid_index: u32,
+    @location(11) @interpolate(flat) orientation: u32,
+    @location(12) @interpolate(flat) lod_alphas: vec3<f32>,
 }
 
 fn view_matrix() -> mat4x4<f32> {
@@ -108,6 +111,9 @@ fn disabled_vertex() -> VertexOutput {
     out.lod_center = vec2<f32>(0.0);
     out.lod_half_span = 1.0;
     out.plane_normal = vec3<f32>(0.0, 0.0, 1.0);
+    out.grid_index = 0u;
+    out.orientation = 0u;
+    out.lod_alphas = vec3<f32>(0.0);
     return out;
 }
 
@@ -118,10 +124,11 @@ fn vs_main(
 ) -> VertexOutput {
     let grid_index = instance_index / INSTANCES_PER_GRID;
     let grid_instance = instance_index % INSTANCES_PER_GRID;
-    let lod = grid_instance / (LINE_COUNT * 2u);
-    let orientation_and_line = grid_instance % (LINE_COUNT * 2u);
-    let orientation = orientation_and_line / LINE_COUNT;
-    let line_index = orientation_and_line % LINE_COUNT;
+    let lines_per_orientation = LOD_COUNT * LINE_COUNT;
+    let orientation = grid_instance / lines_per_orientation;
+    let orientation_instance = grid_instance % lines_per_orientation;
+    let lod = orientation_instance / LINE_COUNT;
+    let line_index = orientation_instance % LINE_COUNT;
     let grid = grids[grid_index];
 
     let subdivisions = max(grid.params.y, 1.0);
@@ -200,18 +207,23 @@ fn vs_main(
     let focus_world = grid.origin.xyz
         + grid.u_axis.xyz * camera_u
         + grid.v_axis.xyz * camera_v;
-    let u_pixel_spacing = projected_spacing_pixels(
+    let minor_u_pixel_spacing = projected_spacing_pixels(
         focus_world,
-        grid.u_axis.xyz * spacing,
+        grid.u_axis.xyz * minor_spacing,
         view,
     );
-    let v_pixel_spacing = projected_spacing_pixels(
+    let minor_v_pixel_spacing = projected_spacing_pixels(
         focus_world,
-        grid.v_axis.xyz * spacing,
+        grid.v_axis.xyz * minor_spacing,
         view,
     );
-    let pixel_spacing = min(u_pixel_spacing, v_pixel_spacing);
-    let lod_alpha = smoothstep(2.0, 8.0, pixel_spacing);
+    let minor_pixel_spacing = min(minor_u_pixel_spacing, minor_v_pixel_spacing);
+    let lod_alphas = vec3<f32>(
+        smoothstep(2.0, 8.0, minor_pixel_spacing),
+        smoothstep(2.0, 8.0, minor_pixel_spacing * subdivisions),
+        smoothstep(2.0, 8.0, minor_pixel_spacing * subdivisions * subdivisions),
+    );
+    let lod_alpha = lod_alphas[lod];
 
     let on_axis = abs(line_coordinate) < spacing * 0.01;
     var color = select(grid.major_color, grid.minor_color, lod == 0u);
@@ -241,7 +253,8 @@ fn vs_main(
 
     var out: VertexOutput;
     out.clip_position = vec4<f32>(clip.xy + ndc_offset * clip.w, clip.zw);
-    out.edge_distance = side * half_quad_width;
+    // Interpolate distance in raster pixels so fragment coverage matches SSAA.
+    out.edge_distance = side * half_quad_width * raster_pixel_scale();
     out.local_position = local_position;
     out.world_position = world_position;
     out.color = color;
@@ -251,7 +264,27 @@ fn vs_main(
     out.lod_center = vec2<f32>(camera_u, camera_v);
     out.lod_half_span = half_span;
     out.plane_normal = plane_normal;
+    out.grid_index = grid_index;
+    out.orientation = orientation;
+    out.lod_alphas = lod_alphas;
     return out;
+}
+
+fn raster_pixel_scale() -> f32 {
+    return f32(max(camera.raster_scale, 1u));
+}
+
+fn line_coverage(pixel_distance: f32, line_width: f32) -> f32 {
+    // `pixel_distance` is in raster pixels. SSAA shrinks those pixels, so
+    // convert the output-pixel width the same way `raster_shader.wgsl` does.
+    let scale = raster_pixel_scale();
+    let target_w = max(line_width * scale, 0.01);
+    let half_width = max(target_w * 0.5, 0.01);
+    return 1.0 - smoothstep(
+        max(half_width - 0.75 * scale, 0.0),
+        half_width + 0.75 * scale,
+        abs(pixel_distance),
+    );
 }
 
 @fragment
@@ -272,19 +305,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    let half_width = max(in.line_width * 0.5, 0.01);
-    let coverage = 1.0 - smoothstep(
-        max(half_width - 0.75, 0.0),
-        half_width + 0.75,
-        abs(in.edge_distance),
-    );
+    let coverage = line_coverage(in.edge_distance, in.line_width);
     var distance_alpha = 1.0;
     if in.fade_radius > 0.0 {
         let radius = length(in.local_position) / in.fade_radius;
         distance_alpha = 1.0 - smoothstep(0.65, 1.0, radius);
     }
-    let lod_distance = length(in.local_position - in.lod_center)
-        / max(in.lod_half_span, 1e-4);
+    let lod_radius = length(in.local_position - in.lod_center);
+    let lod_distance = lod_radius / max(in.lod_half_span, 1e-4);
     let lod_range_alpha = 1.0 - smoothstep(0.72, 1.0, lod_distance);
     let view_direction = normalize(camera.pos - in.world_position);
     let angle_alpha = smoothstep(
@@ -292,12 +320,76 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         0.12,
         abs(dot(in.plane_normal, view_direction)),
     );
-    let alpha = in.color.a
-        * in.line_alpha
+    let fade_alpha = in.line_alpha
         * distance_alpha
         * lod_range_alpha
-        * angle_alpha
-        * coverage;
+        * angle_alpha;
+    var alpha = in.color.a * fade_alpha * coverage;
+
+    // Every horizontal LOD is emitted before the vertical LODs. Reconstruct
+    // their accumulated alpha and make the vertical source contribute only the
+    // remainder required by the coverage union.
+    let other_coordinate_gradient = length(vec2<f32>(
+        dpdx(in.local_position.y),
+        dpdy(in.local_position.y),
+    ));
+    if in.orientation == 1u && other_coordinate_gradient > 1e-8 {
+        let grid = grids[in.grid_index];
+        let subdivisions = max(grid.params.y, 1.0);
+        let minor_spacing = grid.params.x / subdivisions;
+        var other_alpha = 0.0;
+        var other_spacing = minor_spacing;
+        for (var other_lod = 0u; other_lod < LOD_COUNT; other_lod += 1u) {
+            let other_coordinate = round(in.local_position.y / other_spacing) * other_spacing;
+            let other_center = round(in.lod_center.y / other_spacing) * other_spacing;
+            let other_half_span = min(
+                grid.extent.x,
+                (f32(LINE_COUNT) - 1.0) * 0.5 * other_spacing,
+            );
+            var other_line_exists = abs(other_coordinate - other_center)
+                    <= other_half_span + other_spacing * 0.01
+                && abs(in.local_position.x - in.lod_center.x) <= other_half_span
+                && abs(other_coordinate) <= grid.extent.x;
+            if other_lod + 1u < LOD_COUNT {
+                let next_spacing = other_spacing * subdivisions;
+                let coarse_coordinate = round(other_coordinate / next_spacing) * next_spacing;
+                other_line_exists = other_line_exists
+                    && abs(other_coordinate - coarse_coordinate) >= other_spacing * 0.01;
+            }
+
+            if other_line_exists {
+                let local_distance = abs(in.local_position.y - other_coordinate);
+                let other_pixel_distance = local_distance / other_coordinate_gradient;
+                let other_coverage = line_coverage(other_pixel_distance, in.line_width);
+                let other_lod_distance = lod_radius / max(other_half_span, 1e-4);
+                let other_range_alpha = 1.0
+                    - smoothstep(0.72, 1.0, other_lod_distance);
+                var other_color = select(
+                    grid.major_color,
+                    grid.minor_color,
+                    other_lod == 0u,
+                );
+                if abs(other_coordinate) < other_spacing * 0.01 {
+                    other_color = grid.u_axis_color;
+                }
+                let candidate_alpha = other_color.a
+                    * in.lod_alphas[other_lod]
+                    * distance_alpha
+                    * other_range_alpha
+                    * angle_alpha
+                    * other_coverage;
+                other_alpha = candidate_alpha + other_alpha * (1.0 - candidate_alpha);
+            }
+            other_spacing *= subdivisions;
+        }
+
+        let union_alpha = max(other_alpha, alpha);
+        alpha = select(
+            0.0,
+            (union_alpha - other_alpha) / max(1.0 - other_alpha, 1e-6),
+            union_alpha > other_alpha + 1e-6,
+        );
+    }
     if alpha <= 1e-4 {
         discard;
     }

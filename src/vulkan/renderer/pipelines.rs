@@ -682,7 +682,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
                 .binding(1)
                 .descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC)
                 .descriptor_count(1)
-                .stage_flags(vk::ShaderStageFlags::VERTEX),
+                .stage_flags(vk::ShaderStageFlags::VERTEX | vk::ShaderStageFlags::FRAGMENT),
             vk::DescriptorSetLayoutBinding::default()
                 .binding(2)
                 .descriptor_type(vk::DescriptorType::SAMPLED_IMAGE)
