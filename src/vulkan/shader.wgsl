@@ -260,12 +260,18 @@ fn calc_normal(p: vec3<f32>) -> vec3<f32> {
     return normalize(n);
 }
 
+fn raster_height() -> f32 {
+    return camera.height * f32(max(camera.raster_scale, 1u));
+}
+
 fn get_pixel_radius(t: f32) -> f32 {
+    // The pixel footprint is measured in raster pixels so the analytic edge
+    // feather spans one raster pixel regardless of the SSAA factor.
     if (camera.proj_type == 0u) {
         let fov_scale = tan(camera.fov * 0.5);
-        return max(0.0001, (2.0 * t * fov_scale) / max(camera.height, 1.0));
+        return max(0.0001, (2.0 * t * fov_scale) / max(raster_height(), 1.0));
     } else {
-        return max(0.0001, (camera.ortho_top - camera.ortho_bottom) / max(camera.height * 2.0, 1.0));
+        return max(0.0001, (camera.ortho_top - camera.ortho_bottom) / max(raster_height() * 2.0, 1.0));
     }
 }
 
@@ -340,9 +346,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         return;
     }
     
+    let scale = f32(max(camera.raster_scale, 1u));
+    let raster_width = camera.width * scale;
+    let raster_h = raster_height();
+
     if (camera.has_clip == 1u) {
-        if (f32(x) < camera.clip_x || f32(x) >= camera.clip_x + camera.clip_w ||
-            f32(y) < camera.clip_y || f32(y) >= camera.clip_y + camera.clip_h) {
+        // Clip rectangles are expressed in output pixels; the dispatch runs
+        // at the SSAA raster resolution.
+        let clip_x = camera.clip_x * scale;
+        let clip_y = camera.clip_y * scale;
+        let clip_w = camera.clip_w * scale;
+        let clip_h = camera.clip_h * scale;
+        if (f32(x) < clip_x || f32(x) >= clip_x + clip_w ||
+            f32(y) < clip_y || f32(y) >= clip_y + clip_h) {
             textureStore(normal_coverage_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(0.0));
             textureStore(material_id_tex, vec2<i32>(i32(x), i32(y)), vec4<u32>(0u));
             textureStore(depth_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(1e20));
@@ -371,8 +387,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let sub_x = (f32(i) + 0.5) / f32(aa) - 0.5;
             let sub_y = (f32(j) + 0.5) / f32(aa) - 0.5;
 
-            let ndc_x = ((f32(x) + 0.5 + sub_x) / camera.width) * 2.0 - 1.0;
-            let ndc_y = 1.0 - ((f32(y) + 0.5 + sub_y) / camera.height) * 2.0;
+            let ndc_x = ((f32(x) + 0.5 + sub_x) / raster_width) * 2.0 - 1.0;
+            let ndc_y = 1.0 - ((f32(y) + 0.5 + sub_y) / raster_h) * 2.0;
             
             var ro_sample = ro;
             var rd_sample = cz;

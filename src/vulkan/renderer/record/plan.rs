@@ -18,7 +18,7 @@ pub(in crate::vulkan::renderer) struct RecordingPlanInput {
     pub(in crate::vulkan::renderer) all_2d_analytic: bool,
     pub(in crate::vulkan::renderer) has_opaque_meshes: bool,
     pub(in crate::vulkan::renderer) has_transparent_meshes: bool,
-    pub(in crate::vulkan::renderer) has_grid_3d: bool,
+    pub(in crate::vulkan::renderer) grid_3d_draw_calls: u32,
     pub(in crate::vulkan::renderer) outputs: RenderOutputs,
     pub(in crate::vulkan::renderer) background_color: [f32; 4],
     pub(in crate::vulkan::renderer) camera_clip: Option<[f32; 4]>,
@@ -40,6 +40,7 @@ pub(in crate::vulkan::renderer) struct RecordingPlan {
     pub(in crate::vulkan::renderer) raster_uses_depth: bool,
     pub(in crate::vulkan::renderer) has_transparent_meshes: bool,
     pub(in crate::vulkan::renderer) has_grid_3d: bool,
+    grid_3d_draw_calls: u32,
     pub(in crate::vulkan::renderer) uses_deferred_raster: bool,
     pub(in crate::vulkan::renderer) has_surface_overlay: bool,
     pub(in crate::vulkan::renderer) background_color: [f32; 4],
@@ -49,15 +50,14 @@ pub(in crate::vulkan::renderer) struct RecordingPlan {
 
 impl RecordingPlan {
     pub(in crate::vulkan::renderer) fn new(input: RecordingPlanInput) -> Self {
+        let has_grid_3d = input.grid_3d_draw_calls != 0;
         // Analytic AA applies only when every rastered 2D instance is a
         // filled rectangle: the frame then renders at output resolution with
         // one sample, and the tone-map downsample factor becomes one.
         // Bloom is excluded for now because its extract pass still derives
         // its sampling grid from the resolved image dimensions.
-        let raster_2d_only = !input.has_sdf
-            && !input.has_mesh_indices
-            && !input.has_grid_3d
-            && input.has_prepared_mesh_2d;
+        let raster_2d_only =
+            !input.has_sdf && !input.has_mesh_indices && !has_grid_3d && input.has_prepared_mesh_2d;
         let analytic_2d =
             raster_2d_only && input.analytic_aa_2d && !input.bloom_enabled && input.all_2d_analytic;
         let execution = if analytic_2d {
@@ -65,7 +65,7 @@ impl RecordingPlan {
         } else {
             FrameExecutionPlan::build(
                 input.has_sdf,
-                input.has_mesh_indices || input.has_prepared_mesh_2d || input.has_grid_3d,
+                input.has_mesh_indices || input.has_prepared_mesh_2d || has_grid_3d,
                 input.ssaa_factor,
             )
         };
@@ -89,14 +89,13 @@ impl RecordingPlan {
             runs_postprocess: execution != FrameExecutionPlan::Empty && !fused_video_downsample,
             bloom_enabled: input.bloom_enabled,
             gpu_profiling: input.gpu_profiling,
-            raster_uses_depth: input.has_mesh_indices || input.has_grid_3d,
+            raster_uses_depth: input.has_mesh_indices || has_grid_3d,
             has_transparent_meshes: input.has_transparent_meshes,
-            has_grid_3d: input.has_grid_3d,
+            has_grid_3d,
+            grid_3d_draw_calls: input.grid_3d_draw_calls,
             uses_deferred_raster,
             has_surface_overlay: (execution.runs_sdf() || uses_deferred_raster)
-                && (input.has_transparent_meshes
-                    || input.has_prepared_mesh_2d
-                    || input.has_grid_3d),
+                && (input.has_transparent_meshes || input.has_prepared_mesh_2d || has_grid_3d),
             background_color: input.background_color,
             camera_clip: input.camera_clip,
             camera_raster_scale: input.camera_raster_scale,
@@ -123,7 +122,7 @@ impl RecordingPlan {
                 .filter(|draw| draw.is_transparent())
                 .count() as u32
                 * 2,
-            grid_3d_draw_calls: self.has_grid_3d as u32,
+            grid_3d_draw_calls: self.grid_3d_draw_calls,
             mesh_2d_draw_calls,
             mesh_2d_instances,
             mesh_2d_geometry_uploads: geometry_uploads_2d.len() as u32,
@@ -205,7 +204,7 @@ mod tests {
             all_2d_analytic: true,
             has_opaque_meshes: false,
             has_transparent_meshes: false,
-            has_grid_3d: false,
+            grid_3d_draw_calls: 0,
             outputs: RenderOutputs::CPU_RGBA_ONLY,
             background_color: [0.0; 4],
             camera_clip: None,
@@ -329,14 +328,14 @@ mod tests {
     #[test]
     fn grid_only_uses_one_depth_tested_raster_pass() {
         let plan = RecordingPlan::new(RecordingPlanInput {
-            has_grid_3d: true,
+            grid_3d_draw_calls: 2,
             ..input()
         });
         assert_eq!(plan.execution, FrameExecutionPlan::RasterDownsample);
         assert!(plan.raster_uses_depth);
         assert!(!plan.has_surface_overlay);
         let stats = plan.stats(&[], 0, 0, &[], 0, RenderOutputs::CPU_RGBA_ONLY);
-        assert_eq!(stats.grid_3d_draw_calls, 1);
+        assert_eq!(stats.grid_3d_draw_calls, 2);
         assert_eq!(stats.raster_passes, 1);
         assert_eq!(stats.depth_attachment_raster_passes, 1);
     }
@@ -345,7 +344,7 @@ mod tests {
     fn sdf_plus_grid_routes_grid_through_surface_overlay() {
         let plan = RecordingPlan::new(RecordingPlanInput {
             has_sdf: true,
-            has_grid_3d: true,
+            grid_3d_draw_calls: 1,
             ..input()
         });
         assert_eq!(plan.execution, FrameExecutionPlan::SdfRasterComposite);

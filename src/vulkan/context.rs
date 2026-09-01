@@ -5,6 +5,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 const VK_QUEUE_VIDEO_ENCODE_BIT_KHR_RAW: u32 = 0x0000_0040;
+const LINE_RASTERIZATION_EXTENSION: &str = "VK_EXT_line_rasterization";
 const OPTIONAL_VIDEO_DEVICE_EXTENSIONS: [&str; 3] = [
     "VK_KHR_video_queue",
     "VK_KHR_video_encode_queue",
@@ -35,6 +36,7 @@ pub enum VulkanContextError {
     TimelineSemaphoreUnsupported,
     Synchronization2Unsupported,
     DynamicRenderingUnsupported,
+    GridLineRasterizationUnsupported,
     TimestampQueriesUnsupported,
     Allocator(String),
 }
@@ -60,6 +62,9 @@ impl fmt::Display for VulkanContextError {
             Self::DynamicRenderingUnsupported => {
                 formatter.write_str("Vulkan dynamic rendering is required but unsupported")
             }
+            Self::GridLineRasterizationUnsupported => formatter.write_str(
+                "VK_EXT_line_rasterization with rectangular wide lines is required but unsupported",
+            ),
             Self::TimestampQueriesUnsupported => {
                 formatter.write_str("GPU timestamp queries are required but unsupported")
             }
@@ -185,14 +190,21 @@ impl VulkanContext {
                             == extension_name.as_bytes()
                     })
                 });
-        let enabled_extension_names: Vec<CString> = if has_all_video_extensions {
-            OPTIONAL_VIDEO_DEVICE_EXTENSIONS
-                .iter()
-                .map(|extension_name| CString::new(*extension_name).unwrap())
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let has_line_rasterization = available_extensions.iter().any(|extension| unsafe {
+            CStr::from_ptr(extension.extension_name.as_ptr()).to_bytes()
+                == LINE_RASTERIZATION_EXTENSION.as_bytes()
+        });
+        if !has_line_rasterization {
+            return Err(VulkanContextError::GridLineRasterizationUnsupported);
+        }
+        let mut enabled_extension_names = vec![CString::new(LINE_RASTERIZATION_EXTENSION).unwrap()];
+        if has_all_video_extensions {
+            enabled_extension_names.extend(
+                OPTIONAL_VIDEO_DEVICE_EXTENSIONS
+                    .iter()
+                    .map(|extension_name| CString::new(*extension_name).unwrap()),
+            );
+        }
         let enabled_extension_ptrs: Vec<*const i8> = enabled_extension_names
             .iter()
             .map(|extension_name| extension_name.as_ptr())
@@ -206,14 +218,18 @@ impl VulkanContext {
             vk::PhysicalDeviceSynchronization2Features::default();
         let mut supported_dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default();
+        let mut supported_line_rasterization =
+            vk::PhysicalDeviceLineRasterizationFeaturesEXT::default();
         let mut physical_device_features = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut supported_descriptor_indexing)
             .push_next(&mut supported_timeline_features)
             .push_next(&mut supported_synchronization2_features)
-            .push_next(&mut supported_dynamic_rendering_features);
+            .push_next(&mut supported_dynamic_rendering_features)
+            .push_next(&mut supported_line_rasterization);
         unsafe {
             instance.get_physical_device_features2(physical_device, &mut physical_device_features);
         }
+        let wide_lines_supported = physical_device_features.features.wide_lines == vk::TRUE;
         if supported_descriptor_indexing.descriptor_binding_partially_bound != vk::TRUE
             || supported_descriptor_indexing.runtime_descriptor_array != vk::TRUE
         {
@@ -228,6 +244,9 @@ impl VulkanContext {
         if supported_dynamic_rendering_features.dynamic_rendering != vk::TRUE {
             return Err(VulkanContextError::DynamicRenderingUnsupported);
         }
+        if !wide_lines_supported || supported_line_rasterization.rectangular_lines != vk::TRUE {
+            return Err(VulkanContextError::GridLineRasterizationUnsupported);
+        }
 
         let mut enabled_descriptor_indexing =
             vk::PhysicalDeviceDescriptorIndexingFeatures::default()
@@ -239,13 +258,18 @@ impl VulkanContext {
             vk::PhysicalDeviceSynchronization2Features::default().synchronization2(true);
         let mut enabled_dynamic_rendering_features =
             vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+        let enabled_core_features = vk::PhysicalDeviceFeatures::default().wide_lines(true);
+        let mut enabled_line_rasterization =
+            vk::PhysicalDeviceLineRasterizationFeaturesEXT::default().rectangular_lines(true);
         let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_infos)
             .enabled_extension_names(&enabled_extension_ptrs)
+            .enabled_features(&enabled_core_features)
             .push_next(&mut enabled_timeline_features)
             .push_next(&mut enabled_synchronization2_features)
             .push_next(&mut enabled_dynamic_rendering_features)
-            .push_next(&mut enabled_descriptor_indexing);
+            .push_next(&mut enabled_descriptor_indexing)
+            .push_next(&mut enabled_line_rasterization);
 
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None)? };
 

@@ -32,15 +32,16 @@ struct CameraUniform {
 }
 
 struct GridData3D {
-    origin: vec4<f32>,
-    u_axis: vec4<f32>,
-    v_axis: vec4<f32>,
+    // The spare component of each geometry vector contains one per-frame invariant.
+    origin: vec4<f32>,     // xyz: origin, w: half extent
+    u_axis: vec4<f32>,     // xyz: basis, w: camera-local u
+    v_axis: vec4<f32>,     // xyz: basis, w: camera-local v
     major_color: vec4<f32>,
     minor_color: vec4<f32>,
     u_axis_color: vec4<f32>,
     v_axis_color: vec4<f32>,
-    params: vec4<f32>,
-    extent: vec4<f32>,
+    params: vec4<f32>,     // line width, fade radius, lod alpha 0, lod alpha 1
+    lod: vec4<f32>,        // lod spacings 0..2, lod alpha 2
 }
 
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
@@ -49,19 +50,17 @@ struct GridData3D {
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) @interpolate(linear) edge_distance: f32,
-    @location(1) @interpolate(perspective) local_position: vec2<f32>,
-    @location(2) @interpolate(perspective) world_position: vec3<f32>,
-    @location(3) @interpolate(flat) color: vec4<f32>,
-    @location(4) @interpolate(flat) line_width: f32,
-    @location(5) @interpolate(flat) line_alpha: f32,
-    @location(6) @interpolate(flat) fade_radius: f32,
-    @location(7) @interpolate(flat) lod_center: vec2<f32>,
-    @location(8) @interpolate(flat) lod_half_span: f32,
-    @location(9) @interpolate(flat) plane_normal: vec3<f32>,
-    @location(10) @interpolate(flat) grid_index: u32,
-    @location(11) @interpolate(flat) orientation: u32,
-    @location(12) @interpolate(flat) lod_alphas: vec3<f32>,
+    @location(0) @interpolate(perspective) local_position: vec2<f32>,
+    @location(1) @interpolate(perspective) world_position: vec3<f32>,
+    @location(2) @interpolate(flat) color: vec4<f32>,
+    @location(3) @interpolate(flat) line_alpha: f32,
+    @location(4) @interpolate(flat) fade_radius: f32,
+    @location(5) @interpolate(flat) lod_center: vec2<f32>,
+    @location(6) @interpolate(flat) lod_half_span: f32,
+    @location(7) @interpolate(flat) plane_normal: vec3<f32>,
+    @location(8) @interpolate(flat) line_start: vec2<f32>,
+    @location(9) @interpolate(flat) line_normal: vec2<f32>,
+    @location(10) @interpolate(flat) line_width: f32,
 }
 
 fn view_matrix() -> mat4x4<f32> {
@@ -80,40 +79,28 @@ fn project(world_position: vec3<f32>, view: mat4x4<f32>) -> vec4<f32> {
     return camera.proj_mat * view * vec4<f32>(world_position, 1.0);
 }
 
-fn local_camera_coordinate(delta: vec3<f32>, axis: vec3<f32>) -> f32 {
-    return dot(delta, axis) / max(dot(axis, axis), 1e-8);
-}
-
-fn projected_spacing_pixels(
-    world_position: vec3<f32>,
-    offset: vec3<f32>,
-    view: mat4x4<f32>,
-) -> f32 {
-    let a = project(world_position, view);
-    let b = project(world_position + offset, view);
-    if a.w <= 1e-4 || b.w <= 1e-4 {
-        return 0.0;
-    }
-    let pixel_scale = vec2<f32>(camera.width, camera.height) * 0.5;
-    return length((b.xy / b.w - a.xy / a.w) * pixel_scale);
+fn screen_position(clip_position: vec4<f32>) -> vec2<f32> {
+    let ndc = clip_position.xy / clip_position.w;
+    let vulkan_ndc = vec2<f32>(ndc.x, -ndc.y);
+    let raster_size = vec2<f32>(camera.width, camera.height)
+        * f32(max(camera.raster_scale, 1u));
+    return (vulkan_ndc * 0.5 + 0.5) * raster_size;
 }
 
 fn disabled_vertex() -> VertexOutput {
     var out: VertexOutput;
     out.clip_position = vec4<f32>(2.0, 2.0, 1.0, 1.0);
-    out.edge_distance = 0.0;
     out.local_position = vec2<f32>(0.0);
     out.world_position = vec3<f32>(0.0);
     out.color = vec4<f32>(0.0);
-    out.line_width = 0.0;
     out.line_alpha = 0.0;
     out.fade_radius = 0.0;
     out.lod_center = vec2<f32>(0.0);
     out.lod_half_span = 1.0;
     out.plane_normal = vec3<f32>(0.0, 0.0, 1.0);
-    out.grid_index = 0u;
-    out.orientation = 0u;
-    out.lod_alphas = vec3<f32>(0.0);
+    out.line_start = vec2<f32>(0.0);
+    out.line_normal = vec2<f32>(0.0, 1.0);
+    out.line_width = 0.0;
     return out;
 }
 
@@ -124,47 +111,62 @@ fn vs_main(
 ) -> VertexOutput {
     let grid_index = instance_index / INSTANCES_PER_GRID;
     let grid_instance = instance_index % INSTANCES_PER_GRID;
-    let lines_per_orientation = LOD_COUNT * LINE_COUNT;
-    let orientation = grid_instance / lines_per_orientation;
-    let orientation_instance = grid_instance % lines_per_orientation;
-    let lod = orientation_instance / LINE_COUNT;
-    let line_index = orientation_instance % LINE_COUNT;
     let grid = grids[grid_index];
+    let extent = grid.origin.w;
+    let camera_u = grid.u_axis.w;
+    let camera_v = grid.v_axis.w;
+    let regular_count = INSTANCES_PER_GRID - AXIS_LINE_COUNT;
 
-    let subdivisions = max(grid.params.y, 1.0);
-    let minor_spacing = grid.params.x / subdivisions;
-    let spacing = minor_spacing * pow(subdivisions, f32(lod));
-    let next_spacing = spacing * subdivisions;
-    let extent = grid.extent.x;
-    let plane_normal = normalize(cross(grid.u_axis.xyz, grid.v_axis.xyz));
-    let view_ray = normalize(camera.look_at);
-    let plane_denominator = dot(plane_normal, view_ray);
-    var focus_position = camera.pos;
-    if abs(plane_denominator) > 1e-4 {
-        let focus_distance = dot(grid.origin.xyz - camera.pos, plane_normal)
-            / plane_denominator;
-        if focus_distance > 0.0 {
-            focus_position = camera.pos + view_ray * focus_distance;
-        }
-    }
-    let camera_delta = focus_position - grid.origin.xyz;
-    let camera_u = local_camera_coordinate(camera_delta, grid.u_axis.xyz);
-    let camera_v = local_camera_coordinate(camera_delta, grid.v_axis.xyz);
-    let line_center = select(camera_v, camera_u, orientation == 1u);
-    let along_center = select(camera_u, camera_v, orientation == 1u);
-    let line_coordinate = round(line_center / spacing) * spacing
-        + (f32(line_index) - (f32(LINE_COUNT) - 1.0) * 0.5) * spacing;
-    let half_span = min(extent, (f32(LINE_COUNT) - 1.0) * 0.5 * spacing);
-    let along_start = max(-extent, along_center - half_span);
-    let along_end = min(extent, along_center + half_span);
+    var orientation: u32;
+    var lod: u32 = 0u;
+    var line_coordinate: f32;
+    var along_start: f32;
+    var along_end: f32;
+    var half_span: f32;
+    var is_world_axis: bool;
 
-    if abs(line_coordinate) > extent || along_start >= along_end {
-        return disabled_vertex();
-    }
-    if lod + 1u < LOD_COUNT {
-        let coarse_coordinate = round(line_coordinate / next_spacing) * next_spacing;
-        if abs(line_coordinate - coarse_coordinate) < spacing * 0.01 {
+    if grid_instance >= regular_count {
+        // Dedicated world-axis strokes. The sliding LOD window used to draw
+        // these only on the coarsest level, so they vanished whenever that
+        // level's alpha collapsed or the origin left the camera-centered set.
+        orientation = grid_instance - regular_count;
+        is_world_axis = true;
+        line_coordinate = 0.0;
+        along_start = -extent;
+        along_end = extent;
+        half_span = extent;
+        if along_start >= along_end {
             return disabled_vertex();
+        }
+    } else {
+        let lines_per_orientation = LOD_COUNT * LINE_COUNT;
+        orientation = grid_instance / lines_per_orientation;
+        let orientation_instance = grid_instance % lines_per_orientation;
+        lod = orientation_instance / LINE_COUNT;
+        let line_index = orientation_instance % LINE_COUNT;
+        let spacing = grid.lod[lod];
+        let next_spacing = grid.lod[min(lod + 1u, LOD_COUNT - 1u)];
+        let line_center = select(camera_v, camera_u, orientation == 1u);
+        let along_center = select(camera_u, camera_v, orientation == 1u);
+        line_coordinate = round(line_center / spacing) * spacing
+            + (f32(line_index) - (f32(LINE_COUNT) - 1.0) * 0.5) * spacing;
+        half_span = min(extent, (f32(LINE_COUNT) - 1.0) * 0.5 * spacing);
+        along_start = max(-extent, along_center - half_span);
+        along_end = min(extent, along_center + half_span);
+        is_world_axis = false;
+
+        if abs(line_coordinate) > extent || along_start >= along_end {
+            return disabled_vertex();
+        }
+        // Origin is owned by the dedicated axis instances.
+        if abs(line_coordinate) < spacing * 0.01 {
+            return disabled_vertex();
+        }
+        if lod + 1u < LOD_COUNT {
+            let coarse_coordinate = round(line_coordinate / next_spacing) * next_spacing;
+            if abs(line_coordinate - coarse_coordinate) < spacing * 0.01 {
+                return disabled_vertex();
+            }
         }
     }
 
@@ -204,82 +206,46 @@ fn vs_main(
         end_clip = project(end_world, view);
     }
 
-    let focus_world = grid.origin.xyz
-        + grid.u_axis.xyz * camera_u
-        + grid.v_axis.xyz * camera_v;
-    let minor_u_pixel_spacing = projected_spacing_pixels(
-        focus_world,
-        grid.u_axis.xyz * minor_spacing,
-        view,
-    );
-    let minor_v_pixel_spacing = projected_spacing_pixels(
-        focus_world,
-        grid.v_axis.xyz * minor_spacing,
-        view,
-    );
-    let minor_pixel_spacing = min(minor_u_pixel_spacing, minor_v_pixel_spacing);
-    let lod_alphas = vec3<f32>(
-        smoothstep(2.0, 8.0, minor_pixel_spacing),
-        smoothstep(2.0, 8.0, minor_pixel_spacing * subdivisions),
-        smoothstep(2.0, 8.0, minor_pixel_spacing * subdivisions * subdivisions),
-    );
-    let lod_alpha = lod_alphas[lod];
-
-    let on_axis = abs(line_coordinate) < spacing * 0.01;
-    var color = select(grid.major_color, grid.minor_color, lod == 0u);
-    if on_axis {
-        color = select(grid.u_axis_color, grid.v_axis_color, orientation == 1u);
-    }
-
-    let corner_index = array<u32, 6>(0u, 1u, 2u, 0u, 2u, 3u)[vertex_index];
-    let at_end = corner_index == 1u || corner_index == 2u;
-    let side = select(-1.0, 1.0, corner_index >= 2u);
-    let clip = select(start_clip, end_clip, at_end);
-    let world_position = select(start_world, end_world, at_end);
-    let local_position = select(start_local, end_local, at_end);
-    let start_ndc = start_clip.xy / start_clip.w;
-    let end_ndc = end_clip.xy / end_clip.w;
-    let screen_direction = (end_ndc - start_ndc) * vec2<f32>(camera.width, camera.height);
+    let at_end = vertex_index != 0u;
+    let start_screen = screen_position(start_clip);
+    let end_screen = screen_position(end_clip);
+    let screen_direction = end_screen - start_screen;
     if length(screen_direction) <= 1e-4 {
         return disabled_vertex();
     }
-    let screen_normal = normalize(vec2<f32>(-screen_direction.y, screen_direction.x));
-    let half_quad_width = max(grid.params.z * 0.5, 0.01) + 1.0;
-    let ndc_offset = screen_normal
-        * side
-        * half_quad_width
-        * 2.0
-        / vec2<f32>(camera.width, camera.height);
+    let line_normal = normalize(vec2<f32>(-screen_direction.y, screen_direction.x));
+    let lod_alphas = vec3<f32>(grid.params.z, grid.params.w, grid.lod.w);
+    var color = select(grid.major_color, grid.minor_color, lod == 0u);
+    var line_alpha = lod_alphas[lod];
+    if is_world_axis {
+        color = select(grid.u_axis_color, grid.v_axis_color, orientation == 1u);
+        line_alpha = 1.0;
+    }
 
     var out: VertexOutput;
-    out.clip_position = vec4<f32>(clip.xy + ndc_offset * clip.w, clip.zw);
-    // Interpolate distance in raster pixels so fragment coverage matches SSAA.
-    out.edge_distance = side * half_quad_width * raster_pixel_scale();
-    out.local_position = local_position;
-    out.world_position = world_position;
+    out.clip_position = select(start_clip, end_clip, at_end);
+    out.local_position = select(start_local, end_local, at_end);
+    out.world_position = select(start_world, end_world, at_end);
     out.color = color;
-    out.line_width = grid.params.z;
-    out.line_alpha = lod_alpha;
-    out.fade_radius = grid.params.w;
-    out.lod_center = vec2<f32>(camera_u, camera_v);
-    out.lod_half_span = half_span;
-    out.plane_normal = plane_normal;
-    out.grid_index = grid_index;
-    out.orientation = orientation;
-    out.lod_alphas = lod_alphas;
+    out.line_alpha = line_alpha;
+    out.fade_radius = grid.params.y;
+    if is_world_axis {
+        out.lod_center = vec2<f32>(0.0);
+        out.lod_half_span = max(extent, 1e-4);
+    } else {
+        out.lod_center = vec2<f32>(camera_u, camera_v);
+        out.lod_half_span = half_span;
+    }
+    out.plane_normal = normalize(cross(grid.u_axis.xyz, grid.v_axis.xyz));
+    out.line_start = start_screen;
+    out.line_normal = line_normal;
+    out.line_width = grid.params.x;
     return out;
 }
 
-fn raster_pixel_scale() -> f32 {
-    return f32(max(camera.raster_scale, 1u));
-}
-
 fn line_coverage(pixel_distance: f32, line_width: f32) -> f32 {
-    // `pixel_distance` is in raster pixels. SSAA shrinks those pixels, so
-    // convert the output-pixel width the same way `raster_shader.wgsl` does.
-    let scale = raster_pixel_scale();
-    let target_w = max(line_width * scale, 0.01);
-    let half_width = max(target_w * 0.5, 0.01);
+    let scale = f32(max(camera.raster_scale, 1u));
+    let half_width = max(line_width * 0.5, 0.01);
     return 1.0 - smoothstep(
         max(half_width - 0.75 * scale, 0.0),
         half_width + 0.75 * scale,
@@ -290,22 +256,25 @@ fn line_coverage(pixel_distance: f32, line_width: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if camera.num_primitives > 0u {
+        // sdf_depth is allocated at the raster resolution; map with a ratio
+        // so the lookup stays correct if the resolutions ever diverge.
         let dimensions = textureDimensions(sdf_depth);
+        let scale = f32(max(camera.raster_scale, 1u));
+        let raster_size = vec2<u32>(
+            max(u32(camera.width * scale), 1u),
+            max(u32(camera.height * scale), 1u),
+        );
         let position = min(
-            vec2<u32>(in.clip_position.xy) / max(camera.raster_scale, 1u),
+            vec2<u32>(in.clip_position.xy) * dimensions / raster_size,
             dimensions - vec2<u32>(1u),
         );
         let surface_depth = textureLoad(sdf_depth, vec2<i32>(position), 0).r;
-        let grid_depth = dot(
-            in.world_position - camera.pos,
-            normalize(camera.look_at),
-        );
+        let grid_depth = dot(in.world_position - camera.pos, normalize(camera.look_at));
         if surface_depth + 1e-4 < grid_depth {
             discard;
         }
     }
 
-    let coverage = line_coverage(in.edge_distance, in.line_width);
     var distance_alpha = 1.0;
     if in.fade_radius > 0.0 {
         let radius = length(in.local_position) / in.fade_radius;
@@ -320,78 +289,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         0.12,
         abs(dot(in.plane_normal, view_direction)),
     );
-    let fade_alpha = in.line_alpha
+    let pixel_distance = dot(in.line_normal, in.clip_position.xy - in.line_start);
+    let alpha = in.color.a
+        * in.line_alpha
         * distance_alpha
         * lod_range_alpha
-        * angle_alpha;
-    var alpha = in.color.a * fade_alpha * coverage;
-
-    // Every horizontal LOD is emitted before the vertical LODs. Reconstruct
-    // their accumulated alpha and make the vertical source contribute only the
-    // remainder required by the coverage union.
-    let other_coordinate_gradient = length(vec2<f32>(
-        dpdx(in.local_position.y),
-        dpdy(in.local_position.y),
-    ));
-    if in.orientation == 1u && other_coordinate_gradient > 1e-8 {
-        let grid = grids[in.grid_index];
-        let subdivisions = max(grid.params.y, 1.0);
-        let minor_spacing = grid.params.x / subdivisions;
-        var other_alpha = 0.0;
-        var other_spacing = minor_spacing;
-        for (var other_lod = 0u; other_lod < LOD_COUNT; other_lod += 1u) {
-            let other_coordinate = round(in.local_position.y / other_spacing) * other_spacing;
-            let other_center = round(in.lod_center.y / other_spacing) * other_spacing;
-            let other_half_span = min(
-                grid.extent.x,
-                (f32(LINE_COUNT) - 1.0) * 0.5 * other_spacing,
-            );
-            var other_line_exists = abs(other_coordinate - other_center)
-                    <= other_half_span + other_spacing * 0.01
-                && abs(in.local_position.x - in.lod_center.x) <= other_half_span
-                && abs(other_coordinate) <= grid.extent.x;
-            if other_lod + 1u < LOD_COUNT {
-                let next_spacing = other_spacing * subdivisions;
-                let coarse_coordinate = round(other_coordinate / next_spacing) * next_spacing;
-                other_line_exists = other_line_exists
-                    && abs(other_coordinate - coarse_coordinate) >= other_spacing * 0.01;
-            }
-
-            if other_line_exists {
-                let local_distance = abs(in.local_position.y - other_coordinate);
-                let other_pixel_distance = local_distance / other_coordinate_gradient;
-                let other_coverage = line_coverage(other_pixel_distance, in.line_width);
-                let other_lod_distance = lod_radius / max(other_half_span, 1e-4);
-                let other_range_alpha = 1.0
-                    - smoothstep(0.72, 1.0, other_lod_distance);
-                var other_color = select(
-                    grid.major_color,
-                    grid.minor_color,
-                    other_lod == 0u,
-                );
-                if abs(other_coordinate) < other_spacing * 0.01 {
-                    other_color = grid.u_axis_color;
-                }
-                let candidate_alpha = other_color.a
-                    * in.lod_alphas[other_lod]
-                    * distance_alpha
-                    * other_range_alpha
-                    * angle_alpha
-                    * other_coverage;
-                other_alpha = candidate_alpha + other_alpha * (1.0 - candidate_alpha);
-            }
-            other_spacing *= subdivisions;
-        }
-
-        let union_alpha = max(other_alpha, alpha);
-        alpha = select(
-            0.0,
-            (union_alpha - other_alpha) / max(1.0 - other_alpha, 1e-6),
-            union_alpha > other_alpha + 1e-6,
-        );
-    }
+        * angle_alpha
+        * line_coverage(pixel_distance, in.line_width);
     if alpha <= 1e-4 {
         discard;
     }
-    return vec4<f32>(in.color.rgb, alpha);
+    // Premultiplied output: the grid pipeline accumulates with a MAX color
+    // blend so overlapping line crossings keep single-line brightness
+    // instead of double-blending into bright dots.
+    return vec4<f32>(in.color.rgb * alpha, alpha);
 }

@@ -184,10 +184,13 @@ impl TargetCache {
                 vk::ImageAspectFlags::COLOR,
                 vk::SampleCountFlags::TYPE_1,
             );
+            // SDF G-buffers are rendered at the SSAA resolution so that
+            // raymarched content receives the same supersampling as the
+            // raster/grid paths; resolve then maps 1:1.
             let sdf_normal_coverage = Image::new(
                 resources.ctx,
-                width,
-                height,
+                width * resources.ssaa_factor,
+                height * resources.ssaa_factor,
                 vk::Format::R16G16B16A16_SFLOAT,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
                 vk::ImageAspectFlags::COLOR,
@@ -195,8 +198,8 @@ impl TargetCache {
             );
             let sdf_material_id = Image::new(
                 resources.ctx,
-                width,
-                height,
+                width * resources.ssaa_factor,
+                height * resources.ssaa_factor,
                 vk::Format::R32_UINT,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
                 vk::ImageAspectFlags::COLOR,
@@ -204,8 +207,8 @@ impl TargetCache {
             );
             let sdf_depth = Image::new(
                 resources.ctx,
-                width,
-                height,
+                width * resources.ssaa_factor,
+                height * resources.ssaa_factor,
                 vk::Format::R32_SFLOAT,
                 vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED,
                 vk::ImageAspectFlags::COLOR,

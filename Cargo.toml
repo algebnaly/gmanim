@@ -27,4 +27,3 @@ slotmap = "1.0.7"
 default = ["gmfloat_f32"]
 gmfloat_f32 = []
 gmfloat_f64 = []
-gmfloat_f16 = []

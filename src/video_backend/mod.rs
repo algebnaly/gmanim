@@ -62,6 +62,7 @@ pub struct VideoConfig {
     pub output_color_profile: crate::OutputColorProfile,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FfmpegPipeEncoder {
     Libx264,
     Libx265,
@@ -82,6 +83,22 @@ impl FfmpegPipeEncoder {
 
 pub struct FfmpegPipeConfig {
     pub ffmpeg_encoder: FfmpegPipeEncoder,
+    /// Slow, high-efficiency encoder presets (e.g. libx264 `veryslow`).
+    pub high_quality: bool,
+    /// Constant-quality level (ffmpeg `-crf`). Takes precedence over
+    /// `VideoConfig::bitrate`; when neither is set the encoder default
+    /// (x264 CRF 23) applies.
+    pub crf: Option<u32>,
+}
+
+impl Default for FfmpegPipeConfig {
+    fn default() -> Self {
+        Self {
+            ffmpeg_encoder: FfmpegPipeEncoder::Libx264,
+            high_quality: false,
+            crf: None,
+        }
+    }
 }
 
 pub struct FfmpegPipeBackend {
@@ -155,6 +172,8 @@ struct FfmpegPipeOutputOptionBuilder {
     high_quality: bool,
     encoder: FfmpegPipeEncoder,
     color_order: ColorOrder,
+    crf: Option<u32>,
+    bitrate: Option<u64>,
 }
 
 impl FfmpegPipeOutputOptionBuilder {
@@ -194,55 +213,56 @@ impl FfmpegPipeOutputOptionBuilder {
     }
 
     fn specify_quality_option(&self, args: &mut Vec<String>) {
-        let mut quality_options = match self.encoder {
+        let mut quality_options: Vec<String> = match self.encoder {
             FfmpegPipeEncoder::HevcVaapi => {
                 if self.high_quality {
-                    vec!["-compression_level", "11"] // I can't use level value 1 and 29, and i don't know why.
+                    vec!["-compression_level".to_owned(), "11".to_owned()] // I can't use level value 1 and 29, and i don't know why.
                 } else {
-                    vec!["-compression_level", "0"]
+                    vec!["-compression_level".to_owned(), "0".to_owned()]
                 }
             }
             FfmpegPipeEncoder::HevcNvenc => {
                 if self.high_quality {
-                    vec!["-preset", "p7"]
+                    vec!["-preset".to_owned(), "p7".to_owned()]
                 } else {
-                    vec!["-preset", "p1"]
+                    vec!["-preset".to_owned(), "p1".to_owned()]
                 }
             }
             _ => {
                 if self.high_quality {
-                    vec!["-preset", "veryslow"]
+                    vec!["-preset".to_owned(), "veryslow".to_owned()]
                 } else {
-                    vec!["-preset", "ultrafast"]
+                    vec!["-preset".to_owned(), "ultrafast".to_owned()]
                 }
             }
         };
+        if let Some(crf) = self.crf {
+            quality_options.extend(["-crf".to_owned(), crf.to_string()]);
+        } else if let Some(bitrate) = self.bitrate {
+            quality_options.extend(["-b:v".to_owned(), bitrate.to_string()]);
+        }
         // vaapi only support "vaapi" pix_fmt
         if !matches!(self.encoder, FfmpegPipeEncoder::HevcVaapi) {
             if matches!(self.color_order, ColorOrder::Yuv444p) {
-                quality_options.extend(["-pix_fmt", "yuv444p"]);
+                quality_options.extend(["-pix_fmt".to_owned(), "yuv444p".to_owned()]);
             } else {
-                quality_options.extend(["-pix_fmt", "yuv420p"]);
+                quality_options.extend(["-pix_fmt".to_owned(), "yuv420p".to_owned()]);
             }
         }
         quality_options.extend([
-            "-color_primaries",
-            "bt709",
-            "-color_trc",
-            "bt709",
-            "-colorspace",
-            "bt709",
+            "-color_primaries".to_owned(),
+            "bt709".to_owned(),
+            "-color_trc".to_owned(),
+            "bt709".to_owned(),
+            "-colorspace".to_owned(),
+            "bt709".to_owned(),
         ]);
-        args.extend(quality_options.iter().map(|x| x.to_string()))
+        args.extend(quality_options)
     }
 }
 
 impl FfmpegPipeBackend {
-    pub fn new(
-        video_config: &VideoConfig,
-        encoder_config: FfmpegPipeEncoder,
-        high_profile: bool,
-    ) -> Self {
+    pub fn new(video_config: &VideoConfig, pipe_config: &FfmpegPipeConfig) -> Self {
         assert_eq!(
             video_config.output_color_profile,
             crate::OutputColorProfile::Bt709Sdr,
@@ -265,9 +285,11 @@ impl FfmpegPipeBackend {
             "-".to_string(),
         ];
         let encoder_option_builder = FfmpegPipeOutputOptionBuilder {
-            high_quality: high_profile,
-            encoder: encoder_config,
+            high_quality: pipe_config.high_quality,
+            encoder: pipe_config.ffmpeg_encoder,
             color_order: video_config.color_order,
+            crf: pipe_config.crf,
+            bitrate: video_config.bitrate,
         };
 
         encoder_option_builder.build_option(&mut args);

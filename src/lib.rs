@@ -11,9 +11,7 @@ pub mod video_backend;
 pub mod vulkan;
 
 cfg_if::cfg_if! {
-    if #[cfg(feature = "gmfloat_f16")]{
-        pub type GMFloat = f16;
-    }else if #[cfg(feature = "gmfloat_f32")]{
+    if #[cfg(feature = "gmfloat_f32")]{
         pub type GMFloat = f32;
     }else if #[cfg(feature = "gmfloat_f64")]{
         pub type GMFloat = f64;

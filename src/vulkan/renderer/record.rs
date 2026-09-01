@@ -4,6 +4,7 @@ use super::Mesh3DDraw;
 use super::frame::TrackedImageState;
 use super::mesh_2d::PreparedMesh2DBatch;
 use super::pipelines::PipelineSet;
+use super::prepared_frame::GpuGrid3D;
 
 mod frame;
 mod output;
@@ -71,7 +72,8 @@ pub(super) struct Mesh3DBindings<'a> {
 
 #[derive(Clone, Copy)]
 pub(super) struct Grid3DBindings<'a> {
-    pub(super) count: u32,
+    pub(super) grids: &'a [GpuGrid3D],
+    pub(super) raster_scale: u32,
     pub(super) descriptor_set: vk::DescriptorSet,
     pub(super) dynamic_offsets: &'a [u32],
 }

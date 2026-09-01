@@ -5,6 +5,7 @@ use super::super::frame::{
 };
 use super::super::mesh_2d::{GeometryUpload2D, PreparedMesh2DBatch};
 use super::super::output::RenderOutputs;
+use super::super::prepared_frame::GpuGrid3D;
 use super::super::targets::TargetCache;
 use super::super::upload::UploadedFrame;
 use super::super::{Image, Mesh3DDraw};
@@ -55,7 +56,7 @@ pub(in crate::vulkan::renderer) struct FrameRecord<'a> {
     pub(in crate::vulkan::renderer) uploaded: UploadedFrame,
     pub(in crate::vulkan::renderer) outputs: RenderOutputs,
     pub(in crate::vulkan::renderer) mesh_draws_3d: &'a [Mesh3DDraw],
-    pub(in crate::vulkan::renderer) grid_count_3d: u32,
+    pub(in crate::vulkan::renderer) grids_3d: &'a [GpuGrid3D],
     pub(in crate::vulkan::renderer) mesh_batches_2d: &'a [PreparedMesh2DBatch],
     pub(in crate::vulkan::renderer) geometry_uploads_2d: &'a [GeometryUpload2D],
     pub(in crate::vulkan::renderer) uploads_2d: GeometryUploadBuffers2D,
@@ -78,7 +79,7 @@ impl<'a> CommandRecorder<'a> {
             uploaded,
             outputs,
             mesh_draws_3d,
-            grid_count_3d,
+            grids_3d,
             mesh_batches_2d,
             geometry_uploads_2d,
             uploads_2d,
@@ -111,7 +112,8 @@ impl<'a> CommandRecorder<'a> {
             instance_offset: uploaded.instance_2d_offset,
         };
         let grids_3d = Grid3DBindings {
-            count: grid_count_3d,
+            grids: grids_3d,
+            raster_scale: plan.raster_scale,
             descriptor_set: targets.grid_descriptor_set,
             dynamic_offsets: &uploaded.grid_dynamic_offsets,
         };
@@ -131,11 +133,12 @@ impl<'a> CommandRecorder<'a> {
             }
 
             if plan.execution.runs_sdf() {
+                let sdf_extent = plan.ssaa_extent();
                 self.record_sdf(
                     targets,
                     &uploaded.compute_dynamic_offsets,
-                    plan.width,
-                    plan.height,
+                    sdf_extent.width,
+                    sdf_extent.height,
                 );
             }
             write_gpu_timestamp(

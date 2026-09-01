@@ -299,9 +299,16 @@ fn fs_gbuffer(in: VertexOutput, @builtin(front_facing) is_front: bool) -> GBuffe
 @fragment
 fn fs_main(in: VertexOutput, @builtin(front_facing) is_front: bool) -> @location(0) vec4<f32> {
     if camera.num_primitives > 0u {
+        // sdf_depth is allocated at the raster resolution; map with a ratio
+        // so the lookup stays correct if the resolutions ever diverge.
         let depth_dimensions = textureDimensions(sdf_depth);
+        let scale = f32(max(camera.raster_scale, 1u));
+        let raster_size = vec2<u32>(
+            max(u32(camera.width * scale), 1u),
+            max(u32(camera.height * scale), 1u),
+        );
         let depth_position = min(
-            vec2<u32>(in.clip_position.xy) / max(camera.raster_scale, 1u),
+            vec2<u32>(in.clip_position.xy) * depth_dimensions / raster_size,
             depth_dimensions - vec2<u32>(1),
         );
         let sdf_linear_depth = textureLoad(sdf_depth, vec2<i32>(depth_position), 0).r;

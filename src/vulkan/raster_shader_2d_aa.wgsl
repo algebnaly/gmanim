@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 // Analytic-AA 2D raster shader.
 //
 // For rectangle instances the geometry stores per-vertex coordinates in the

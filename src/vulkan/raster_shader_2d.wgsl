@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 struct CameraUniform2D {
     width: f32,
     height: f32,

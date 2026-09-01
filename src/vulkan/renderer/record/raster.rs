@@ -147,7 +147,7 @@ impl<'a> CommandRecorder<'a> {
     }
 
     unsafe fn record_grids_3d(&self, bindings: Grid3DBindings<'_>) {
-        if bindings.count == 0 {
+        if bindings.grids.is_empty() {
             return;
         }
         unsafe {
@@ -164,13 +164,21 @@ impl<'a> CommandRecorder<'a> {
                 std::slice::from_ref(&bindings.descriptor_set),
                 bindings.dynamic_offsets,
             );
-            self.device.cmd_draw(
-                self.command_buffer,
-                6,
-                bindings.count * GRID_INSTANCES_PER_GRID,
-                0,
-                0,
-            );
+            let [min_line_width, max_line_width] = self.pipelines.grid_line_width_range;
+            let aa_support = 1.5 * bindings.raster_scale as f32;
+            for (grid_index, grid) in bindings.grids.iter().enumerate() {
+                self.device.cmd_set_line_width(
+                    self.command_buffer,
+                    (grid.params[0] + aa_support).clamp(min_line_width, max_line_width),
+                );
+                self.device.cmd_draw(
+                    self.command_buffer,
+                    2,
+                    GRID_INSTANCES_PER_GRID,
+                    0,
+                    grid_index as u32 * GRID_INSTANCES_PER_GRID,
+                );
+            }
         }
     }
 

@@ -5,7 +5,9 @@ use ash::vk;
 use std::sync::Arc;
 
 use super::mesh_2d::Instance2D;
-use super::prepared_frame::{GRID_INSTANCES_PER_GRID, GRID_LINE_COUNT, GRID_LOD_COUNT};
+use super::prepared_frame::{
+    GRID_AXIS_LINE_COUNT, GRID_INSTANCES_PER_GRID, GRID_LINE_COUNT, GRID_LOD_COUNT,
+};
 
 pub(super) struct PipelineSet {
     device: Arc<ash::Device>,
@@ -49,6 +51,7 @@ pub(super) struct PipelineSet {
     pub(super) yuv444p_pipeline: vk::Pipeline,
     pub(super) raster_pipeline: vk::Pipeline,
     pub(super) grid_pipeline: vk::Pipeline,
+    pub(super) grid_line_width_range: [f32; 2],
     pub(super) raster_pipeline_transparent_depth: vk::Pipeline,
     pub(super) raster_pipeline_transparent_back: vk::Pipeline,
     pub(super) raster_pipeline_transparent_front: vk::Pipeline,
@@ -127,6 +130,7 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
         let grid_shader_source = format!(
             "const LINE_COUNT: u32 = {GRID_LINE_COUNT}u;\n\
              const LOD_COUNT: u32 = {GRID_LOD_COUNT}u;\n\
+             const AXIS_LINE_COUNT: u32 = {GRID_AXIS_LINE_COUNT}u;\n\
              const INSTANCES_PER_GRID: u32 = {GRID_INSTANCES_PER_GRID}u;\n{}",
             include_str!("../grid_shader.wgsl"),
         );
@@ -1091,13 +1095,42 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             },
         ];
         let grid_vertex_input = vk::PipelineVertexInputStateCreateInfo::default();
+        let grid_input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
+            topology: vk::PrimitiveTopology::LINE_LIST,
+            ..input_assembly
+        };
+        let grid_line_rasterization = vk::PipelineRasterizationLineStateCreateInfoEXT::default()
+            .line_rasterization_mode(vk::LineRasterizationModeEXT::RECTANGULAR);
+        let grid_rasterizer = vk::PipelineRasterizationStateCreateInfo {
+            p_next: (&grid_line_rasterization
+                as *const vk::PipelineRasterizationLineStateCreateInfoEXT)
+                .cast(),
+            ..rasterizer
+        };
+        let grid_dynamic_states = [
+            vk::DynamicState::VIEWPORT,
+            vk::DynamicState::SCISSOR,
+            vk::DynamicState::LINE_WIDTH,
+        ];
+        let grid_dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&grid_dynamic_states);
         let grid_depth_stencil = vk::PipelineDepthStencilStateCreateInfo {
             depth_write_enable: vk::FALSE,
             depth_compare_op: vk::CompareOp::LESS_OR_EQUAL,
             ..depth_stencil
         };
+        // Grid lines are emissive strokes of a shared color: compositing two
+        // crossing lines with alpha-over would make every crossing brighter
+        // than the lines themselves. The fragment shader emits premultiplied
+        // color, and a MAX blend keeps crossings at single-line brightness.
         let grid_blend_attachment = vk::PipelineColorBlendAttachmentState {
             blend_enable: vk::TRUE,
+            src_color_blend_factor: vk::BlendFactor::ONE,
+            dst_color_blend_factor: vk::BlendFactor::ONE,
+            color_blend_op: vk::BlendOp::MAX,
+            src_alpha_blend_factor: vk::BlendFactor::ONE,
+            dst_alpha_blend_factor: vk::BlendFactor::ONE,
+            alpha_blend_op: vk::BlendOp::MAX,
             ..color_blend_attachment
         };
         let grid_color_blending = vk::PipelineColorBlendStateCreateInfo {
@@ -1108,8 +1141,11 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             stage_count: grid_shader_stages.len() as u32,
             p_stages: grid_shader_stages.as_ptr(),
             p_vertex_input_state: &grid_vertex_input,
+            p_input_assembly_state: &grid_input_assembly,
+            p_rasterization_state: &grid_rasterizer,
             p_depth_stencil_state: &grid_depth_stencil,
             p_color_blend_state: &grid_color_blending,
+            p_dynamic_state: &grid_dynamic_state,
             layout: grid_pipeline_layout,
             ..raster_pipeline_info
         };
@@ -1459,6 +1495,12 @@ fn load_raster_material_id(pixel: vec2<i32>, sample: u32) -> u32 {{
             yuv444p_pipeline,
             raster_pipeline,
             grid_pipeline,
+            grid_line_width_range: unsafe {
+                ctx.instance
+                    .get_physical_device_properties(ctx.physical_device)
+                    .limits
+                    .line_width_range
+            },
             raster_pipeline_transparent_depth,
             raster_pipeline_transparent_back,
             raster_pipeline_transparent_front,

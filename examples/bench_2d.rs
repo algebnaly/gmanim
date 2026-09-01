@@ -80,13 +80,13 @@ fn main() {
         output_color_profile: Default::default(),
     };
 
+    let pipe_config = gmanim_core::video_backend::FfmpegPipeConfig {
+        ffmpeg_encoder: gmanim_core::video_backend::FfmpegPipeEncoder::HevcVaapi,
+        ..Default::default()
+    };
     let mut video_backend = VideoBackend {
         backend_type: VideoBackendType::FfmpegPipe(
-            gmanim_core::video_backend::FfmpegPipeBackend::new(
-                &video_config,
-                gmanim_core::video_backend::FfmpegPipeEncoder::HevcVaapi,
-                false,
-            ),
+            gmanim_core::video_backend::FfmpegPipeBackend::new(&video_config, &pipe_config),
         ),
     };
 

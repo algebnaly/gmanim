@@ -604,7 +604,7 @@ impl VulkanRenderer {
                 uploaded,
                 outputs,
                 mesh_draws_3d: &scene.mesh_draws_3d,
-                grid_count_3d: grids_3d.len() as u32,
+                grids_3d: &grids_3d,
                 mesh_batches_2d: &mesh_batches_2d,
                 geometry_uploads_2d: &geometry_uploads_2d,
                 uploads_2d: GeometryUploadBuffers2D {
