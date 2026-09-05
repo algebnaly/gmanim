@@ -113,7 +113,6 @@ impl<'a> CommandRecorder<'a> {
         };
         let grids_3d = Grid3DBindings {
             grids: grids_3d,
-            raster_scale: plan.raster_scale,
             descriptor_set: targets.grid_descriptor_set,
             dynamic_offsets: &uploaded.grid_dynamic_offsets,
         };

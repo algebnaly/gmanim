@@ -73,7 +73,6 @@ pub(super) struct Mesh3DBindings<'a> {
 #[derive(Clone, Copy)]
 pub(super) struct Grid3DBindings<'a> {
     pub(super) grids: &'a [GpuGrid3D],
-    pub(super) raster_scale: u32,
     pub(super) descriptor_set: vk::DescriptorSet,
     pub(super) dynamic_offsets: &'a [u32],
 }

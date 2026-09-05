@@ -1,7 +1,7 @@
 use ash::vk;
 
 use super::super::frame::{TrackedImageState, transition_image};
-use super::super::prepared_frame::GRID_INSTANCES_PER_GRID;
+use super::super::prepared_frame::GRID_QUAD_VERTEX_COUNT;
 use super::{
     ColorAttachment, ColorLoad, ColorRasterPass, CommandRecorder, DeferredOpaquePass,
     DepthAttachment, DepthLoad, Grid3DBindings, Mesh2DBindings, Mesh2DPass, Mesh3DBindings,
@@ -164,21 +164,13 @@ impl<'a> CommandRecorder<'a> {
                 std::slice::from_ref(&bindings.descriptor_set),
                 bindings.dynamic_offsets,
             );
-            let [min_line_width, max_line_width] = self.pipelines.grid_line_width_range;
-            let aa_support = 1.5 * bindings.raster_scale as f32;
-            for (grid_index, grid) in bindings.grids.iter().enumerate() {
-                self.device.cmd_set_line_width(
-                    self.command_buffer,
-                    (grid.params[0] + aa_support).clamp(min_line_width, max_line_width),
-                );
-                self.device.cmd_draw(
-                    self.command_buffer,
-                    2,
-                    GRID_INSTANCES_PER_GRID,
-                    0,
-                    grid_index as u32 * GRID_INSTANCES_PER_GRID,
-                );
-            }
+            self.device.cmd_draw(
+                self.command_buffer,
+                GRID_QUAD_VERTEX_COUNT,
+                bindings.grids.len() as u32,
+                0,
+                0,
+            );
         }
     }
 

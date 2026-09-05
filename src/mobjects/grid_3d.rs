@@ -55,6 +55,8 @@ impl Default for GridStyle3D {
     }
 }
 
+/// World-space grid plane. Lines and axes are evaluated from this plane's UV
+/// coordinates; the camera only changes how the plane is viewed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct GridPlane3D {
     pub plane: GridPlane,
