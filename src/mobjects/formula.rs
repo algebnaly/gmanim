@@ -73,16 +73,6 @@ fn test_formula_to_node_bundle() {
         ) {
             self.vertex_count += mesh.vertices().len();
         }
-        fn push_rectangle_2d(
-            &mut self,
-            _id: crate::mobjects::RectangleId,
-            rectangle: &crate::mobjects::Rectangle,
-            _geometry_revision: u64,
-            _dynamic: bool,
-            _transform: nalgebra::Matrix4<crate::GMFloat>,
-        ) {
-            self.vertex_count += rectangle.tessellate().vertices().len();
-        }
         fn push_surface_3d(&mut self, _surface: crate::mobjects::Surface3DSubmission<'_>) {}
         fn push_grid_3d(&mut self, _grid: crate::mobjects::Grid3DSubmission<'_>) {}
     }

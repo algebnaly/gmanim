@@ -37,6 +37,35 @@ impl Default for Rectangle {
 }
 
 impl Rectangle {
+    /// Returns `[half_extent_x, half_extent_y, enabled, 0]` when the rectangle
+    /// qualifies for analytic edge AA. Other geometry keeps the multisampled
+    /// supersampled raster path.
+    pub fn analytic_aa_params(&self) -> [f32; 4] {
+        let degenerate = |value: GMFloat| value.abs() <= GMFloat::EPSILON * 4.0;
+        if !self.draw_config.fill || self.draw_config.stoke_width > 0.0 {
+            return [0.0; 4];
+        }
+        let edge_x = self.p1 - self.p0;
+        let edge_y = self.p3 - self.p0;
+        let edge_x_len = edge_x.norm();
+        let edge_y_len = edge_y.norm();
+        if degenerate(edge_x_len) || degenerate(edge_y_len) {
+            return [0.0; 4];
+        }
+        let perpendicular = edge_x.dot(&edge_y).abs() <= edge_x_len * edge_y_len * 1e-4;
+        let closure = (self.p2 - (self.p1 + edge_y)).norm();
+        let closes = closure <= (edge_x_len + edge_y_len) * 1e-4;
+        if !perpendicular || !closes {
+            return [0.0; 4];
+        }
+        let aa_mode = if self.aa_mode >= 2.0 {
+            self.aa_mode
+        } else {
+            1.0
+        };
+        [(edge_x_len / 2.0), (edge_y_len / 2.0), aa_mode, 0.0]
+    }
+
     /// Tessellates the quad and stores per-vertex local coordinates in the
     /// rectangle's own frame (x along p0->p1, y along p0->p3, origin at the
     /// center). These coordinates feed the analytic edge-AA fragment shader;
@@ -57,6 +86,24 @@ impl Rectangle {
             [edge_x[0] / edge_x_len, edge_x[1] / edge_x_len],
             [edge_y[0] / edge_y_len, edge_y[1] / edge_y_len],
         );
+
+        let linear_color = [
+            self.color.r as f32 / 255.0,
+            self.color.g as f32 / 255.0,
+            self.color.b as f32 / 255.0,
+            self.color.a as f32 / 255.0,
+        ];
+        let aa_params = self.analytic_aa_params();
+
+        if self.draw_config.fill && self.draw_config.stoke_width <= 0.0 {
+            let vertices = [self.p0, self.p1, self.p2, self.p3]
+                .map(|p| rect_builder.project_vertex([p.x, p.y]))
+                .to_vec();
+            let indices = vec![0, 1, 2, 0, 2, 3];
+            return TriangleMesh2D::new(vertices, indices, self.color)
+                .with_linear_color(linear_color)
+                .with_aa_params(aa_params);
+        }
 
         let mut builder = Path::builder();
         builder.begin(point(self.p0.x, self.p0.y));
@@ -92,6 +139,8 @@ impl Rectangle {
         }
 
         TriangleMesh2D::new(geometry.vertices, geometry.indices, self.color)
+            .with_linear_color(linear_color)
+            .with_aa_params(aa_params)
     }
 
     pub fn corners(&self) -> [Point3<GMFloat>; 4] {
@@ -113,6 +162,20 @@ impl Rectangle {
             })
             && self.draw_config.fill == other.draw_config.fill
             && self.draw_config.stoke_width.to_bits() == other.draw_config.stoke_width.to_bits()
+    }
+}
+
+impl Mobject for Rectangle {
+    fn default_name(&self) -> &'static str {
+        "Rectangle"
+    }
+
+    fn submit_to_renderer(
+        &self,
+        visitor: &mut dyn crate::mobjects::RenderVisitor,
+        world_transform: nalgebra::Matrix4<crate::GMFloat>,
+    ) {
+        visitor.push_mesh_2d(&self.tessellate(), world_transform);
     }
 }
 

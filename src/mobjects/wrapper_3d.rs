@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::mobjects::{
-    Geometry3DRef, Grid3DSubmission, Mobject, Rectangle, RectangleId, RenderVisitor,
-    Surface3DSubmission, mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D, mesh_3d::Vertex,
+    Geometry3DRef, Grid3DSubmission, Mobject, RenderVisitor, Surface3DSubmission,
+    mesh_2d::TriangleMesh2D, mesh_3d::TriangleMesh3D, mesh_3d::Vertex,
 };
 use nalgebra::Matrix4;
 
@@ -25,17 +25,18 @@ struct InterceptorVisitor<'a> {
 
 impl RenderVisitor for InterceptorVisitor<'_> {
     fn push_mesh_2d(&mut self, mesh: &TriangleMesh2D, transform: Matrix4<crate::GMFloat>) {
-        let mut mesh3d = TriangleMesh3D::new(Vec::new(), Vec::new());
         let color = mesh.color();
-        for vertex in mesh.vertices() {
-            mesh3d.vertices.push(Vertex {
+        let vertices = mesh
+            .vertices()
+            .iter()
+            .map(|vertex| Vertex {
                 position: [vertex.position[0], vertex.position[1], 0.0],
                 normal: [0.0, 0.0, 1.0],
                 color,
                 surface_coord: [0.0, 0.0, 1.0],
-            });
-        }
-        mesh3d.indices = mesh.indices().to_vec();
+            })
+            .collect();
+        let mut mesh3d = TriangleMesh3D::new(vertices, mesh.indices().to_vec());
         mesh3d.material.unlit = true;
 
         self.real_visitor.push_surface_3d(Surface3DSubmission {
@@ -43,17 +44,6 @@ impl RenderVisitor for InterceptorVisitor<'_> {
             material: mesh3d.material,
             transform: self.wrapper_matrix * transform,
         });
-    }
-
-    fn push_rectangle_2d(
-        &mut self,
-        _id: RectangleId,
-        rectangle: &Rectangle,
-        _geometry_revision: u64,
-        _dynamic: bool,
-        transform: Matrix4<crate::GMFloat>,
-    ) {
-        self.push_mesh_2d(&rectangle.tessellate(), transform);
     }
 
     fn push_surface_3d(&mut self, surface: Surface3DSubmission<'_>) {

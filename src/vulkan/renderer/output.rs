@@ -80,7 +80,11 @@ impl OutputRetirement {
         outputs: RenderOutputs,
     ) -> OutputSubmission {
         let frame_index = cache.current_frame % RENDER_FRAME_COUNT;
-        let video_frame_index = cache.current_frame % cache.video_nv12_slots.len();
+        let video_frame_index = if outputs.vulkan_video {
+            cache.current_frame % cache.video_nv12_slots.len()
+        } else {
+            0
+        };
         let mut wait_infos = [vk::SemaphoreSubmitInfo::default()];
         let mut signal_infos = [vk::SemaphoreSubmitInfo::default()];
         let mut wait_count = 0;
@@ -162,6 +166,9 @@ impl OutputRetirement {
     }
 
     pub(super) fn current_image_view(&self, cache: &TargetCache) -> Option<vk::ImageView> {
+        if !cache.requirements.rgba_image {
+            return None;
+        }
         let frame_index = Self::latest_frame_index(cache)?;
         Some(cache.render_targets[frame_index].texture.view)
     }
@@ -172,9 +179,10 @@ impl OutputRetirement {
         frames: &FrameSet,
     ) -> Option<&'a [u8]> {
         let frame_index = Self::latest_frame_index(cache)?;
+        let buffer = cache.nv12_output_buffers.get(frame_index)?;
         frames.wait(frame_index);
         let len = (cache.width * cache.height * 3 / 2) as usize;
-        Self::mapped_bytes(&cache.nv12_output_buffers[frame_index], len)
+        Self::mapped_bytes(buffer, len)
     }
 
     pub(super) fn latest_yuv444p<'a>(
@@ -183,9 +191,10 @@ impl OutputRetirement {
         frames: &FrameSet,
     ) -> Option<&'a [u8]> {
         let frame_index = Self::latest_frame_index(cache)?;
+        let buffer = cache.yuv444p_output_buffers.get(frame_index)?;
         frames.wait(frame_index);
         let len = (cache.width * cache.height * 3) as usize;
-        Self::mapped_bytes(&cache.yuv444p_output_buffers[frame_index], len)
+        Self::mapped_bytes(buffer, len)
     }
 
     pub(super) fn take_video_frame(&self, cache: &mut TargetCache) -> Option<VulkanVideoFrame> {
@@ -211,6 +220,7 @@ impl OutputRetirement {
             slot.timeline.clone(),
             ready_value,
             release_value,
+            slot.image.clone(),
         ))
     }
 
@@ -220,6 +230,7 @@ impl OutputRetirement {
         frames: &FrameSet,
     ) -> Option<&'a [u8]> {
         let frame_index = Self::latest_frame_index(cache)?;
+        cache.output_buffers.get(frame_index)?;
         frames.wait(frame_index);
         self.rgba_readback
             .resize((cache.width * cache.height * 4) as usize, 0);
@@ -245,7 +256,7 @@ impl OutputRetirement {
             output.len()
         );
         let padded = Self::mapped_bytes(
-            &cache.output_buffers[frame_index],
+            cache.output_buffers.get(frame_index)?,
             (cache.padded_bytes_per_row * cache.height) as usize,
         )?;
         for row in 0..cache.height {

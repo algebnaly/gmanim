@@ -1,12 +1,12 @@
 use ash::vk;
 
 use super::Mesh3DDraw;
-use super::frame::TrackedImageState;
 use super::mesh_2d::PreparedMesh2DBatch;
 use super::pipelines::PipelineSet;
 use super::prepared_frame::GpuGrid3D;
 
 mod frame;
+pub(super) mod graph;
 mod output;
 mod plan;
 mod postprocess;
@@ -24,25 +24,6 @@ pub(super) struct CommandRecorder<'a> {
 }
 
 #[derive(Clone, Copy)]
-pub(super) struct VideoOutputPass {
-    pub(super) image: vk::Image,
-    pub(super) descriptor_set: vk::DescriptorSet,
-    pub(super) current_layout: vk::ImageLayout,
-}
-
-#[derive(Clone, Copy)]
-pub(super) struct OutputPasses {
-    pub(super) width: u32,
-    pub(super) height: u32,
-    pub(super) fused_video_downsample: bool,
-    pub(super) cpu_nv12_descriptor_set: Option<vk::DescriptorSet>,
-    pub(super) cpu_yuv444p_descriptor_set: Option<vk::DescriptorSet>,
-    pub(super) video: Option<VideoOutputPass>,
-    pub(super) rgba_buffer: Option<vk::Buffer>,
-    pub(super) rgba_padded_bytes_per_row: u32,
-}
-
-#[derive(Clone, Copy)]
 pub(super) struct GeometryUploadBuffers2D {
     pub(super) vertex_staging: vk::Buffer,
     pub(super) vertex_staging_base: u64,
@@ -52,7 +33,7 @@ pub(super) struct GeometryUploadBuffers2D {
     pub(super) index_device: vk::Buffer,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Mesh3DPass {
     Opaque,
     TransparentDepth,
@@ -77,7 +58,7 @@ pub(super) struct Grid3DBindings<'a> {
     pub(super) dynamic_offsets: &'a [u32],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Mesh2DPass {
     Depth,
     Depthless,
@@ -96,45 +77,54 @@ pub(super) struct Mesh2DBindings<'a> {
     pub(super) instance_offset: u64,
 }
 
-pub(super) struct RasterAttachment<'a> {
-    pub(super) image: vk::Image,
-    pub(super) view: vk::ImageView,
-    pub(super) state: &'a mut TrackedImageState,
-}
-
-pub(super) enum ColorAttachment<'a> {
-    Single(RasterAttachment<'a>),
+#[derive(Clone, Copy)]
+pub(super) enum ColorAttachment {
+    Single(vk::ImageView),
     Resolve {
-        multisample: RasterAttachment<'a>,
-        resolved: RasterAttachment<'a>,
+        multisample: vk::ImageView,
+        resolved: vk::ImageView,
         preserve_multisample: bool,
     },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum ColorLoad {
     Clear([f32; 4]),
     Load,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum DepthLoad {
     Clear,
     Load,
     Discard,
 }
 
-pub(super) struct DepthAttachment<'a> {
-    pub(super) attachment: RasterAttachment<'a>,
+#[derive(Clone, Copy)]
+pub(super) struct DepthAttachment {
+    pub(super) view: vk::ImageView,
     pub(super) load: DepthLoad,
     pub(super) preserve: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct RasterRegion {
     extent: vk::Extent2D,
     viewport: vk::Viewport,
     scissor: vk::Rect2D,
+}
+
+impl PartialEq for RasterRegion {
+    fn eq(&self, other: &Self) -> bool {
+        self.extent == other.extent
+            && self.scissor == other.scissor
+            && self.viewport.x == other.viewport.x
+            && self.viewport.y == other.viewport.y
+            && self.viewport.width == other.viewport.width
+            && self.viewport.height == other.viewport.height
+            && self.viewport.min_depth == other.viewport.min_depth
+            && self.viewport.max_depth == other.viewport.max_depth
+    }
 }
 
 impl RasterRegion {
@@ -168,37 +158,29 @@ impl RasterRegion {
 }
 
 pub(super) struct DeferredOpaquePass<'a> {
-    pub(super) normal_depth: RasterAttachment<'a>,
-    pub(super) albedo: RasterAttachment<'a>,
-    pub(super) material_id: RasterAttachment<'a>,
-    pub(super) depth: RasterAttachment<'a>,
+    pub(super) normal_depth: vk::ImageView,
+    pub(super) albedo: vk::ImageView,
+    pub(super) material_id: vk::ImageView,
+    pub(super) depth: vk::ImageView,
     pub(super) region: RasterRegion,
     pub(super) preserve_depth: bool,
     pub(super) meshes: Mesh3DBindings<'a>,
 }
 
 pub(super) struct TransparentDepthPass<'a> {
-    pub(super) depth: RasterAttachment<'a>,
+    pub(super) depth: vk::ImageView,
     pub(super) extent: vk::Extent2D,
     pub(super) meshes: Mesh3DBindings<'a>,
 }
 
 pub(super) struct ColorRasterPass<'a> {
-    pub(super) color: ColorAttachment<'a>,
+    pub(super) color: ColorAttachment,
     pub(super) color_load: ColorLoad,
-    pub(super) depth: Option<DepthAttachment<'a>>,
+    pub(super) depth: Option<DepthAttachment>,
     pub(super) region: RasterRegion,
     pub(super) meshes_3d: Option<(Mesh3DPass, Mesh3DBindings<'a>)>,
     pub(super) grids_3d: Option<Grid3DBindings<'a>>,
     pub(super) meshes_2d: Option<(Mesh2DPass, Mesh2DBindings<'a>)>,
-}
-
-impl OutputPasses {
-    fn has_compute_output(self) -> bool {
-        self.cpu_nv12_descriptor_set.is_some()
-            || self.cpu_yuv444p_descriptor_set.is_some()
-            || self.video.is_some()
-    }
 }
 
 impl<'a> CommandRecorder<'a> {

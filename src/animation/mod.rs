@@ -8,7 +8,7 @@ mod runtime;
 mod time;
 mod track;
 
-pub use authoring::{AnimationBuilder, AnimationClip, MorphRectangle, Move, Rotate, Wait};
+pub use authoring::{AnimationBuilder, AnimationClip, MorphRectangle, Move, Rotate, Spin, Wait};
 pub use compiler::TimelineBuilder;
 pub use error::TimelineError;
 pub use operation::SceneOperation;

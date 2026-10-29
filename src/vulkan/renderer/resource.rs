@@ -3,6 +3,33 @@ use std::sync::Arc;
 
 use crate::vulkan::context::VulkanContext;
 
+pub(super) fn assert_buffer_range(label: &str, offset: u64, len: u64, capacity: u64) {
+    assert!(
+        offset <= capacity && len <= capacity - offset,
+        "{label} upload exceeds capacity: offset={offset}, bytes={len}, capacity={capacity}"
+    );
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::assert_buffer_range;
+
+    #[test]
+    fn upload_ranges_allow_exact_fit_and_reject_overflow() {
+        assert_buffer_range("test", 4, 12, 16);
+        assert_buffer_range("test", 16, 0, 16);
+        assert_buffer_range("test", u64::MAX, 0, u64::MAX);
+        for (offset, len, capacity) in [(4, 13, 16), (17, 0, 16), (u64::MAX, 1, u64::MAX)] {
+            assert!(
+                std::panic::catch_unwind(|| {
+                    assert_buffer_range("test", offset, len, capacity);
+                })
+                .is_err()
+            );
+        }
+    }
+}
+
 pub struct Buffer {
     ctx: Arc<VulkanContext>,
     pub vk_buffer: vk::Buffer,
@@ -56,15 +83,18 @@ impl Buffer {
     }
 
     pub fn write_bytes(&self, offset: u64, data: &[u8]) {
-        if let Some(mapped) = self
+        assert_buffer_range("buffer", offset, data.len() as u64, self.size);
+        if data.is_empty() {
+            return;
+        }
+        let mapped = self
             .allocation
             .as_ref()
             .and_then(gpu_allocator::vulkan::Allocation::mapped_ptr)
-        {
-            unsafe {
-                let dst = mapped.as_ptr().add(offset as usize);
-                std::ptr::copy_nonoverlapping(data.as_ptr(), dst.cast::<u8>(), data.len());
-            }
+            .expect("cannot upload to an unmapped buffer");
+        unsafe {
+            let dst = mapped.as_ptr().cast::<u8>().add(offset as usize);
+            std::ptr::copy_nonoverlapping(data.as_ptr(), dst, data.len());
         }
     }
 

@@ -3,7 +3,7 @@ use nalgebra::{Matrix4, Point3, Vector3};
 use crate::{
     GMFloat,
     mobjects::{
-        Mobject, NodeBundle, Rectangle, RectangleId, RenderVisitor, Surface3DSubmission,
+        Mobject, NodeBundle, Rectangle, RenderVisitor, Surface3DSubmission,
         mesh_2d::TriangleMesh2D,
     },
 };
@@ -217,17 +217,6 @@ struct TransformRecorder(Vec<Matrix4<GMFloat>>);
 
 impl RenderVisitor for TransformRecorder {
     fn push_mesh_2d(&mut self, _mesh: &TriangleMesh2D, transform: Matrix4<GMFloat>) {
-        self.0.push(transform);
-    }
-
-    fn push_rectangle_2d(
-        &mut self,
-        _id: RectangleId,
-        _rectangle: &Rectangle,
-        _geometry_revision: u64,
-        _dynamic: bool,
-        transform: Matrix4<GMFloat>,
-    ) {
         self.0.push(transform);
     }
 

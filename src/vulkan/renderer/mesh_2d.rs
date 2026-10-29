@@ -1,8 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::mobjects::Rectangle;
-use crate::mobjects::mesh_2d::{GeometryFingerprint, MeshGeometry2D, Vertex2D};
+use crate::mobjects::mesh_2d::{Geometry2DId, GeometryFingerprint, MeshGeometry2D, Vertex2D};
 
 use super::align_up;
 
@@ -69,12 +68,6 @@ pub(super) struct Mesh2DBatch {
     pub(super) dynamic: bool,
 }
 
-pub(super) struct CachedRectangle2D {
-    pub(super) geometry_revision: u64,
-    pub(super) source: Rectangle,
-    pub(super) geometry: Arc<MeshGeometry2D>,
-}
-
 #[derive(Clone)]
 pub(super) struct CachedMesh2D {
     pub(super) geometry: Arc<MeshGeometry2D>,
@@ -125,6 +118,7 @@ pub(super) struct PreparedMesh2D {
 }
 
 pub(super) struct Mesh2DUploadPlanner {
+    id_cache: HashMap<Geometry2DId, CachedMesh2D>,
     cache: HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
     static_vertex_capacity: u64,
     static_index_capacity: u64,
@@ -135,11 +129,12 @@ pub(super) struct Mesh2DUploadPlanner {
 impl Mesh2DUploadPlanner {
     pub(super) fn new(static_vertex_capacity: u64, static_index_capacity: u64) -> Self {
         Self {
+            id_cache: HashMap::new(),
             cache: HashMap::new(),
             static_vertex_capacity,
             static_index_capacity,
             static_vertex_used: 0,
-            static_index_used: 0,
+            static_index_used: u64::default(),
         }
     }
 
@@ -149,6 +144,7 @@ impl Mesh2DUploadPlanner {
         batches: &[Mesh2DBatch],
     ) -> Result<PreparedMesh2D, PrepareMesh2DError> {
         prepare_mesh_2d_batches(
+            &mut self.id_cache,
             &mut self.cache,
             &mut self.static_vertex_used,
             &mut self.static_index_used,
@@ -178,40 +174,11 @@ impl Mesh2DUploadPlanner {
     }
 
     pub(super) fn reset_static_arena(&mut self) {
+        self.id_cache.clear();
         self.cache.clear();
         self.static_vertex_used = 0;
         self.static_index_used = 0;
     }
-}
-
-/// Returns `[half_extent_x, half_extent_y, enabled, 0]` when the rectangle
-/// qualifies for analytic edge AA. Other geometry keeps the multisampled
-/// supersampled raster path.
-pub(super) fn rectangle_analytic_aa_params(rectangle: &Rectangle) -> [f32; 4] {
-    use crate::GMFloat;
-    let degenerate = |value: GMFloat| value.abs() <= GMFloat::EPSILON * 4.0;
-    if !rectangle.draw_config.fill || rectangle.draw_config.stoke_width > 0.0 {
-        return [0.0; 4];
-    }
-    let edge_x = rectangle.p1 - rectangle.p0;
-    let edge_y = rectangle.p3 - rectangle.p0;
-    let edge_x_len = edge_x.norm();
-    let edge_y_len = edge_y.norm();
-    if degenerate(edge_x_len) || degenerate(edge_y_len) {
-        return [0.0; 4];
-    }
-    let perpendicular = edge_x.dot(&edge_y).abs() <= edge_x_len * edge_y_len * 1e-4;
-    let closure = (rectangle.p2 - (rectangle.p1 + edge_y)).norm();
-    let closes = closure <= (edge_x_len + edge_y_len) * 1e-4;
-    if !perpendicular || !closes {
-        return [0.0; 4];
-    }
-    let aa_mode = if rectangle.aa_mode >= 2.0 {
-        rectangle.aa_mode
-    } else {
-        1.0
-    };
-    [(edge_x_len / 2.0), (edge_y_len / 2.0), aa_mode, 0.0]
 }
 
 pub(super) fn build_ordered_mesh_2d_batches(
@@ -235,7 +202,9 @@ pub(super) fn build_ordered_mesh_2d_batches(
     batches
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_mesh_2d_batches(
+    id_cache: &mut HashMap<Geometry2DId, CachedMesh2D>,
     mesh_cache: &mut HashMap<GeometryFingerprint, Vec<CachedMesh2D>>,
     static_vertex_used: &mut u64,
     static_index_used: &mut u64,
@@ -295,6 +264,8 @@ fn prepare_mesh_2d_batches(
                 index_offset: device_index_offset,
                 index_count: batch.geometry.indices().len() as u32,
             }
+        } else if let Some(cached) = id_cache.get(&batch.geometry.id()).cloned() {
+            cached
         } else {
             let fingerprint = batch.geometry.fingerprint();
             let cached = mesh_cache.get(&fingerprint).and_then(|entries| {
@@ -304,7 +275,10 @@ fn prepare_mesh_2d_batches(
                     .cloned()
             });
             match cached {
-                Some(cached) => cached,
+                Some(cached) => {
+                    id_cache.insert(batch.geometry.id(), cached.clone());
+                    cached
+                }
                 None => {
                     let vertex_size = std::mem::size_of_val(batch.geometry.vertices()) as u64;
                     let index_size = std::mem::size_of_val(batch.geometry.indices()) as u64;
@@ -330,6 +304,7 @@ fn prepare_mesh_2d_batches(
                         index_offset: device_index_offset,
                         index_count: batch.geometry.indices().len() as u32,
                     };
+                    id_cache.insert(batch.geometry.id(), cached.clone());
                     mesh_cache
                         .entry(fingerprint)
                         .or_default()

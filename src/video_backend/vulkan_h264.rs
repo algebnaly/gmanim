@@ -113,6 +113,8 @@ struct VideoFrameSynchronization {
     timeline: Arc<TimelineSemaphore>,
     ready_value: u64,
     release_value: u64,
+    // A frame can remain queued on the encoder worker after the renderer changes targets.
+    _image_owner: Arc<dyn Send + Sync>,
 }
 
 impl VulkanVideoFrame {
@@ -128,6 +130,7 @@ impl VulkanVideoFrame {
         timeline: Arc<TimelineSemaphore>,
         ready_value: u64,
         release_value: u64,
+        image_owner: Arc<dyn Send + Sync>,
     ) -> Self {
         Self {
             image,
@@ -141,6 +144,7 @@ impl VulkanVideoFrame {
                 timeline,
                 ready_value,
                 release_value,
+                _image_owner: image_owner,
             }),
         }
     }
@@ -281,7 +285,7 @@ struct EncodeSlot {
     fence: vk::Fence,
     query_index: u32,
     frame_index: Option<u32>,
-    frame_timeline: Option<Arc<TimelineSemaphore>>,
+    frame_synchronization: Option<VideoFrameSynchronization>,
     busy: bool,
 }
 
@@ -1288,7 +1292,7 @@ fn create_video_encode_resources(
             fence,
             query_index,
             frame_index: None,
-            frame_timeline: None,
+            frame_synchronization: None,
             busy: false,
         });
     }
@@ -1774,7 +1778,7 @@ fn encode_one_frame(
         .ok_or_else(|| io::Error::other("Vulkan video frame synchronization was lost"))?;
     slot.busy = true;
     slot.frame_index = Some(frame_num);
-    slot.frame_timeline = Some(synchronization.timeline);
+    slot.frame_synchronization = Some(synchronization);
     Ok(())
 }
 
@@ -1823,7 +1827,7 @@ fn collect_completed_packets(backend: &mut VulkanH264Backend, wait_all: bool) ->
             completed_packets.push((frame_index, packet, readback_start.elapsed()));
             resources.slots[slot_index].busy = false;
             resources.slots[slot_index].frame_index = None;
-            resources.slots[slot_index].frame_timeline = None;
+            resources.slots[slot_index].frame_synchronization = None;
         }
     }
 
@@ -1875,7 +1879,7 @@ fn acquire_encode_slot(backend: &mut VulkanH264Backend) -> io::Result<usize> {
         let readback_time = readback_start.elapsed();
         resources.slots[slot_index].busy = false;
         resources.slots[slot_index].frame_index = None;
-        resources.slots[slot_index].frame_timeline = None;
+        resources.slots[slot_index].frame_synchronization = None;
         (slot_index, frame_index, packet, wait_time, readback_time)
     };
 

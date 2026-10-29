@@ -1,28 +1,11 @@
 use ash::vk;
 
-use super::super::frame::{TrackedImageState, transition_image};
 use super::super::prepared_frame::GRID_QUAD_VERTEX_COUNT;
 use super::{
     ColorAttachment, ColorLoad, ColorRasterPass, CommandRecorder, DeferredOpaquePass,
     DepthAttachment, DepthLoad, Grid3DBindings, Mesh2DBindings, Mesh2DPass, Mesh3DBindings,
-    Mesh3DPass, RasterAttachment, TransparentDepthPass,
+    Mesh3DPass, TransparentDepthPass,
 };
-
-const COLOR_ATTACHMENT_STATE: TrackedImageState = TrackedImageState {
-    layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-    access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-};
-
-fn depth_attachment_state() -> TrackedImageState {
-    TrackedImageState {
-        layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-        stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-        access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-    }
-}
 
 impl<'a> CommandRecorder<'a> {
     pub(in crate::vulkan::renderer) unsafe fn record_color_raster(
@@ -39,74 +22,47 @@ impl<'a> CommandRecorder<'a> {
             meshes_2d,
         } = pass;
 
-        let color_info = unsafe {
-            match color {
-                ColorAttachment::Single(mut attachment) => {
-                    self.transition_color_attachment(&mut attachment);
-                    Self::color_attachment_info(attachment.view, color_load)
-                        .store_op(vk::AttachmentStoreOp::STORE)
-                }
-                ColorAttachment::Resolve {
-                    mut multisample,
-                    mut resolved,
-                    preserve_multisample,
-                } => {
-                    self.transition_color_attachment(&mut multisample);
-                    self.transition_color_attachment(&mut resolved);
-                    Self::color_attachment_info(multisample.view, color_load)
-                        .store_op(if preserve_multisample {
-                            vk::AttachmentStoreOp::STORE
-                        } else {
-                            vk::AttachmentStoreOp::DONT_CARE
-                        })
-                        .resolve_mode(vk::ResolveModeFlags::AVERAGE)
-                        .resolve_image_view(resolved.view)
-                        .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                }
+        let color_info = match color {
+            ColorAttachment::Single(view) => {
+                Self::color_attachment_info(view, color_load).store_op(vk::AttachmentStoreOp::STORE)
             }
+            ColorAttachment::Resolve {
+                multisample,
+                resolved,
+                preserve_multisample,
+            } => Self::color_attachment_info(multisample, color_load)
+                .store_op(if preserve_multisample {
+                    vk::AttachmentStoreOp::STORE
+                } else {
+                    vk::AttachmentStoreOp::DONT_CARE
+                })
+                .resolve_mode(vk::ResolveModeFlags::AVERAGE)
+                .resolve_image_view(resolved)
+                .resolve_image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
         };
 
-        let depth_info = unsafe {
-            match depth {
-                Some(DepthAttachment {
-                    attachment,
-                    load,
-                    preserve,
-                }) => {
-                    transition_image(
-                        self.device,
-                        self.command_buffer,
-                        attachment.image,
-                        vk::ImageAspectFlags::DEPTH,
-                        attachment.state,
-                        depth_attachment_state(),
-                    );
-                    let load_op = match load {
-                        DepthLoad::Clear => vk::AttachmentLoadOp::CLEAR,
-                        DepthLoad::Load => vk::AttachmentLoadOp::LOAD,
-                        DepthLoad::Discard => vk::AttachmentLoadOp::DONT_CARE,
-                    };
-                    Some(
-                        vk::RenderingAttachmentInfo::default()
-                            .image_view(attachment.view)
-                            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                            .load_op(load_op)
-                            .store_op(if preserve {
-                                vk::AttachmentStoreOp::STORE
-                            } else {
-                                vk::AttachmentStoreOp::DONT_CARE
-                            })
-                            .clear_value(vk::ClearValue {
-                                depth_stencil: vk::ClearDepthStencilValue {
-                                    depth: 1.0,
-                                    stencil: 0,
-                                },
-                            }),
-                    )
-                }
-                None => None,
-            }
-        };
+        let depth_info = depth.map(|DepthAttachment { view, load, preserve }| {
+            let load_op = match load {
+                DepthLoad::Clear => vk::AttachmentLoadOp::CLEAR,
+                DepthLoad::Load => vk::AttachmentLoadOp::LOAD,
+                DepthLoad::Discard => vk::AttachmentLoadOp::DONT_CARE,
+            };
+            vk::RenderingAttachmentInfo::default()
+                .image_view(view)
+                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                .load_op(load_op)
+                .store_op(if preserve {
+                    vk::AttachmentStoreOp::STORE
+                } else {
+                    vk::AttachmentStoreOp::DONT_CARE
+                })
+                .clear_value(vk::ClearValue {
+                    depth_stencil: vk::ClearDepthStencilValue {
+                        depth: 1.0,
+                        stencil: 0,
+                    },
+                })
+        });
 
         let color_infos = [color_info];
         let mut rendering_info = vk::RenderingInfo::default()
@@ -170,19 +126,6 @@ impl<'a> CommandRecorder<'a> {
                 bindings.grids.len() as u32,
                 0,
                 0,
-            );
-        }
-    }
-
-    unsafe fn transition_color_attachment(&self, attachment: &mut RasterAttachment<'_>) {
-        unsafe {
-            transition_image(
-                self.device,
-                self.command_buffer,
-                attachment.image,
-                vk::ImageAspectFlags::COLOR,
-                attachment.state,
-                COLOR_ATTACHMENT_STATE,
             );
         }
     }
@@ -337,55 +280,19 @@ impl<'a> CommandRecorder<'a> {
         pass: DeferredOpaquePass<'_>,
     ) {
         let DeferredOpaquePass {
-            mut normal_depth,
-            mut albedo,
-            mut material_id,
+            normal_depth,
+            albedo,
+            material_id,
             depth,
             region,
             preserve_depth,
             meshes,
         } = pass;
-        let color_attachment = TrackedImageState {
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        };
-        let compute_read = TrackedImageState {
-            layout: vk::ImageLayout::GENERAL,
-            stage: vk::PipelineStageFlags2::COMPUTE_SHADER,
-            access: vk::AccessFlags2::SHADER_READ,
-        };
-        let depth_attachment = TrackedImageState {
-            layout: vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL,
-            stage: vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-            access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ
-                | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        };
 
         unsafe {
-            for attachment in [&mut normal_depth, &mut albedo, &mut material_id] {
-                transition_image(
-                    self.device,
-                    self.command_buffer,
-                    attachment.image,
-                    vk::ImageAspectFlags::COLOR,
-                    attachment.state,
-                    color_attachment,
-                );
-            }
-            transition_image(
-                self.device,
-                self.command_buffer,
-                depth.image,
-                vk::ImageAspectFlags::DEPTH,
-                depth.state,
-                depth_attachment,
-            );
-
             let color_attachments = [
                 vk::RenderingAttachmentInfo::default()
-                    .image_view(normal_depth.view)
+                    .image_view(normal_depth)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -393,7 +300,7 @@ impl<'a> CommandRecorder<'a> {
                         color: vk::ClearColorValue { float32: [0.0; 4] },
                     }),
                 vk::RenderingAttachmentInfo::default()
-                    .image_view(albedo.view)
+                    .image_view(albedo)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -401,7 +308,7 @@ impl<'a> CommandRecorder<'a> {
                         color: vk::ClearColorValue { float32: [0.0; 4] },
                     }),
                 vk::RenderingAttachmentInfo::default()
-                    .image_view(material_id.view)
+                    .image_view(material_id)
                     .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -410,7 +317,7 @@ impl<'a> CommandRecorder<'a> {
                     }),
             ];
             let depth_info = vk::RenderingAttachmentInfo::default()
-                .image_view(depth.view)
+                .image_view(depth)
                 .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(if preserve_depth {
@@ -447,17 +354,6 @@ impl<'a> CommandRecorder<'a> {
             );
             self.record_meshes_3d(Mesh3DPass::Opaque, meshes);
             self.device.cmd_end_rendering(self.command_buffer);
-
-            for attachment in [&mut normal_depth, &mut albedo, &mut material_id] {
-                transition_image(
-                    self.device,
-                    self.command_buffer,
-                    attachment.image,
-                    vk::ImageAspectFlags::COLOR,
-                    attachment.state,
-                    compute_read,
-                );
-            }
         }
     }
 
@@ -465,27 +361,9 @@ impl<'a> CommandRecorder<'a> {
         &self,
         pass: TransparentDepthPass<'_>,
     ) {
-        let color_attachment = TrackedImageState {
-            layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            stage: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-            access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        };
-        let fragment_read = TrackedImageState {
-            layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-            stage: vk::PipelineStageFlags2::FRAGMENT_SHADER,
-            access: vk::AccessFlags2::SHADER_READ,
-        };
         unsafe {
-            transition_image(
-                self.device,
-                self.command_buffer,
-                pass.depth.image,
-                vk::ImageAspectFlags::COLOR,
-                pass.depth.state,
-                color_attachment,
-            );
             let attachment = vk::RenderingAttachmentInfo::default()
-                .image_view(pass.depth.view)
+                .image_view(pass.depth)
                 .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                 .load_op(vk::AttachmentLoadOp::CLEAR)
                 .store_op(vk::AttachmentStoreOp::STORE)
@@ -504,14 +382,6 @@ impl<'a> CommandRecorder<'a> {
             );
             self.record_meshes_3d(Mesh3DPass::TransparentDepth, pass.meshes);
             self.device.cmd_end_rendering(self.command_buffer);
-            transition_image(
-                self.device,
-                self.command_buffer,
-                pass.depth.image,
-                vk::ImageAspectFlags::COLOR,
-                pass.depth.state,
-                fragment_read,
-            );
         }
     }
 }

@@ -179,7 +179,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.local_position;
     let du = fwidth(uv.x);
     let dv = fwidth(uv.y);
-    let pixel_size = max(min(du, dv), 1e-8);
+    // LOD is measured in output pixels; coverage still uses raster derivatives.
+    let output_pixel_scale = f32(max(camera.raster_scale, 1u));
+    let pixel_size = max(min(du, dv) * output_pixel_scale, 1e-8);
     let line_width = grid.params.x;
     let cell = max(grid.params.z, 1e-6);
     let subdivisions = max(grid.params.w, 1.0);

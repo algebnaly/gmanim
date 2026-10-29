@@ -8,6 +8,7 @@ use crate::vulkan::context::VulkanContext;
 use super::frame::RENDER_FRAME_COUNT;
 use super::mesh_2d::{GeometryUpload2D, Instance2D};
 use super::prepared_frame::{GpuGrid3D, GpuSdfPrimitive};
+use super::resource::assert_buffer_range;
 use super::{
     Buffer, CameraUniform, CameraUniform2D, MAX_GRIDS_3D, MAX_SURFACE_MATERIALS, MaterialData3D,
     Nv12Constants, ToneMapConstants, align_up,
@@ -60,6 +61,62 @@ pub(super) struct FrameUpload<'a> {
     pub(super) geometry_2d: &'a [GeometryUpload2D],
     pub(super) instances_2d: &'a [Instance2D],
     pub(super) tone_map_factor: u32,
+}
+
+impl FrameUpload<'_> {
+    /// Validate per-frame slices before resetting the frame fence or writing mapped memory.
+    pub(super) fn validate(&self, strides: &FrameBufferStrides) {
+        for (label, bytes, capacity) in [
+            (
+                "3D vertices",
+                std::mem::size_of_val(self.mesh_vertices),
+                strides.vertex,
+            ),
+            (
+                "3D indices",
+                std::mem::size_of_val(self.mesh_indices),
+                strides.index,
+            ),
+            (
+                "SDF primitives",
+                std::mem::size_of_val(self.primitives),
+                strides.primitive,
+            ),
+            (
+                "3D grids",
+                std::mem::size_of_val(self.grids_3d),
+                strides.grid_3d,
+            ),
+            (
+                "2D instances",
+                std::mem::size_of_val(self.instances_2d),
+                strides.instance_2d,
+            ),
+            (
+                "3D materials",
+                self.materials.len() * std::mem::size_of::<MaterialData3D>(),
+                strides.material_3d,
+            ),
+        ] {
+            assert_buffer_range(label, 0, bytes as u64, capacity);
+        }
+        assert!(self.materials.len() <= MAX_SURFACE_MATERIALS);
+        assert!(self.grids_3d.len() <= MAX_GRIDS_3D);
+        for geometry in self.geometry_2d {
+            assert_buffer_range(
+                "2D vertex staging",
+                geometry.staging_vertex_offset,
+                std::mem::size_of_val(geometry.geometry.vertices()) as u64,
+                strides.vertex_staging_2d,
+            );
+            assert_buffer_range(
+                "2D index staging",
+                geometry.staging_index_offset,
+                std::mem::size_of_val(geometry.geometry.indices()) as u64,
+                strides.index_staging_2d,
+            );
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -324,7 +381,79 @@ impl FrameBuffers {
             return;
         }
         let bytes = bytemuck::cast_slice(values);
-        let len = (capacity as usize).min(bytes.len());
-        buffer.write_bytes(offset, &bytes[..len]);
+        assert_buffer_range("frame slice", 0, bytes.len() as u64, capacity);
+        buffer.write_bytes(offset, bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytemuck::Zeroable;
+
+    #[test]
+    fn frame_upload_checks_each_slice_against_its_own_slot_capacity() {
+        let camera = CameraUniform::zeroed();
+        let camera_2d = CameraUniform2D::zeroed();
+        let vertices = [Vertex::zeroed()];
+        let indices = [0u32];
+        let primitives = [GpuSdfPrimitive::zeroed()];
+        let grids = [GpuGrid3D::zeroed()];
+        let materials = [SurfaceMaterial::default()];
+        let instances = [Instance2D::zeroed()];
+        let upload = FrameUpload {
+            camera: &camera,
+            camera_2d: &camera_2d,
+            primitives: &primitives,
+            grids_3d: &grids,
+            materials: &materials,
+            mesh_vertices: &vertices,
+            mesh_indices: &indices,
+            geometry_2d: &[],
+            instances_2d: &instances,
+            tone_map_factor: 1,
+        };
+        let strides = FrameBufferStrides {
+            vertex: std::mem::size_of_val(&vertices) as u64,
+            index: std::mem::size_of_val(&indices) as u64,
+            camera: std::mem::size_of_val(&camera) as u64,
+            material_3d: std::mem::size_of::<MaterialData3D>() as u64,
+            primitive: std::mem::size_of_val(&primitives) as u64,
+            grid_3d: std::mem::size_of_val(&grids) as u64,
+            vertex_staging_2d: 0,
+            index_staging_2d: 0,
+            instance_2d: std::mem::size_of_val(&instances) as u64,
+            camera_2d: std::mem::size_of_val(&camera_2d) as u64,
+            tone_map_factor: std::mem::size_of::<ToneMapConstants>() as u64,
+        };
+        upload.validate(&strides);
+        for undersized in [
+            FrameBufferStrides {
+                vertex: strides.vertex - 1,
+                ..strides
+            },
+            FrameBufferStrides {
+                index: strides.index - 1,
+                ..strides
+            },
+            FrameBufferStrides {
+                primitive: strides.primitive - 1,
+                ..strides
+            },
+            FrameBufferStrides {
+                grid_3d: strides.grid_3d - 1,
+                ..strides
+            },
+            FrameBufferStrides {
+                material_3d: strides.material_3d - 1,
+                ..strides
+            },
+            FrameBufferStrides {
+                instance_2d: strides.instance_2d - 1,
+                ..strides
+            },
+        ] {
+            assert!(std::panic::catch_unwind(|| upload.validate(&undersized)).is_err());
+        }
     }
 }

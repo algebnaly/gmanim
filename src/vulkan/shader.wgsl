@@ -251,27 +251,32 @@ fn map(p: vec3<f32>) -> MapResult {
 }
 
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(0.001, 0.0);
-    let n = vec3<f32>(
-        map(p + e.xyy).dist - map(p - e.xyy).dist,
-        map(p + e.yxy).dist - map(p - e.yxy).dist,
-        map(p + e.yyx).dist - map(p - e.yyx).dist
-    );
-    return normalize(n);
+    // Tetrahedron sampling needs four map() evaluations instead of the six
+    // required by central differences, and the tetrahedron stays regular
+    // around the hit point.
+    let e = 0.001;
+    let a = map(p + vec3<f32>( e, -e, -e)).dist;
+    let b = map(p + vec3<f32>(-e, -e,  e)).dist;
+    let c = map(p + vec3<f32>(-e,  e, -e)).dist;
+    let d = map(p + vec3<f32>( e,  e,  e)).dist;
+    return normalize(vec3<f32>(
+        a - b - c + d,
+        -a - b + c + d,
+        -a + b - c + d,
+    ));
 }
 
 fn raster_height() -> f32 {
     return camera.height * f32(max(camera.raster_scale, 1u));
 }
 
-fn get_pixel_radius(t: f32) -> f32 {
+fn get_pixel_radius(t: f32, fov_scale: f32, raster_h: f32) -> f32 {
     // The pixel footprint is measured in raster pixels so the analytic edge
     // feather spans one raster pixel regardless of the SSAA factor.
     if (camera.proj_type == 0u) {
-        let fov_scale = tan(camera.fov * 0.5);
-        return max(0.0001, (2.0 * t * fov_scale) / max(raster_height(), 1.0));
+        return max(0.0001, (2.0 * t * fov_scale) / max(raster_h, 1.0));
     } else {
-        return max(0.0001, (camera.ortho_top - camera.ortho_bottom) / max(raster_height() * 2.0, 1.0));
+        return max(0.0001, (camera.ortho_top - camera.ortho_bottom) / max(raster_h * 2.0, 1.0));
     }
 }
 
@@ -292,12 +297,16 @@ fn render_ray(ro: vec3<f32>, rd: vec3<f32>) -> RayResult {
     var best_t: f32 = 0.0;
     var best_material_index: u32 = 0u;
     var hit = false;
-    
+    // Both values are loop invariants: hoisting them keeps tan() and the
+    // raster-height computation out of the per-step hot path.
+    let fov_scale = tan(camera.fov * 0.5);
+    let raster_h = raster_height();
+
     for (var i: i32 = 0; i < max_steps; i = i + 1) {
         let p = ro + rd * t;
         let res = map(p);
         let d = res.dist;
-        let pr = get_pixel_radius(t);
+        let pr = get_pixel_radius(t, fov_scale, raster_h);
         
         if (d < surf_dist) {
             hit = true;

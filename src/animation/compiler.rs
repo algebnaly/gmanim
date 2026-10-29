@@ -37,8 +37,15 @@ impl TimelineBuilder {
         }
     }
 
+    pub fn compile(
+        &self,
+        animation: impl AnimationBuilder,
+    ) -> Result<AnimationClip, TimelineError> {
+        animation.compile(&self.build_scene)
+    }
+
     pub fn play(&mut self, animation: impl AnimationBuilder) -> Result<(), TimelineError> {
-        let clip = animation.compile(&self.build_scene)?;
+        let clip = self.compile(animation)?;
         self.append_clip(clip)
     }
 
@@ -129,56 +136,81 @@ impl TimelineBuilder {
     }
 
     pub fn append_clip(&mut self, clip: AnimationClip) -> Result<(), TimelineError> {
-        let (duration, tracks, events) = clip.into_parts();
-        if duration == 0 {
-            return Err(TimelineError::EmptyClip);
+        self.append_clips(vec![clip])
+    }
+
+    /// Stack clips on the same cursor. The group lasts `max(durations)` frames;
+    /// shorter tracks keep their final sample until the group ends.
+    pub fn append_clips(&mut self, clips: Vec<AnimationClip>) -> Result<(), TimelineError> {
+        if clips.is_empty() {
+            return Ok(());
         }
-        for track in &tracks {
-            track.validate(&self.build_scene, duration)?;
+
+        let start = self.cursor;
+        let mut prepared = Vec::with_capacity(clips.len());
+        let mut group_duration = 0u32;
+
+        for clip in clips {
+            let duration = clip.duration();
+            if duration == 0 {
+                return Err(TimelineError::EmptyClip);
+            }
+            group_duration = group_duration.max(duration);
+            let (_, tracks, events) = clip.into_parts();
+            prepared.push((duration, tracks, events));
         }
-        for event in &events {
-            if event.frame == 0 || event.frame > duration {
-                return Err(TimelineError::EventOutsideClip {
-                    frame: event.frame,
-                    duration,
-                });
+
+        let mut new_tracks = Vec::new();
+        let mut new_events = Vec::new();
+
+        for (duration, tracks, events) in prepared {
+            for track in &tracks {
+                track.validate(&self.build_scene, duration)?;
+            }
+            for event in &events {
+                if event.frame == 0 || event.frame > duration {
+                    return Err(TimelineError::EventOutsideClip {
+                        frame: event.frame,
+                        duration,
+                    });
+                }
+            }
+
+            let range = FrameRange {
+                start,
+                end: start + duration,
+            };
+            for track in tracks {
+                let compiled = track.compile(range);
+                self.validate_conflicts(&compiled, &new_tracks)?;
+                new_tracks.push(compiled);
+            }
+
+            for event in events {
+                let event = TimedEvent {
+                    frame: start + event.frame,
+                    order: self.next_event_order,
+                    operation: event.operation,
+                };
+                self.next_event_order += 1;
+                new_events.push(event);
             }
         }
 
-        let range = FrameRange {
-            start: self.cursor,
-            end: self.cursor + duration,
-        };
-        let mut new_tracks = Vec::with_capacity(tracks.len());
-        for track in tracks {
-            let compiled = track.compile(range);
-            self.validate_conflicts(&compiled, &new_tracks)?;
-            new_tracks.push(compiled);
-        }
-
-        let mut new_events = Vec::with_capacity(events.len());
-        for event in events {
-            let event = TimedEvent {
-                frame: self.cursor + event.frame,
-                order: self.next_event_order,
-                operation: event.operation,
-            };
-            self.next_event_order += 1;
-            new_events.push(event);
-        }
         new_events.sort_by_key(|event| (event.frame, event.order));
 
         for event in &new_events {
             apply_operation(&mut self.build_scene, &event.operation)?;
         }
+        let group_end = start + group_duration;
         for track in &new_tracks {
-            track.apply(range.end, &mut self.build_scene)?;
+            track.apply(group_end, &mut self.build_scene)?;
         }
 
         self.tracks.extend(new_tracks);
         self.events.extend(new_events);
         self.events.sort_by_key(|event| (event.frame, event.order));
-        self.cursor = range.end;
+        self.cursor = group_end;
         Ok(())
     }
 

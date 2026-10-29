@@ -199,7 +199,7 @@ impl Drop for VideoNv12Image {
 }
 
 pub(super) struct VideoNv12Slot {
-    pub image: VideoNv12Image,
+    pub image: Arc<VideoNv12Image>,
     pub descriptor_set: vk::DescriptorSet,
     pub layout: vk::ImageLayout,
     pub timeline: Arc<TimelineSemaphore>,
@@ -211,7 +211,7 @@ pub(super) struct VideoNv12Slot {
 impl VideoNv12Slot {
     pub(super) fn new(ctx: &Arc<VulkanContext>, width: u32, height: u32) -> Self {
         Self {
-            image: VideoNv12Image::new(ctx, width, height),
+            image: Arc::new(VideoNv12Image::new(ctx, width, height)),
             descriptor_set: vk::DescriptorSet::null(),
             layout: vk::ImageLayout::UNDEFINED,
             timeline: TimelineSemaphore::new(ctx, 0)

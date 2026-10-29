@@ -1,14 +1,26 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
-use crate::mobjects::mesh_3d::{AlphaMode3D, SurfaceMaterial, Vertex};
+use crate::mobjects::GridStyle3D;
+use crate::mobjects::mesh_3d::{AlphaMode3D, Geometry3DId, SurfaceMaterial, Vertex};
 use crate::mobjects::object_3d::SdfPrimitive;
-use crate::mobjects::{GridStyle3D, Rectangle, RectangleId};
 
 use super::mesh_2d::{
-    CachedRectangle2D, Instance2D, Mesh2DBatch, Mesh2DSubmission, build_ordered_mesh_2d_batches,
-    rectangle_analytic_aa_params,
+    Instance2D, Mesh2DBatch, Mesh2DSubmission, build_ordered_mesh_2d_batches,
 };
 use super::{CameraUniform, CameraUniform2D, Mesh3DDraw};
+
+type TransformBits = [[u32; 4]; 4];
+type MeshCacheKey3D = (Geometry3DId, TransformBits);
+
+struct CachedMesh3D {
+    vertices: Arc<[Vertex]>,
+    world_center: nalgebra::Point3<crate::GMFloat>,
+}
+
+fn matrix_to_bits(matrix: &nalgebra::Matrix4<crate::GMFloat>) -> TransformBits {
+    std::array::from_fn(|row| std::array::from_fn(|col| matrix[(row, col)].to_bits()))
+}
 
 pub(super) struct PreparedSdfPrimitive {
     pub(super) primitive: SdfPrimitive,
@@ -40,7 +52,27 @@ pub(super) struct PreparedScene {
 
 #[derive(Default)]
 pub(super) struct ScenePreparer {
-    rectangle_cache_2d: HashMap<RectangleId, CachedRectangle2D>,
+    mesh_cache_3d: HashMap<MeshCacheKey3D, CachedMesh3D>,
+}
+
+/// Opaque draws are ordered front-to-back so that early depth rejection
+/// avoids shading pixels that are later covered by a nearer mesh.
+/// Transparent draws stay back-to-front because they are alpha-composited.
+fn sort_mesh_draws_3d(draws: &mut [Mesh3DDraw]) {
+    draws.sort_by(
+        |left, right| match (left.is_transparent(), right.is_transparent()) {
+            (false, true) => std::cmp::Ordering::Less,
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, false) => left
+                .view_depth
+                .partial_cmp(&right.view_depth)
+                .unwrap_or(std::cmp::Ordering::Equal),
+            (true, true) => right
+                .view_depth
+                .partial_cmp(&left.view_depth)
+                .unwrap_or(std::cmp::Ordering::Equal),
+        },
+    );
 }
 
 impl ScenePreparer {
@@ -92,7 +124,7 @@ impl ScenePreparer {
         let mut grids_3d = Vec::new();
 
         let mut mesh_submissions_2d = Vec::new();
-        let mut active_rectangles_2d = HashSet::new();
+        let mut active_meshes_3d = HashSet::new();
 
         struct VulkanDataCollector<'a> {
             sdf_primitives: &'a mut Vec<PreparedSdfPrimitive>,
@@ -102,8 +134,8 @@ impl ScenePreparer {
             surface_materials: &'a mut Vec<SurfaceMaterial>,
             grids_3d: &'a mut Vec<PreparedGrid3D>,
             mesh_submissions_2d: &'a mut Vec<Mesh2DSubmission>,
-            rectangle_cache_2d: &'a mut HashMap<RectangleId, CachedRectangle2D>,
-            active_rectangles_2d: &'a mut HashSet<RectangleId>,
+            mesh_cache_3d: &'a mut HashMap<MeshCacheKey3D, CachedMesh3D>,
+            active_meshes_3d: &'a mut HashSet<MeshCacheKey3D>,
             camera_position: nalgebra::Point3<crate::GMFloat>,
             camera_look: nalgebra::Vector3<crate::GMFloat>,
         }
@@ -116,56 +148,8 @@ impl ScenePreparer {
             ) {
                 self.mesh_submissions_2d.push(Mesh2DSubmission {
                     geometry: mesh.geometry(),
-                    instance: Instance2D::new(
-                        transform,
-                        mesh.color(),
-                        [0.0, 0.0, mesh.aa_mode, 0.0],
-                    ),
-                    dynamic: false,
-                });
-            }
-
-            fn push_rectangle_2d(
-                &mut self,
-                id: RectangleId,
-                rectangle: &Rectangle,
-                geometry_revision: u64,
-                dynamic: bool,
-                transform: nalgebra::Matrix4<crate::GMFloat>,
-            ) {
-                self.active_rectangles_2d.insert(id);
-                let rebuild = self
-                    .rectangle_cache_2d
-                    .get(&id)
-                    .map(|cached| {
-                        cached.geometry_revision != geometry_revision
-                            || !cached.source.same_geometry(rectangle)
-                    })
-                    .unwrap_or(true);
-                if rebuild {
-                    self.rectangle_cache_2d.insert(
-                        id,
-                        CachedRectangle2D {
-                            geometry_revision,
-                            source: rectangle.clone(),
-                            geometry: rectangle.tessellate().geometry(),
-                        },
-                    );
-                }
-                let geometry = self.rectangle_cache_2d[&id].geometry.clone();
-                self.mesh_submissions_2d.push(Mesh2DSubmission {
-                    geometry,
-                    instance: Instance2D::new(
-                        transform,
-                        [
-                            rectangle.color.r as f32 / 255.0,
-                            rectangle.color.g as f32 / 255.0,
-                            rectangle.color.b as f32 / 255.0,
-                            rectangle.color.a as f32 / 255.0,
-                        ],
-                        rectangle_analytic_aa_params(rectangle),
-                    ),
-                    dynamic,
+                    instance: Instance2D::new(transform, mesh.color(), mesh.aa_params()),
+                    dynamic: mesh.is_dynamic(),
                 });
             }
 
@@ -174,48 +158,84 @@ impl ScenePreparer {
                 self.surface_materials.push(surface.material);
                 match surface.geometry {
                     crate::mobjects::Geometry3DRef::Mesh(mesh) => {
+                        let vertices = mesh.vertices();
+                        let indices = mesh.indices();
+                        if vertices.is_empty() || indices.is_empty() {
+                            return;
+                        }
+                        let cache_key = (mesh.geometry().id(), matrix_to_bits(&surface.transform));
+                        self.active_meshes_3d.insert(cache_key);
+                        let cached = self.mesh_cache_3d.entry(cache_key).or_insert_with(|| {
+                            let linear = surface.transform.fixed_view::<3, 3>(0, 0).into_owned();
+                            let normal_matrix = linear
+                                .try_inverse()
+                                .map(|inverse| inverse.transpose())
+                                .unwrap_or_else(|| {
+                                    // Cofactors preserve normals for surfaces flattened to a plane.
+                                    // Fully collapsed surfaces have no geometric normal.
+                                    nalgebra::Matrix3::from_columns(&[
+                                        linear.column(1).cross(&linear.column(2)),
+                                        linear.column(2).cross(&linear.column(0)),
+                                        linear.column(0).cross(&linear.column(1)),
+                                    ])
+                                });
+                            let mut world_center = nalgebra::Point3::origin();
+                            let transformed: Vec<Vertex> = vertices
+                                .iter()
+                                .map(|vertex| {
+                                    let position = nalgebra::Point3::new(
+                                        vertex.position[0] as crate::GMFloat,
+                                        vertex.position[1] as crate::GMFloat,
+                                        vertex.position[2] as crate::GMFloat,
+                                    );
+                                    let world_position =
+                                        surface.transform.transform_point(&position);
+                                    world_center.coords += world_position.coords;
+                                    let normal = nalgebra::Vector3::new(
+                                        vertex.normal[0] as crate::GMFloat,
+                                        vertex.normal[1] as crate::GMFloat,
+                                        vertex.normal[2] as crate::GMFloat,
+                                    );
+                                    let world_normal = (normal_matrix * normal)
+                                        .try_normalize(0.0)
+                                        .filter(|normal| {
+                                            normal.iter().all(|value| value.is_finite())
+                                        })
+                                        .unwrap_or_else(nalgebra::Vector3::z);
+                                    Vertex {
+                                        position: [
+                                            world_position.x,
+                                            world_position.y,
+                                            world_position.z,
+                                        ],
+                                        normal: [world_normal.x, world_normal.y, world_normal.z],
+                                        color: vertex.color,
+                                        surface_coord: vertex.surface_coord,
+                                    }
+                                })
+                                .collect();
+                            world_center.coords /= vertices.len() as crate::GMFloat;
+                            CachedMesh3D {
+                                vertices: transformed.into(),
+                                world_center,
+                            }
+                        });
                         let base_index = self.mesh_vertices.len() as u32;
                         let first_index = self.mesh_indices.len() as u32;
-                        let mut world_center = nalgebra::Point3::origin();
-                        for vertex in &mesh.vertices {
-                            let position = nalgebra::Point3::new(
-                                vertex.position[0] as crate::GMFloat,
-                                vertex.position[1] as crate::GMFloat,
-                                vertex.position[2] as crate::GMFloat,
-                            );
-                            let world_position = surface.transform.transform_point(&position);
-                            world_center.coords += world_position.coords;
-                            let normal = nalgebra::Vector3::new(
-                                vertex.normal[0] as crate::GMFloat,
-                                vertex.normal[1] as crate::GMFloat,
-                                vertex.normal[2] as crate::GMFloat,
-                            );
-                            let world_normal =
-                                surface.transform.transform_vector(&normal).normalize();
-                            self.mesh_vertices.push(Vertex {
-                                position: [world_position.x, world_position.y, world_position.z],
-                                normal: [world_normal.x, world_normal.y, world_normal.z],
-                                color: vertex.color,
-                                surface_coord: vertex.surface_coord,
-                            });
-                        }
-                        for index in &mesh.indices {
-                            self.mesh_indices.push(*index + base_index);
-                        }
-                        if !mesh.vertices.is_empty() && !mesh.indices.is_empty() {
-                            world_center.coords /= mesh.vertices.len() as crate::GMFloat;
-                            self.mesh_draws_3d.push(Mesh3DDraw {
-                                first_index,
-                                index_count: mesh.indices.len() as u32,
-                                material_index,
-                                transparent: matches!(
-                                    surface.material.alpha_mode,
-                                    AlphaMode3D::Blend(_)
-                                ),
-                                view_depth: (world_center - self.camera_position)
-                                    .dot(&self.camera_look),
-                            });
-                        }
+                        self.mesh_vertices.extend_from_slice(&cached.vertices);
+                        self.mesh_indices
+                            .extend(indices.iter().map(|index| *index + base_index));
+                        self.mesh_draws_3d.push(Mesh3DDraw {
+                            first_index,
+                            index_count: indices.len() as u32,
+                            material_index,
+                            transparent: matches!(
+                                surface.material.alpha_mode,
+                                AlphaMode3D::Blend(_)
+                            ),
+                            view_depth: (cached.world_center - self.camera_position)
+                                .dot(&self.camera_look),
+                        });
                     }
                     crate::mobjects::Geometry3DRef::Sdf(sdf) => {
                         assert!(
@@ -253,15 +273,15 @@ impl ScenePreparer {
                 surface_materials: &mut surface_materials,
                 grids_3d: &mut grids_3d,
                 mesh_submissions_2d: &mut mesh_submissions_2d,
-                rectangle_cache_2d: &mut self.rectangle_cache_2d,
-                active_rectangles_2d: &mut active_rectangles_2d,
+                mesh_cache_3d: &mut self.mesh_cache_3d,
+                active_meshes_3d: &mut active_meshes_3d,
                 camera_position: scene.camera.position,
                 camera_look: scene.camera.look_at_dir(),
             };
             scene.world.submit_to_renderer(&mut collector);
         }
-        self.rectangle_cache_2d
-            .retain(|id, _| active_rectangles_2d.contains(id));
+        self.mesh_cache_3d
+            .retain(|key, _| active_meshes_3d.contains(key));
         let mesh_batches_2d = build_ordered_mesh_2d_batches(mesh_submissions_2d);
 
         let camera_uniform_2d = CameraUniform2D {
@@ -346,16 +366,7 @@ impl ScenePreparer {
             background_color: bg_clear_color,
         };
 
-        mesh_draws_3d.sort_by(|left, right| {
-            left.is_transparent()
-                .cmp(&right.is_transparent())
-                .then_with(|| {
-                    right
-                        .view_depth
-                        .partial_cmp(&left.view_depth)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-        });
+        sort_mesh_draws_3d(&mut mesh_draws_3d);
 
         PreparedScene {
             width: scene_config.output_width,
@@ -385,6 +396,60 @@ mod tests {
     use crate::mobjects::object_3d::{SdfPrimitive, Sphere3D};
     use crate::mobjects::{GridPlane, GridPlane3D, GridStyle3D, Rectangle};
     use crate::{Color, Scene, SceneConfig};
+
+    fn prepare_transformed_triangle(
+        transform: nalgebra::Matrix4<crate::GMFloat>,
+    ) -> super::PreparedScene {
+        let normal = Vector3::new(-1.0, -1.0, 1.0).normalize();
+        let vertices = [[0.0, 0.0, 0.0], [1.0, 0.0, 1.0], [0.0, 1.0, 1.0]].map(|position| {
+            crate::mobjects::mesh_3d::Vertex {
+                position,
+                normal: normal.into(),
+                color: [1.0; 4],
+                surface_coord: [0.0; 3],
+            }
+        });
+        let mut scene = Scene::default();
+        let id = scene.add(TriangleMesh3D::new(vertices.to_vec(), vec![0, 1, 2]));
+        scene.world.get_mut(id).unwrap().set_transform(transform);
+        ScenePreparer::default().prepare(&scene, &SceneConfig::default(), 1)
+    }
+
+    #[test]
+    fn mesh_normals_remain_perpendicular_after_scaling_shear_and_reflection() {
+        for x_scale in [2.0, -2.0] {
+            let mut transform =
+                nalgebra::Matrix4::new_nonuniform_scaling(&Vector3::new(x_scale, 3.0, 0.5));
+            transform[(0, 1)] = 0.4;
+            transform[(0, 3)] = 7.0;
+            let prepared = prepare_transformed_triangle(transform);
+            let positions: Vec<_> = prepared
+                .mesh_vertices
+                .iter()
+                .map(|vertex| Vector3::from(vertex.position))
+                .collect();
+            let normal = Vector3::from(prepared.mesh_vertices[0].normal);
+            assert!((normal.norm() - 1.0).abs() < 1e-6);
+            assert!(normal.dot(&(positions[1] - positions[0])).abs() < 1e-6);
+            assert!(normal.dot(&(positions[2] - positions[0])).abs() < 1e-6);
+            // Reflections must preserve the inverse-transpose normal orientation.
+            assert!(normal.dot(&transform.transform_vector(&Vector3::new(-1.0, -1.0, 1.0))) > 0.0);
+        }
+    }
+
+    #[test]
+    fn singular_mesh_transforms_keep_finite_normals() {
+        for scale in [Vector3::new(2.0, 3.0, 0.0), Vector3::zeros()] {
+            let prepared =
+                prepare_transformed_triangle(nalgebra::Matrix4::new_nonuniform_scaling(&scale));
+            assert_eq!(prepared.mesh_indices.len(), 3);
+            for vertex in prepared.mesh_vertices {
+                let normal = Vector3::from(vertex.normal);
+                assert!(normal.iter().all(|value| value.is_finite()));
+                assert!((normal - Vector3::z()).norm() < 1e-6);
+            }
+        }
+    }
 
     #[test]
     fn preparation_collects_scene_without_a_vulkan_device() {
@@ -437,5 +502,74 @@ mod tests {
             &first.mesh_batches_2d[0].geometry,
             &second.mesh_batches_2d[0].geometry,
         ));
+        assert_eq!(
+            first.mesh_batches_2d[0].geometry.id(),
+            second.mesh_batches_2d[0].geometry.id(),
+        );
+    }
+
+    #[test]
+    fn mesh_3d_world_transform_cache_tracks_geometry_id_and_transform() {
+        let mut scene = Scene::default();
+        let box_id = scene.add(TriangleMesh3D::box_mesh(
+            Point3::new(0.0, 0.0, -3.0),
+            Vector3::new(0.5, 0.5, 0.5),
+            Color::white(),
+        ));
+        let config = SceneConfig::default();
+        let mut preparer = ScenePreparer::default();
+
+        let first = preparer.prepare(&scene, &config, 1);
+        assert_eq!(preparer.mesh_cache_3d.len(), 1);
+        let second = preparer.prepare(&scene, &config, 1);
+        assert_eq!(preparer.mesh_cache_3d.len(), 1);
+        assert_eq!(first.mesh_vertices, second.mesh_vertices);
+
+        scene
+            .world
+            .get_mut(box_id)
+            .unwrap()
+            .move_by(Vector3::new(1.0, 0.0, 0.0));
+        let moved = preparer.prepare(&scene, &config, 1);
+        assert_eq!(preparer.mesh_cache_3d.len(), 1);
+        assert_ne!(first.mesh_vertices, moved.mesh_vertices);
+
+        scene.world.remove(box_id).unwrap();
+        let _ = preparer.prepare(&scene, &config, 1);
+        assert!(preparer.mesh_cache_3d.is_empty());
+    }
+
+    #[test]
+    fn opaque_draws_are_sorted_front_to_back_and_transparent_back_to_front() {
+        let draw = |view_depth, transparent| super::Mesh3DDraw {
+            first_index: 0,
+            index_count: 3,
+            material_index: 0,
+            transparent,
+            view_depth,
+        };
+        let mut draws = vec![
+            draw(5.0, false),
+            draw(1.0, true),
+            draw(1.0, false),
+            draw(5.0, true),
+            draw(3.0, false),
+            draw(3.0, true),
+        ];
+        super::sort_mesh_draws_3d(&mut draws);
+        assert_eq!(
+            draws
+                .iter()
+                .map(|draw| (draw.is_transparent(), draw.view_depth))
+                .collect::<Vec<_>>(),
+            vec![
+                (false, 1.0),
+                (false, 3.0),
+                (false, 5.0),
+                (true, 5.0),
+                (true, 3.0),
+                (true, 1.0),
+            ]
+        );
     }
 }

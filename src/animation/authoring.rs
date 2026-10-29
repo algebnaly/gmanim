@@ -158,6 +158,39 @@ impl AnimationBuilder for Rotate {
     }
 }
 
+pub struct Spin {
+    target: MobjectId,
+    axis_angle: Vector3<GMFloat>,
+    duration: u32,
+}
+
+impl Spin {
+    pub fn new(target: MobjectId, axis_angle: Vector3<GMFloat>, duration: u32) -> Self {
+        Self {
+            target,
+            axis_angle,
+            duration,
+        }
+    }
+}
+
+impl AnimationBuilder for Spin {
+    fn compile(self, scene: &Scene) -> Result<AnimationClip, TimelineError> {
+        if self.duration == 0 {
+            return Err(TimelineError::EmptyClip);
+        }
+        let start = scene.world.get(self.target)?.transform();
+        let values: Arc<[Matrix4<GMFloat>]> = (0..=self.duration)
+            .map(|frame| {
+                let alpha = frame as GMFloat / self.duration as GMFloat;
+                start * Matrix4::new_rotation(self.axis_angle * alpha)
+            })
+            .collect::<Vec<_>>()
+            .into();
+        Ok(AnimationClip::new(self.duration).transform(self.target, Curve::Sampled(values)))
+    }
+}
+
 pub struct MorphRectangle {
     target: MobjectId,
     target_corners: [Point3<GMFloat>; 4],

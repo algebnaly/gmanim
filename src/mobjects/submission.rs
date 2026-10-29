@@ -3,8 +3,6 @@ use nalgebra::Matrix4;
 use crate::GMFloat;
 
 use super::{
-    RectangleId,
-    basic::Rectangle,
     grid_3d::GridPlane3D,
     mesh_2d::TriangleMesh2D,
     mesh_3d::{SurfaceMaterial, TriangleMesh3D},
@@ -29,15 +27,6 @@ pub struct Surface3DSubmission<'a> {
 
 pub trait RenderVisitor {
     fn push_mesh_2d(&mut self, mesh: &TriangleMesh2D, transform: Matrix4<GMFloat>);
-
-    fn push_rectangle_2d(
-        &mut self,
-        id: RectangleId,
-        rectangle: &Rectangle,
-        geometry_revision: u64,
-        dynamic: bool,
-        transform: Matrix4<GMFloat>,
-    );
 
     fn push_surface_3d(&mut self, surface: Surface3DSubmission<'_>);
 

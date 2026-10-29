@@ -1,11 +1,23 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::Color;
 use lyon::tessellation::{
     FillVertex, FillVertexConstructor, StrokeVertex, StrokeVertexConstructor,
 };
+
+static NEXT_GEOMETRY_2D_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Geometry2DId(u64);
+
+impl Geometry2DId {
+    fn next() -> Self {
+        Self(NEXT_GEOMETRY_2D_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -27,6 +39,7 @@ pub struct GeometryFingerprint {
 
 #[derive(Debug)]
 pub struct MeshGeometry2D {
+    id: Geometry2DId,
     vertices: Box<[Vertex2D]>,
     indices: Box<[u32]>,
     fingerprint: GeometryFingerprint,
@@ -36,10 +49,15 @@ impl MeshGeometry2D {
     pub fn new(vertices: Vec<Vertex2D>, indices: Vec<u32>) -> Self {
         let fingerprint = geometry_fingerprint(&vertices, &indices);
         Self {
+            id: Geometry2DId::next(),
             vertices: vertices.into_boxed_slice(),
             indices: indices.into_boxed_slice(),
             fingerprint,
         }
+    }
+
+    pub fn id(&self) -> Geometry2DId {
+        self.id
     }
 
     pub fn vertices(&self) -> &[Vertex2D] {
@@ -55,6 +73,9 @@ impl MeshGeometry2D {
     }
 
     pub fn same_geometry(&self, other: &Self) -> bool {
+        if self.id == other.id {
+            return true;
+        }
         self.fingerprint == other.fingerprint
             && self
                 .vertices
@@ -63,16 +84,20 @@ impl MeshGeometry2D {
                 .all(|(left, right)| {
                     left.position[0].to_bits() == right.position[0].to_bits()
                         && left.position[1].to_bits() == right.position[1].to_bits()
+                        && left.local[0].to_bits() == right.local[0].to_bits()
+                        && left.local[1].to_bits() == right.local[1].to_bits()
                 })
             && self.indices == other.indices
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct TriangleMesh2D {
     geometry: Arc<MeshGeometry2D>,
     color: [f32; 4],
     pub aa_mode: f32,
+    analytic_half_extents: [f32; 2],
+    dynamic: bool,
 }
 
 impl Default for TriangleMesh2D {
@@ -81,6 +106,8 @@ impl Default for TriangleMesh2D {
             geometry: Arc::new(MeshGeometry2D::new(Vec::new(), Vec::new())),
             color: color_to_f32(Color::default()),
             aa_mode: 0.0,
+            analytic_half_extents: [0.0; 2],
+            dynamic: false,
         }
     }
 }
@@ -91,7 +118,42 @@ impl TriangleMesh2D {
             geometry: Arc::new(MeshGeometry2D::new(vertices, indices)),
             color: color_to_f32(color),
             aa_mode: 0.0,
+            analytic_half_extents: [0.0; 2],
+            dynamic: false,
         }
+    }
+
+    pub fn with_linear_color(mut self, color: [f32; 4]) -> Self {
+        self.color = color;
+        self
+    }
+
+    pub fn with_aa_params(mut self, aa_params: [f32; 4]) -> Self {
+        self.analytic_half_extents = [aa_params[0], aa_params[1]];
+        self.aa_mode = aa_params[2];
+        self
+    }
+
+    pub fn with_dynamic(mut self, dynamic: bool) -> Self {
+        self.dynamic = dynamic;
+        self
+    }
+
+    pub fn set_dynamic(&mut self, dynamic: bool) {
+        self.dynamic = dynamic;
+    }
+
+    pub fn is_dynamic(&self) -> bool {
+        self.dynamic
+    }
+
+    pub fn aa_params(&self) -> [f32; 4] {
+        [
+            self.analytic_half_extents[0],
+            self.analytic_half_extents[1],
+            self.aa_mode,
+            0.0,
+        ]
     }
 
     pub fn replace_geometry(&mut self, vertices: Vec<Vertex2D>, indices: Vec<u32>, color: Color) {
@@ -156,6 +218,13 @@ impl RectVertexBuilder {
             origin,
             x_axis,
             y_axis,
+        }
+    }
+
+    pub fn project_vertex(&self, position: [f32; 2]) -> Vertex2D {
+        Vertex2D {
+            position,
+            local: self.local_from_position(position),
         }
     }
 

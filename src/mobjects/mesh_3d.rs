@@ -1,10 +1,53 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::Color;
 use crate::GMFloat;
 use crate::mobjects::Mobject;
 use nalgebra::{Matrix4, Point3, Vector3};
 
+static NEXT_GEOMETRY_3D_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Geometry3DId(u64);
+
+impl Geometry3DId {
+    fn next() -> Self {
+        Self(NEXT_GEOMETRY_3D_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+#[derive(Debug)]
+pub struct MeshGeometry3D {
+    id: Geometry3DId,
+    vertices: Box<[Vertex]>,
+    indices: Box<[u32]>,
+}
+
+impl MeshGeometry3D {
+    pub fn new(vertices: Vec<Vertex>, indices: Vec<u32>) -> Self {
+        Self {
+            id: Geometry3DId::next(),
+            vertices: vertices.into_boxed_slice(),
+            indices: indices.into_boxed_slice(),
+        }
+    }
+
+    pub fn id(&self) -> Geometry3DId {
+        self.id
+    }
+
+    pub fn vertices(&self) -> &[Vertex] {
+        &self.vertices
+    }
+
+    pub fn indices(&self) -> &[u32] {
+        &self.indices
+    }
+}
+
 #[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct Vertex {
     pub position: [f32; 3],
     pub normal: [f32; 3],
@@ -101,9 +144,9 @@ impl Default for SurfaceMaterial {
     }
 }
 
+#[derive(Clone, Debug)]
 pub struct TriangleMesh3D {
-    pub vertices: Vec<Vertex>,
-    pub indices: Vec<u32>,
+    geometry: Arc<MeshGeometry3D>,
     pub model_matrix: Matrix4<GMFloat>,
     pub material: SurfaceMaterial,
 }
@@ -119,14 +162,29 @@ impl TriangleMesh3D {
             AlphaMode3D::Opaque
         };
         Self {
-            vertices,
-            indices,
+            geometry: Arc::new(MeshGeometry3D::new(vertices, indices)),
             model_matrix: Matrix4::identity(),
             material: SurfaceMaterial {
                 alpha_mode,
                 ..Default::default()
             },
         }
+    }
+
+    pub fn replace_geometry(&mut self, vertices: Vec<Vertex>, indices: Vec<u32>) {
+        self.geometry = Arc::new(MeshGeometry3D::new(vertices, indices));
+    }
+
+    pub fn geometry(&self) -> Arc<MeshGeometry3D> {
+        self.geometry.clone()
+    }
+
+    pub fn vertices(&self) -> &[Vertex] {
+        self.geometry.vertices()
+    }
+
+    pub fn indices(&self) -> &[u32] {
+        self.geometry.indices()
     }
 
     pub fn with_material(mut self, material: SurfaceMaterial) -> Self {
@@ -651,9 +709,9 @@ mod tests {
             Color::white(),
         );
 
-        assert_eq!(mesh.vertices.len(), 45);
-        assert_eq!(mesh.indices.len(), 8 * 8 * 3);
-        for vertex in mesh.vertices {
+        assert_eq!(mesh.vertices().len(), 45);
+        assert_eq!(mesh.indices().len(), 8 * 8 * 3);
+        for vertex in mesh.vertices() {
             let point = Point3::new(vertex.position[0], vertex.position[1], vertex.position[2]);
             assert!(((point - center).norm() - radius).abs() < 1e-4);
         }

@@ -10,6 +10,7 @@ use crate::GMFloat;
 
 use super::{
     basic::Rectangle,
+    mesh_2d::TriangleMesh2D,
     mobject::Mobject,
     node::{MobjectId, MobjectNode, RectangleId, VisualComponent},
     spawn::{NodeBundle, NodeVisual, ReservedNode, SpawnPlan},
@@ -21,8 +22,8 @@ static NEXT_WORLD_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 struct RectangleComponent {
     shape: Rectangle,
+    mesh: TriangleMesh2D,
     geometry_revision: u64,
-    dynamic: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,10 +151,11 @@ impl SceneWorld {
             NodeVisual::None => VisualComponent::None,
             NodeVisual::Renderable(renderable) => VisualComponent::Renderable(renderable.clone()),
             NodeVisual::Rectangle(rectangle) => {
+                let mesh = rectangle.tessellate();
                 let rectangle = self.rectangles.insert(RectangleComponent {
                     shape: rectangle.clone(),
+                    mesh,
                     geometry_revision: 0,
-                    dynamic: false,
                 });
                 VisualComponent::Rectangle(rectangle)
             }
@@ -245,13 +247,13 @@ impl SceneWorld {
         let component = &mut self.rectangles[rectangle];
         component.shape.set_corners(corners);
         component.geometry_revision = component.geometry_revision.wrapping_add(1);
-        component.dynamic = true;
+        component.mesh = component.shape.tessellate().with_dynamic(true);
         Ok(())
     }
 
     pub fn freeze_rectangle_geometry(&mut self, id: MobjectId) -> Result<(), SceneWorldError> {
         let rectangle = self.rectangle_component_id(id)?;
-        self.rectangles[rectangle].dynamic = false;
+        self.rectangles[rectangle].mesh.set_dynamic(false);
         Ok(())
     }
 
@@ -372,13 +374,7 @@ impl SceneWorld {
             }
             VisualComponent::Rectangle(rectangle) => {
                 let component = &self.rectangles[*rectangle];
-                visitor.push_rectangle_2d(
-                    *rectangle,
-                    &component.shape,
-                    component.geometry_revision,
-                    component.dynamic,
-                    world_transform,
-                );
+                visitor.push_mesh_2d(&component.mesh, world_transform);
             }
         }
         for child in self.ordered_ids(node.children()).iter().copied() {

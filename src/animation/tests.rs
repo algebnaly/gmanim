@@ -4,7 +4,7 @@ use crate::{Context, Scene, mobjects::Rectangle};
 
 use super::{
     AaLevelProperty, AnimationClip, CameraPoseProperty, Curve, MorphRectangle, Move,
-    SceneOperation, TimelineBuilder, TimelineError, Wait,
+    SceneOperation, Spin, TimelineBuilder, TimelineError, Wait,
 };
 
 #[test]
@@ -89,6 +89,67 @@ fn morph_rectangle_compiles_to_corner_track() {
         timeline.scene.world.rectangle(rectangle).unwrap().corners(),
         target
     );
+}
+
+#[test]
+fn spin_composes_local_rotation_without_moving_origin() {
+    let mut scene = Scene::default();
+    let rectangle = scene.add_rectangle(Rectangle::default());
+    scene
+        .world
+        .get_mut(rectangle)
+        .unwrap()
+        .set_transform(Matrix4::new_translation(&Vector3::new(2.0, 0.0, 0.0)));
+    let mut builder = TimelineBuilder::new(scene, Context::default());
+    builder
+        .play(Spin::new(
+            rectangle,
+            Vector3::z() * std::f32::consts::FRAC_PI_2,
+            2,
+        ))
+        .unwrap();
+    let mut timeline = builder.build();
+
+    timeline.seek(2).unwrap();
+    let transform = timeline.scene.world.get(rectangle).unwrap().transform();
+    assert!((transform[(0, 3)] - 2.0).abs() < 1e-5);
+    assert!(transform[(1, 3)].abs() < 1e-5);
+    assert!(transform[(2, 3)].abs() < 1e-5);
+
+    let expected = Matrix4::new_translation(&Vector3::new(2.0, 0.0, 0.0))
+        * Matrix4::new_rotation(Vector3::z() * std::f32::consts::FRAC_PI_2);
+    for row in 0..4 {
+        for col in 0..4 {
+            assert!((transform[(row, col)] - expected[(row, col)]).abs() < 1e-5);
+        }
+    }
+}
+
+#[test]
+fn spin_and_orbit_rotate_differ_after_prior_local_rotation() {
+    let mut scene = Scene::default();
+    let rectangle = scene.add_rectangle(Rectangle::default());
+    let start = Matrix4::new_translation(&Vector3::new(2.0, 0.0, 0.0))
+        * Matrix4::new_rotation(Vector3::x() * std::f32::consts::FRAC_PI_2);
+    scene.world.get_mut(rectangle).unwrap().set_transform(start);
+    let mut builder = TimelineBuilder::new(scene, Context::default());
+    builder
+        .play(Spin::new(
+            rectangle,
+            Vector3::z() * std::f32::consts::FRAC_PI_2,
+            1,
+        ))
+        .unwrap();
+    let mut timeline = builder.build();
+    timeline.seek(1).unwrap();
+    let spun = timeline.scene.world.get(rectangle).unwrap().transform();
+
+    let orbit = Matrix4::new_rotation_wrt_point(
+        Vector3::z() * std::f32::consts::FRAC_PI_2,
+        Point3::new(2.0, 0.0, 0.0),
+    ) * start;
+    assert!((spun[(0, 3)] - 2.0).abs() < 1e-5);
+    assert!((spun - orbit).norm() > 1e-3);
 }
 
 #[test]
@@ -279,6 +340,95 @@ fn later_boundary_operations_do_not_consume_frames() {
     timeline.seek(1).unwrap();
     assert!(timeline.scene.world.contains(original));
     assert!(timeline.scene.world.is_reserved(added));
+}
+
+#[test]
+fn parallel_clips_share_a_cursor_and_shorter_tracks_hold() {
+    let mut scene = Scene::default();
+    let first = scene.add_rectangle(Rectangle::default());
+    let second = scene.add_rectangle(Rectangle::default());
+    let mut builder = TimelineBuilder::new(scene, Context::default());
+    let first_clip = builder
+        .compile(Move::new(first, Vector3::new(2.0, 0.0, 0.0), 2))
+        .unwrap();
+    let second_clip = builder
+        .compile(Move::new(second, Vector3::new(0.0, 4.0, 0.0), 4))
+        .unwrap();
+    builder.append_clips(vec![first_clip, second_clip]).unwrap();
+    let mut timeline = builder.build();
+
+    assert_eq!(timeline.total_frames(), 4);
+    timeline.seek(2).unwrap();
+    assert_eq!(
+        timeline.scene.world.get(first).unwrap().transform()[(0, 3)],
+        2.0
+    );
+    assert_eq!(
+        timeline.scene.world.get(second).unwrap().transform()[(1, 3)],
+        2.0
+    );
+    timeline.seek(4).unwrap();
+    assert_eq!(
+        timeline.scene.world.get(first).unwrap().transform()[(0, 3)],
+        2.0
+    );
+    assert_eq!(
+        timeline.scene.world.get(second).unwrap().transform()[(1, 3)],
+        4.0
+    );
+    timeline.seek(1).unwrap();
+    assert_eq!(
+        timeline.scene.world.get(first).unwrap().transform()[(0, 3)],
+        1.0
+    );
+    assert_eq!(
+        timeline.scene.world.get(second).unwrap().transform()[(1, 3)],
+        1.0
+    );
+}
+
+#[test]
+fn parallel_clips_reject_overlapping_replace_writes() {
+    let mut scene = Scene::default();
+    let rectangle = scene.add_rectangle(Rectangle::default());
+    let mut builder = TimelineBuilder::new(scene, Context::default());
+    let first = builder
+        .compile(Move::new(rectangle, Vector3::new(1.0, 0.0, 0.0), 2))
+        .unwrap();
+    let second = builder
+        .compile(Move::new(rectangle, Vector3::new(0.0, 1.0, 0.0), 2))
+        .unwrap();
+    assert!(matches!(
+        builder.append_clips(vec![first, second]),
+        Err(TimelineError::ConflictingWrites { .. })
+    ));
+}
+
+#[test]
+fn parallel_clips_can_drive_disjoint_properties() {
+    let mut scene = Scene::default();
+    let rectangle = scene.add_rectangle(Rectangle::default());
+    let start_pose = scene.camera.pose();
+    let target_pose = crate::camera::CameraPose {
+        position: Point3::new(3.0, 4.0, 5.0),
+        look_at: -Vector3::z(),
+        up_direction: Vector3::y(),
+    };
+    let mut builder = TimelineBuilder::new(scene, Context::default());
+    let move_clip = builder
+        .compile(Move::new(rectangle, Vector3::new(2.0, 0.0, 0.0), 2))
+        .unwrap();
+    let camera_clip =
+        AnimationClip::new(2).track(CameraPoseProperty, Curve::linear(start_pose, target_pose));
+    builder.append_clips(vec![move_clip, camera_clip]).unwrap();
+    let mut timeline = builder.build();
+
+    timeline.seek(2).unwrap();
+    assert_eq!(
+        timeline.scene.world.get(rectangle).unwrap().transform()[(0, 3)],
+        2.0
+    );
+    assert_eq!(timeline.scene.camera.pose(), target_pose);
 }
 
 #[test]

@@ -145,48 +145,55 @@ pub(super) struct FrameRequirements {
     pub(super) height: u32,
     pub(super) rgba_row_bytes: u32,
     pub(super) padded_rgba_row_bytes: u32,
+    pub(super) raster_width: u32,
+    pub(super) raster_height: u32,
+    pub(super) multisampled_raster: bool,
+    pub(super) depth: bool,
+    pub(super) rgba_image: bool,
+    pub(super) sdf: bool,
+    pub(super) surface: bool,
     pub(super) raster_gbuffer: bool,
     pub(super) overlay_hdr: bool,
+    pub(super) transparent: bool,
+    pub(super) bloom: bool,
+    pub(super) outputs: RenderOutputs,
 }
 
 impl FrameRequirements {
-    pub(super) fn for_scene(scene: &PreparedScene) -> Self {
-        let has_opaque_meshes = scene
-            .mesh_draws_3d
-            .iter()
-            .any(|draw| !draw.is_transparent());
-        let has_transparent_meshes = scene.mesh_draws_3d.iter().any(|draw| draw.is_transparent());
-        Self::from_features(
-            scene.width,
-            scene.height,
-            !scene.sdf_primitives.is_empty(),
-            has_opaque_meshes,
-            has_transparent_meshes,
-            !scene.mesh_batches_2d.is_empty(),
-            !scene.grids_3d.is_empty(),
-        )
-    }
-
-    fn from_features(
-        width: u32,
-        height: u32,
-        has_sdf: bool,
-        has_opaque_meshes: bool,
-        has_transparent_meshes: bool,
-        has_mesh_2d: bool,
-        has_grid_3d: bool,
-    ) -> Self {
+    pub(super) fn for_plan(plan: RecordingPlan, outputs: RenderOutputs) -> Self {
+        let width = plan.width;
+        let height = plan.height;
         let rgba_row_bytes = width * 4;
         let padded_rgba_row_bytes =
             rgba_row_bytes.div_ceil(COPY_BYTES_PER_ROW_ALIGNMENT) * COPY_BYTES_PER_ROW_ALIGNMENT;
+        let has_content = plan.execution.runs_sdf() || plan.execution.runs_raster();
         Self {
             width,
             height,
             rgba_row_bytes,
             padded_rgba_row_bytes,
-            raster_gbuffer: has_opaque_meshes,
-            overlay_hdr: (has_sdf || has_opaque_meshes)
-                && (has_transparent_meshes || has_mesh_2d || has_grid_3d),
+            raster_width: if has_content {
+                width * plan.raster_scale
+            } else {
+                1
+            },
+            raster_height: if has_content {
+                height * plan.raster_scale
+            } else {
+                1
+            },
+            multisampled_raster: plan.execution.runs_raster()
+                && !plan.analytic_2d
+                && (!plan.uses_deferred_raster || plan.has_surface_overlay),
+            depth: plan.raster_uses_depth,
+            rgba_image: !plan.fused_video_downsample,
+            sdf: plan.execution.runs_sdf(),
+            surface: plan.execution.runs_sdf() || plan.uses_deferred_raster,
+            raster_gbuffer: plan.uses_deferred_raster,
+            overlay_hdr: plan.has_surface_overlay,
+            transparent: plan.has_transparent_meshes,
+            bloom: has_content && plan.bloom_enabled,
+            outputs,
         }
     }
 }
@@ -213,7 +220,6 @@ pub(super) struct PreparedFrame {
 impl PreparedFrame {
     pub(super) fn new(
         scene: PreparedScene,
-        requirements: FrameRequirements,
         mesh_2d: PreparedMesh2D,
         mesh_2d_arena_rebuilds: u32,
         options: FrameOptions,
@@ -234,8 +240,8 @@ impl PreparedFrame {
             .any(|draw| !draw.is_transparent());
         let has_transparent_meshes = scene.mesh_draws_3d.iter().any(|draw| draw.is_transparent());
         let plan = RecordingPlan::new(RecordingPlanInput {
-            width: requirements.width,
-            height: requirements.height,
+            width: scene.width,
+            height: scene.height,
             ssaa_factor: options.ssaa_factor,
             analytic_aa_2d: options.analytic_aa_2d,
             bloom_enabled: options.bloom_enabled,
@@ -287,6 +293,38 @@ mod tests {
     use bytemuck::Zeroable;
     use nalgebra::{Point3, Vector3};
 
+    fn requirements_for_features(
+        width: u32,
+        height: u32,
+        sdf: bool,
+        opaque: bool,
+        transparent: bool,
+        mesh_2d: bool,
+        grid: bool,
+    ) -> FrameRequirements {
+        let outputs = super::RenderOutputs::CPU_RGBA_ONLY;
+        let plan = super::RecordingPlan::new(super::RecordingPlanInput {
+            width,
+            height,
+            ssaa_factor: 2,
+            analytic_aa_2d: true,
+            bloom_enabled: false,
+            gpu_profiling: false,
+            has_sdf: sdf,
+            has_mesh_indices: opaque || transparent,
+            has_prepared_mesh_2d: mesh_2d,
+            all_2d_analytic: true,
+            has_opaque_meshes: opaque,
+            has_transparent_meshes: transparent,
+            grid_3d_draw_calls: u32::from(grid),
+            outputs,
+            background_color: [0.0; 4],
+            camera_clip: None,
+            camera_raster_scale: 2.0,
+        });
+        FrameRequirements::for_plan(plan, outputs)
+    }
+
     #[test]
     fn grid_shader_abi_is_eight_vec4_values() {
         assert_eq!(std::mem::size_of::<GpuGrid3D>(), 8 * 16);
@@ -326,10 +364,8 @@ mod tests {
             half_extent: 50.0,
             style,
         };
-        let looking_down =
-            perspective_camera([1.0, -6.0, 5.0], [2.0, 2.0, 2.0], [0.0, 0.0, 1.0]);
-        let after_orbit =
-            perspective_camera([9.17, 0.58, 6.53], [2.0, 2.0, 2.0], [0.0, 0.0, 1.0]);
+        let looking_down = perspective_camera([1.0, -6.0, 5.0], [2.0, 2.0, 2.0], [0.0, 0.0, 1.0]);
+        let after_orbit = perspective_camera([9.17, 0.58, 6.53], [2.0, 2.0, 2.0], [0.0, 0.0, 1.0]);
         let a = GpuGrid3D::prepare(&grid, &looking_down);
         let b = GpuGrid3D::prepare(&grid, &after_orbit);
         assert_eq!(a.origin, b.origin);
@@ -342,37 +378,44 @@ mod tests {
 
     #[test]
     fn rgba_rows_are_aligned_for_buffer_copies() {
-        let requirements =
-            FrameRequirements::from_features(1921, 1080, false, false, false, false, false);
+        let requirements = requirements_for_features(1921, 1080, false, false, false, false, false);
         assert_eq!(requirements.rgba_row_bytes, 7684);
         assert_eq!(requirements.padded_rgba_row_bytes, 7936);
     }
 
     #[test]
     fn target_features_follow_surface_composition() {
-        let sdf_with_2d =
-            FrameRequirements::from_features(320, 180, true, false, false, true, false);
+        let sdf_with_2d = requirements_for_features(320, 180, true, false, false, true, false);
         assert!(!sdf_with_2d.raster_gbuffer);
         assert!(sdf_with_2d.overlay_hdr);
 
-        let opaque_only =
-            FrameRequirements::from_features(320, 180, false, true, false, false, false);
+        let opaque_only = requirements_for_features(320, 180, false, true, false, false, false);
         assert!(opaque_only.raster_gbuffer);
         assert!(!opaque_only.overlay_hdr);
 
         let transparent_only =
-            FrameRequirements::from_features(320, 180, false, false, true, false, false);
+            requirements_for_features(320, 180, false, false, true, false, false);
         assert!(!transparent_only.raster_gbuffer);
         assert!(!transparent_only.overlay_hdr);
 
-        let grid_only =
-            FrameRequirements::from_features(320, 180, false, false, false, false, true);
+        let grid_only = requirements_for_features(320, 180, false, false, false, false, true);
         assert!(!grid_only.raster_gbuffer);
         assert!(!grid_only.overlay_hdr);
 
-        let sdf_with_grid =
-            FrameRequirements::from_features(320, 180, true, false, false, false, true);
+        let sdf_with_grid = requirements_for_features(320, 180, true, false, false, false, true);
         assert!(!sdf_with_grid.raster_gbuffer);
         assert!(sdf_with_grid.overlay_hdr);
+    }
+
+    #[test]
+    fn target_extents_follow_the_selected_aa_path() {
+        let empty = requirements_for_features(320, 180, false, false, false, false, false);
+        assert_eq!((empty.raster_width, empty.raster_height), (1, 1));
+        let analytic = requirements_for_features(320, 180, false, false, false, true, false);
+        assert_eq!((analytic.raster_width, analytic.raster_height), (320, 180));
+        assert!(!analytic.sdf && !analytic.surface && !analytic.transparent && !analytic.bloom);
+        let mixed = requirements_for_features(320, 180, true, false, false, true, false);
+        assert_eq!((mixed.raster_width, mixed.raster_height), (640, 360));
+        assert!(mixed.sdf && mixed.surface && mixed.overlay_hdr);
     }
 }

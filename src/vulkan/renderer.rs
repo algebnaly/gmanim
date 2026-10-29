@@ -13,6 +13,8 @@ mod profiling;
 mod record;
 mod resource;
 mod scene;
+#[cfg(test)]
+mod target_tests;
 mod targets;
 mod textures;
 mod upload;
@@ -457,15 +459,12 @@ impl VulkanRenderer {
     }
 
     fn render(&mut self, scene: PreparedScene, output: Option<&mut [u8]>, outputs: RenderOutputs) {
-        let requirements = FrameRequirements::for_scene(&scene);
-        self.ensure_target_cache(requirements);
-
-        let frame_index = self.cache.as_ref().unwrap().current_frame % RENDER_FRAME_COUNT;
+        let frame_index =
+            self.cache.as_ref().map_or(0, |cache| cache.current_frame) % RENDER_FRAME_COUNT;
         let (mesh_2d, mesh_2d_arena_rebuilds) =
             self.prepare_mesh_2d(frame_index, &scene.mesh_batches_2d);
         let frame = PreparedFrame::new(
             scene,
-            requirements,
             mesh_2d,
             mesh_2d_arena_rebuilds,
             FrameOptions {
@@ -476,30 +475,24 @@ impl VulkanRenderer {
                 outputs,
             },
         );
+        self.ensure_target_cache(FrameRequirements::for_plan(frame.plan, outputs));
         self.submit_prepared_frame(frame, output);
     }
 
     fn ensure_target_cache(&mut self, requirements: FrameRequirements) {
-        let cache_needs_update = self
+        if self
             .cache
             .as_ref()
-            .is_none_or(|cache| !cache.satisfies(requirements));
-        if !cache_needs_update {
+            .is_some_and(|cache| cache.satisfies(requirements))
+        {
             return;
         }
 
-        if let Some(old_cache) = self.cache.take() {
-            unsafe {
-                self.ctx.device.device_wait_idle().unwrap();
-            }
-            drop(old_cache);
-        }
         let resources = TargetCacheResources {
             ctx: &self.ctx,
             descriptor_pool: &self.descriptor_pool,
             pipelines: &self.pipelines,
             msaa_samples: self.msaa_samples,
-            ssaa_factor: self.ssaa_factor,
             environment_map: &self.environment.image,
             environment_sampler: self.environment.sampler,
             camera_buffer: &self.frame_buffers.camera,
@@ -516,7 +509,10 @@ impl VulkanRenderer {
             camera_buffer_2d_stride: self.frame_buffers.strides.camera_2d,
             tone_map_factor_stride: self.frame_buffers.strides.tone_map_factor,
         };
-        self.cache = Some(TargetCache::new(requirements, &resources));
+        match &mut self.cache {
+            Some(cache) => cache.reconfigure(requirements, &resources),
+            None => self.cache = Some(TargetCache::new(requirements, &resources)),
+        }
     }
 
     fn prepare_mesh_2d(
@@ -534,7 +530,9 @@ impl VulkanRenderer {
             Ok(prepared) => (prepared, 0),
             Err(PrepareMesh2DError::StaticGeometry) => {
                 unsafe {
-                    self.ctx.device.device_wait_idle().unwrap();
+                    // The persistent 2D geometry arena is only used by the
+                    // graphics/compute queue; avoid waiting for video encode.
+                    self.ctx.device.queue_wait_idle(self.ctx.queue).unwrap();
                 }
                 self.mesh_upload_planner_2d.reset_static_arena();
                 let prepared = self
@@ -564,7 +562,7 @@ impl VulkanRenderer {
         } = mesh_2d;
 
         let cache = self.cache.as_mut().unwrap();
-        cache.ensure_frame_attachments(&self.ctx, plan, self.msaa_samples);
+        cache.ensure_frame_attachments(&self.ctx, self.msaa_samples);
         let output_submission = self
             .output_retirement
             .prepare_submission(cache, plan, outputs);
@@ -572,27 +570,26 @@ impl VulkanRenderer {
         let video_frame_index = output_submission.video_frame_index();
         self.last_stats = stats;
 
+        let upload = FrameUpload {
+            camera: &scene.camera_uniform,
+            camera_2d: &scene.camera_uniform_2d,
+            primitives: &sdf_primitives,
+            grids_3d: &grids_3d,
+            materials: &scene.surface_materials,
+            mesh_vertices: &scene.mesh_vertices,
+            mesh_indices: &scene.mesh_indices,
+            geometry_2d: &geometry_uploads_2d,
+            instances_2d: &instances_2d,
+            tone_map_factor: plan.raster_scale,
+        };
+        upload.validate(&self.frame_buffers.strides);
         let (frame, completed_timings) = self.frames.begin(frame_index, plan.gpu_profiling);
         if let Some(timings) = completed_timings {
             self.last_gpu_timings = Some(timings);
         }
         let command_buffer = frame.command_buffer();
         let query_pool = frame.query_pool();
-        let uploaded = self.frame_buffers.upload(
-            frame_index,
-            FrameUpload {
-                camera: &scene.camera_uniform,
-                camera_2d: &scene.camera_uniform_2d,
-                primitives: &sdf_primitives,
-                grids_3d: &grids_3d,
-                materials: &scene.surface_materials,
-                mesh_vertices: &scene.mesh_vertices,
-                mesh_indices: &scene.mesh_indices,
-                geometry_2d: &geometry_uploads_2d,
-                instances_2d: &instances_2d,
-                tone_map_factor: plan.raster_scale,
-            },
-        );
+        let uploaded = self.frame_buffers.upload(frame_index, upload);
 
         unsafe {
             let recorder = CommandRecorder::new(&self.ctx.device, command_buffer, &self.pipelines);
